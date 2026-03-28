@@ -1,10 +1,22 @@
 #!/Users/zackseyun/voice-transcribe/.venv/bin/python3
 """
-Voice Transcribe — tap Fn to start/stop recording, transcribes and pastes.
+Voice Transcribe — hold Fn or Right Option to record, release to transcribe & paste.
 
 Menu bar app using Qwen3-ASR via MLX (Metal GPU accelerated).
-Key monitoring and transcription run in subprocesses (separate modules)
-to avoid import conflicts with rumps/AppKit.
+
+Architecture:
+  - Main process: rumps menu bar app + always-on audio stream
+  - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
+  - Transcription worker subprocess: loads Qwen3-ASR model, transcribes on demand
+
+IMPORTANT — CoreAudio threading constraints:
+  The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
+  stopped or restarted. This is intentional. PortAudio's Pa_StopStream and
+  Pa_AbortStream both call AudioDeviceStop, which tries to acquire CoreAudio's
+  internal HALB_Mutex. If the audio callback is running (which it is every ~10ms),
+  the callback thread already holds that mutex → DEADLOCK. This happens regardless
+  of which thread calls stop/abort. The only safe approach is to never call them.
+  Recording is controlled by toggling a boolean flag that the callback checks.
 """
 
 import json
@@ -43,7 +55,7 @@ class VoiceTranscribeApp(rumps.App):
         super().__init__(ICON_IDLE, quit_button=None)
 
         self.key_pipe = key_pipe
-        self._key_monitor = None  # set by caller
+        self._key_monitor = None  # set by caller after construction
         self.is_recording = False
         self.is_processing = False
         self.audio_buffer = []
@@ -52,7 +64,7 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_start_time = None
         self._last_heartbeat = time.time()
 
-        # Transcription worker process
+        # Transcription worker subprocess (holds the ML model in GPU memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
         self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
         self._tx_worker = None
@@ -60,13 +72,16 @@ class VoiceTranscribeApp(rumps.App):
 
         self._rebuild_menu()
 
-        # Start always-on audio stream (never stop/start — avoids CoreAudio deadlock)
+        # Open always-on audio stream. See module docstring for why we never close it.
         self._open_audio_stream()
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
 
     # ── Key Monitor Management ──
+    # The key monitor runs as a subprocess with a Quartz CGEvent tap.
+    # macOS can disable event taps after sleep/wake — the monitor auto-recovers,
+    # but if it dies completely, the heartbeat watchdog here restarts it.
 
     def _restart_key_monitor(self):
         """Kill and restart the key monitor subprocess."""
@@ -88,6 +103,9 @@ class VoiceTranscribeApp(rumps.App):
         print(f"Key monitor restarted (PID {self._key_monitor.pid})", flush=True)
 
     # ── Transcription Worker Management ──
+    # The worker holds the Qwen3-ASR model in Metal GPU memory.
+    # It auto-restarts after 50 transcriptions or 4GB active memory to prevent
+    # MLX Metal buffer leaks from accumulating (see transcribe_worker.py).
 
     def _spawn_transcribe_worker(self):
         """Start (or restart) the transcription worker process."""
@@ -163,17 +181,18 @@ class VoiceTranscribeApp(rumps.App):
         )
 
     # ── Pipe Polling ──
+    # Runs in a background thread. Receives messages from the key monitor subprocess.
+    # Messages: "heartbeat", "down:fast", "down:accurate", "up"
 
     def _poll_pipe(self):
         self._last_heartbeat = time.time()
-        self._pending_model = None  # which model to use for current recording
+        self._pending_model = None  # "fast" (0.6B) or "accurate" (1.7B)
         while True:
             try:
-                # Use poll with timeout so we can check for dead key monitor
+                # Use poll with timeout so we can detect a dead key monitor
                 if self.key_pipe.poll(timeout=30):
                     msg = self.key_pipe.recv()
                 else:
-                    # No message in 30s — check if key monitor is dead
                     if time.time() - self._last_heartbeat > 30:
                         print("Key monitor appears dead (no heartbeat), restarting...", flush=True)
                         self._restart_key_monitor()
@@ -204,9 +223,15 @@ class VoiceTranscribeApp(rumps.App):
                 continue
 
     # ── Audio Stream (always-on) ──
+    # DO NOT add stream.stop(), stream.abort(), or stream.close() anywhere.
+    # See module docstring for the CoreAudio HALB_Mutex deadlock explanation.
 
     def _open_audio_stream(self):
-        """Open a persistent audio input stream. Never closed — avoids CoreAudio deadlock."""
+        """Open a persistent audio input stream. Runs for the lifetime of the app.
+
+        The callback always fires (~every 10ms). When is_recording is False, it
+        discards the data (negligible CPU). When True, it appends to audio_buffer.
+        """
         device_idx = None
         try:
             for i, dev in enumerate(sd.query_devices()):
@@ -239,7 +264,8 @@ class VoiceTranscribeApp(rumps.App):
         )
         self._audio_stream.start()
 
-    # ── Recording (just toggle a flag — no CoreAudio calls) ──
+    # ── Recording ──
+    # Start/stop are just flag toggles — no CoreAudio calls, no mutex, no deadlock.
 
     def _start_recording(self):
         if self.is_recording or self.is_processing:
@@ -373,7 +399,7 @@ class VoiceTranscribeApp(rumps.App):
     def _rebuild_menu(self):
         self.menu.clear()
 
-        self.menu.add(rumps.MenuItem("Hold Fn to record, release to transcribe", callback=None))
+        self.menu.add(rumps.MenuItem("Fn = fast (0.6B) | Right Opt = accurate (1.7B)", callback=None))
         self.menu.add(rumps.separator)
 
         if self.history:
@@ -428,7 +454,9 @@ if __name__ == "__main__":
     app = VoiceTranscribeApp(parent_conn)
     app._key_monitor = monitor
 
-    # Ensure all child processes are killed on exit (prevents orphans)
+    # Ensure all child processes are killed on exit (prevents orphan buildup).
+    # Without this, each restart leaves zombie key_monitor/worker/tracker processes
+    # reparented to launchd (PID 1) that accumulate indefinitely.
     def _cleanup():
         for proc in multiprocessing.active_children():
             proc.kill()
