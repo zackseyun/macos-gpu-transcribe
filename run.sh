@@ -5,5 +5,9 @@ PYTHON_APP="/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/
 VENV_SITE="/Users/zackseyun/voice-transcribe/.venv/lib/python3.14/site-packages"
 SCRIPT="/Users/zackseyun/voice-transcribe/transcribe.py"
 
+# Kill any existing voice-transcribe processes (prevents orphan buildup)
+pkill -f "voice-transcribe/transcribe.py" 2>/dev/null
+sleep 0.5
+
 export PYTHONPATH="${VENV_SITE}:/Users/zackseyun/voice-transcribe:${PYTHONPATH}"
 exec "$PYTHON_APP" "$SCRIPT"

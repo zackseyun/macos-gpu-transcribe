@@ -370,6 +370,9 @@ class VoiceTranscribeApp(rumps.App):
 
 
 if __name__ == "__main__":
+    import atexit
+    import signal
+
     # Hide from dock — menu bar only
     from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
@@ -379,4 +382,15 @@ if __name__ == "__main__":
     monitor.start()
 
     app = VoiceTranscribeApp(parent_conn)
+
+    # Ensure all child processes are killed on exit (prevents orphans)
+    def _cleanup():
+        for proc in multiprocessing.active_children():
+            proc.kill()
+            proc.join(timeout=2)
+
+    atexit.register(_cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), os._exit(0)))
+    signal.signal(signal.SIGINT, lambda *_: (_cleanup(), os._exit(0)))
+
     app.run()
