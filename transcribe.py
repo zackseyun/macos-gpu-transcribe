@@ -92,7 +92,22 @@ class VoiceTranscribeApp(rumps.App):
 
         # Wait for result with timeout
         if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
-            return self._tx_res_parent.recv()
+            result = self._tx_res_parent.recv()
+
+            # Worker may send a restart signal after the result
+            if self._tx_res_parent.poll(timeout=0.1):
+                extra = self._tx_res_parent.recv()
+                if isinstance(extra, dict) and extra.get("__restart__"):
+                    print("Worker requested restart (memory pressure), respawning...", flush=True)
+                    self._spawn_transcribe_worker()
+
+            # Handle case where the restart signal came instead of a result
+            if isinstance(result, dict) and result.get("__restart__"):
+                print("Worker requested restart (memory pressure), respawning...", flush=True)
+                self._spawn_transcribe_worker()
+                return None
+
+            return result
         else:
             print(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, killing worker...", flush=True)
             self._spawn_transcribe_worker()
