@@ -1,0 +1,367 @@
+#!/Users/zackseyun/voice-transcribe/.venv/bin/python3
+"""
+Voice Transcribe — tap Fn to start/stop recording, transcribes and pastes.
+
+Menu bar app using Qwen3-ASR via MLX (Metal GPU accelerated).
+Key monitoring and transcription run in subprocesses (separate modules)
+to avoid import conflicts with rumps/AppKit.
+"""
+
+import json
+import multiprocessing
+import os
+import subprocess
+import tempfile
+import threading
+import time
+import wave
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import rumps
+import sounddevice as sd
+
+# Subprocess target functions live in separate files (no rumps/sd imports)
+import key_monitor
+import transcribe_worker
+from format_text import format_transcription
+
+# -- Constants --
+SAMPLE_RATE = 16000
+CHANNELS = 1
+HISTORY_FILE = Path(__file__).parent / "history.json"
+MAX_HISTORY = 100
+ICON_IDLE = "🎙"
+ICON_RECORDING = "🔴"
+ICON_PROCESSING = "⏳"
+TRANSCRIBE_TIMEOUT = 30  # seconds — kill worker if it takes longer
+
+
+class VoiceTranscribeApp(rumps.App):
+    def __init__(self, key_pipe):
+        super().__init__(ICON_IDLE, quit_button=None)
+
+        self.key_pipe = key_pipe
+        self.is_recording = False
+        self.is_processing = False
+        self.audio_buffer = []
+        self.stream = None
+        self.history = self._load_history()
+        self._pending_title = None
+        self._recording_start_time = None
+
+        # Transcription worker process
+        self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
+        self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
+        self._tx_worker = None
+        self._spawn_transcribe_worker()
+
+        self._rebuild_menu()
+
+        # Poll pipe for key events in background thread
+        threading.Thread(target=self._poll_pipe, daemon=True).start()
+
+    # ── Transcription Worker Management ──
+
+    def _spawn_transcribe_worker(self):
+        """Start (or restart) the transcription worker process."""
+        if self._tx_worker and self._tx_worker.is_alive():
+            self._tx_worker.kill()
+            self._tx_worker.join(timeout=2)
+
+        # Fresh pipes for clean state
+        self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
+        self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
+
+        self._tx_worker = multiprocessing.Process(
+            target=transcribe_worker.run,
+            args=(self._tx_req_child, self._tx_res_child),
+            daemon=True,
+        )
+        self._tx_worker.start()
+
+    def _transcribe_via_worker(self, wav_path):
+        """Send wav to worker and wait for result with timeout. Returns dict or None."""
+        try:
+            self._tx_req_parent.send(wav_path)
+        except (BrokenPipeError, OSError):
+            print("Worker pipe broken, respawning...", flush=True)
+            self._spawn_transcribe_worker()
+            self._tx_req_parent.send(wav_path)
+
+        # Wait for result with timeout
+        if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
+            return self._tx_res_parent.recv()
+        else:
+            print(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, killing worker...", flush=True)
+            self._spawn_transcribe_worker()
+            return None
+
+    # ── UI Helpers ──
+
+    def _set_title(self, icon):
+        """Queue title change for main thread."""
+        self._pending_title = icon
+
+    @rumps.timer(0.1)
+    def _tick(self, _):
+        """Main-thread timer: apply pending title + update recording duration."""
+        if self._pending_title is not None:
+            self.title = self._pending_title
+            self._pending_title = None
+        elif self.is_recording and self._recording_start_time:
+            elapsed = time.time() - self._recording_start_time
+            self.title = f"🔴 {elapsed:.0f}s"
+
+    def _play_sound(self, name):
+        """Play a system sound (non-blocking)."""
+        subprocess.Popen(
+            ["afplay", f"/System/Library/Sounds/{name}.aiff"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    # ── Pipe Polling ──
+
+    def _poll_pipe(self):
+        while True:
+            try:
+                msg = self.key_pipe.recv()
+                if msg == "down":
+                    if not self.is_recording and not self.is_processing:
+                        print("Fn hold → recording", flush=True)
+                        self._play_sound("Tink")
+                        self._start_recording()
+                elif msg == "up":
+                    if self.is_recording:
+                        elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
+                        print(f"Fn release → stop ({elapsed:.1f}s), transcribing...", flush=True)
+                        self._play_sound("Pop")
+                        self._stop_recording()
+            except (EOFError, OSError):
+                break
+
+    # ── Recording ──
+
+    def _start_recording(self):
+        if self.is_recording or self.is_processing:
+            return
+        self.is_recording = True
+        self.audio_buffer = []
+        self._recording_start_time = time.time()
+        self._set_title(ICON_RECORDING)
+
+        def audio_callback(indata, frames, time_info, status):
+            if status:
+                print(f"Audio status: {status}", flush=True)
+            self.audio_buffer.append(indata.copy())
+
+        try:
+            # Find MacBook Pro Microphone (default can be -1 on macOS)
+            device_idx = None
+            try:
+                for i, dev in enumerate(sd.query_devices()):
+                    if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
+                        device_idx = i
+                        break
+                if device_idx is None:
+                    for i, dev in enumerate(sd.query_devices()):
+                        if dev['max_input_channels'] > 0:
+                            device_idx = i
+                            break
+            except Exception:
+                pass
+            print(f"Recording with device {device_idx}: {sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'}", flush=True)
+            self.stream = sd.InputStream(
+                device=device_idx,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="float32",
+                callback=audio_callback,
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"Failed to start recording: {e}", flush=True)
+            self.is_recording = False
+            self._recording_start_time = None
+            self._set_title(ICON_IDLE)
+
+    def _stop_recording(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self._recording_start_time = None
+        self._set_title(ICON_PROCESSING)
+
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+        audio_data = self.audio_buffer
+        self.audio_buffer = []
+
+        if not audio_data:
+            self._set_title(ICON_IDLE)
+            return
+
+        threading.Thread(
+            target=self._transcribe_and_paste, args=(audio_data,), daemon=True
+        ).start()
+
+    # ── Transcription ──
+
+    def _transcribe_and_paste(self, audio_data):
+        self.is_processing = True
+        wav_path = None
+        try:
+            audio = np.concatenate(audio_data, axis=0).flatten()
+            duration = len(audio) / SAMPLE_RATE
+            peak = np.max(np.abs(audio))
+            print(f"Audio: {duration:.1f}s, peak={peak:.4f} ({'SILENT' if peak < 0.001 else 'OK'})", flush=True)
+
+            if duration < 0.3:
+                print("Recording too short, skipping.", flush=True)
+                rumps.notification("Voice Transcribe", "Too Short", "Recording was less than 0.3 seconds.")
+                return
+
+            wav_path = tempfile.mktemp(suffix=".wav")
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+            result = self._transcribe_via_worker(wav_path)
+
+            if result is None:
+                print("Transcription timed out, skipping.", flush=True)
+                rumps.notification("Voice Transcribe", "Timeout", "Transcription took too long. Try again.")
+                return
+
+            if result.get("error"):
+                raise Exception(result["error"])
+
+            text = result.get("text", "")
+            transcribe_time = result.get("time", 0)
+
+            if not text:
+                print("No speech detected.", flush=True)
+                rumps.notification("Voice Transcribe", "No Speech", "No speech was detected in the recording.")
+                return
+
+            text = format_transcription(text)
+            print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s): {text}", flush=True)
+            self._add_to_history(text)
+            self._paste_text(text)
+
+        except Exception as e:
+            print(f"Transcription error: {e}", flush=True)
+            rumps.notification("Voice Transcribe", "Error", str(e))
+        finally:
+            self.is_processing = False
+            self._set_title(ICON_IDLE)
+            if wav_path and os.path.exists(wav_path):
+                os.unlink(wav_path)
+
+    # ── Paste ──
+
+    def _paste_text(self, text):
+        """Set clipboard and simulate Cmd+V."""
+        from Quartz import (
+            CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
+            CGEventSourceCreate, kCGEventFlagMaskCommand,
+        )
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+
+        time.sleep(0.05)
+
+        source = CGEventSourceCreate(0)
+        key_down = CGEventCreateKeyboardEvent(source, 9, True)
+        key_up = CGEventCreateKeyboardEvent(source, 9, False)
+        CGEventSetFlags(key_down, kCGEventFlagMaskCommand)
+        CGEventSetFlags(key_up, kCGEventFlagMaskCommand)
+        CGEventPost(0, key_down)
+        CGEventPost(0, key_up)
+
+    # ── History ──
+
+    def _load_history(self):
+        if HISTORY_FILE.exists():
+            try:
+                return json.loads(HISTORY_FILE.read_text())
+            except (json.JSONDecodeError, IOError):
+                pass
+        return []
+
+    def _save_history(self):
+        try:
+            HISTORY_FILE.write_text(json.dumps(self.history, indent=2))
+        except IOError as e:
+            print(f"Failed to save history: {e}", flush=True)
+
+    def _add_to_history(self, text):
+        entry = {"text": text, "timestamp": datetime.now().isoformat()}
+        self.history.insert(0, entry)
+        self.history = self.history[:MAX_HISTORY]
+        self._save_history()
+        self._rebuild_menu()
+
+    def _rebuild_menu(self):
+        self.menu.clear()
+
+        self.menu.add(rumps.MenuItem("Hold Fn to record, release to transcribe", callback=None))
+        self.menu.add(rumps.separator)
+
+        if self.history:
+            self.menu.add(rumps.MenuItem("Recent Transcriptions", callback=None))
+            for entry in self.history[:20]:
+                text = entry["text"]
+                display = text[:80] + "…" if len(text) > 80 else text
+                ts = entry.get("timestamp", "")
+                if ts:
+                    try:
+                        dt = datetime.fromisoformat(ts)
+                        display = f"[{dt.strftime('%H:%M')}] {display}"
+                    except ValueError:
+                        pass
+                item = rumps.MenuItem(display, callback=self._copy_history_item)
+                item.representedObject = text
+                self.menu.add(item)
+            self.menu.add(rumps.separator)
+            self.menu.add(rumps.MenuItem("Clear History", callback=self._clear_history))
+        else:
+            self.menu.add(rumps.MenuItem("No transcriptions yet", callback=None))
+
+        self.menu.add(rumps.separator)
+        self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
+
+    def _copy_history_item(self, sender):
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        text = getattr(sender, "representedObject", sender.title)
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+        rumps.notification("Voice Transcribe", "Copied", text[:100])
+
+    def _clear_history(self, _):
+        self.history = []
+        self._save_history()
+        self._rebuild_menu()
+
+
+if __name__ == "__main__":
+    # Hide from dock — menu bar only
+    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    parent_conn, child_conn = multiprocessing.Pipe()
+    monitor = multiprocessing.Process(target=key_monitor.run, args=(child_conn,), daemon=True)
+    monitor.start()
+
+    app = VoiceTranscribeApp(parent_conn)
+    app.run()

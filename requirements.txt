@@ -1,0 +1,5 @@
+rumps
+sounddevice
+numpy
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
