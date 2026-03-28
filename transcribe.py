@@ -47,15 +47,10 @@ class VoiceTranscribeApp(rumps.App):
         self.is_recording = False
         self.is_processing = False
         self.audio_buffer = []
-        self.stream = None
         self.history = self._load_history()
         self._pending_title = None
         self._recording_start_time = None
         self._last_heartbeat = time.time()
-        # CoreAudio operations MUST happen on the main thread (deadlocks otherwise).
-        # Pipe-polling thread queues these; main-thread timer processes them.
-        self._pending_start = False
-        self._pending_stop = False
 
         # Transcription worker process
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -64,6 +59,9 @@ class VoiceTranscribeApp(rumps.App):
         self._spawn_transcribe_worker()
 
         self._rebuild_menu()
+
+        # Start always-on audio stream (never stop/start — avoids CoreAudio deadlock)
+        self._open_audio_stream()
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
@@ -149,15 +147,7 @@ class VoiceTranscribeApp(rumps.App):
 
     @rumps.timer(0.1)
     def _tick(self, _):
-        """Main-thread timer: process queued audio ops, update title/duration."""
-        # All CoreAudio ops run here on main thread (avoids HALB_Mutex deadlock)
-        if self._pending_start:
-            self._pending_start = False
-            self._start_recording()
-        if self._pending_stop:
-            self._pending_stop = False
-            self._stop_recording()
-
+        """Main-thread timer: apply pending title + update recording duration."""
         if self._pending_title is not None:
             self.title = self._pending_title
             self._pending_title = None
@@ -200,66 +190,64 @@ class VoiceTranscribeApp(rumps.App):
                         model_name = "0.6B" if mode == "fast" else "1.7B"
                         print(f"{label} hold → recording ({model_name})", flush=True)
                         self._play_sound("Tink")
-                        # Queue for main thread — CoreAudio deadlocks from bg threads
-                        self._pending_start = True
+                        self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
                         model_name = "0.6B" if self._pending_model == "fast" else "1.7B"
                         print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_name}...", flush=True)
                         self._play_sound("Pop")
-                        # Queue stop for main thread — calling stream.stop() from
-                        # this thread deadlocks on CoreAudio's HALB_Mutex
-                        self._pending_stop = True
+                        self._stop_recording()
             except (EOFError, OSError):
                 print("Key monitor pipe broken, restarting...", flush=True)
                 self._restart_key_monitor()
                 continue
 
-    # ── Recording ──
+    # ── Audio Stream (always-on) ──
 
-    def _start_recording(self):
-        if self.is_recording or self.is_processing:
-            return
-        self.is_recording = True
-        self.audio_buffer = []
-        self._recording_start_time = time.time()
-        self._set_title(ICON_RECORDING)
+    def _open_audio_stream(self):
+        """Open a persistent audio input stream. Never closed — avoids CoreAudio deadlock."""
+        device_idx = None
+        try:
+            for i, dev in enumerate(sd.query_devices()):
+                if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
+                    device_idx = i
+                    break
+            if device_idx is None:
+                for i, dev in enumerate(sd.query_devices()):
+                    if dev['max_input_channels'] > 0:
+                        device_idx = i
+                        break
+        except Exception:
+            pass
+
+        dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
+        print(f"Audio stream opened on device {device_idx}: {dev_name}", flush=True)
 
         def audio_callback(indata, frames, time_info, status):
             if status:
                 print(f"Audio status: {status}", flush=True)
-            self.audio_buffer.append(indata.copy())
+            if self.is_recording:
+                self.audio_buffer.append(indata.copy())
 
-        try:
-            # Find MacBook Pro Microphone (default can be -1 on macOS)
-            device_idx = None
-            try:
-                for i, dev in enumerate(sd.query_devices()):
-                    if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
-                        device_idx = i
-                        break
-                if device_idx is None:
-                    for i, dev in enumerate(sd.query_devices()):
-                        if dev['max_input_channels'] > 0:
-                            device_idx = i
-                            break
-            except Exception:
-                pass
-            print(f"Recording with device {device_idx}: {sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'}", flush=True)
-            self.stream = sd.InputStream(
-                device=device_idx,
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="float32",
-                callback=audio_callback,
-            )
-            self.stream.start()
-        except Exception as e:
-            print(f"Failed to start recording: {e}", flush=True)
-            self.is_recording = False
-            self._recording_start_time = None
-            self._set_title(ICON_IDLE)
+        self._audio_stream = sd.InputStream(
+            device=device_idx,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            callback=audio_callback,
+        )
+        self._audio_stream.start()
+
+    # ── Recording (just toggle a flag — no CoreAudio calls) ──
+
+    def _start_recording(self):
+        if self.is_recording or self.is_processing:
+            return
+        self.audio_buffer = []
+        self.is_recording = True
+        self._recording_start_time = time.time()
+        self._set_title(ICON_RECORDING)
 
     def _stop_recording(self):
         if not self.is_recording:
@@ -267,13 +255,6 @@ class VoiceTranscribeApp(rumps.App):
         self.is_recording = False
         self._recording_start_time = None
         self._set_title(ICON_PROCESSING)
-
-        if self.stream:
-            # abort() not stop() — Pa_StopStream waits for callback completion
-            # which deadlocks on CoreAudio's HALB_Mutex
-            self.stream.abort()
-            self.stream.close()
-            self.stream = None
 
         audio_data = self.audio_buffer
         self.audio_buffer = []
