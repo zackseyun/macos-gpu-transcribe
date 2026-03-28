@@ -269,7 +269,9 @@ class VoiceTranscribeApp(rumps.App):
         self._set_title(ICON_PROCESSING)
 
         if self.stream:
-            self.stream.stop()
+            # abort() not stop() — Pa_StopStream waits for callback completion
+            # which deadlocks on CoreAudio's HALB_Mutex
+            self.stream.abort()
             self.stream.close()
             self.stream = None
 
