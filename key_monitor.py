@@ -1,10 +1,11 @@
-"""Key monitor subprocess — Fn key hold-to-record via Quartz CGEvent tap.
+"""Key monitor subprocess — hold-to-record via Quartz CGEvent tap.
 
-Uses low-level Quartz event tap to detect actual Fn key press/release state
-(not toggle). This is more reliable than pynput for modifier keys on macOS.
+Supports two trigger keys:
+  - Hold Fn (Globe) → fast model (0.6B)
+  - Hold Right Option → accuracy model (1.7B)
 
-macOS disables event taps after sleep/wake or screen lock. This module
-automatically re-creates the tap when that happens.
+Uses low-level Quartz event tap to detect actual key press/release state.
+Auto-recovers when macOS disables the event tap (sleep/wake, screen lock).
 """
 import os
 import threading
@@ -14,9 +15,12 @@ import time
 # Send heartbeats so parent can detect a dead monitor
 HEARTBEAT_INTERVAL = 10  # seconds
 
+# macOS key codes
+KEYCODE_RIGHT_OPTION = 61
+
 
 def run(pipe):
-    """Monitor Fn key press/release. Hold = record, release = stop.
+    """Monitor Fn and Right Option key press/release. Hold = record, release = stop.
     Auto-recovers when macOS disables the event tap."""
     print(f"Key monitor process started (PID {os.getpid()})", flush=True)
 
@@ -25,13 +29,16 @@ def run(pipe):
             CGEventTapCreate,
             CGEventMaskBit,
             CGEventGetFlags,
+            CGEventGetIntegerValueField,
             CGEventTapIsEnabled,
             kCGEventFlagsChanged,
             kCGEventFlagMaskSecondaryFn,
+            kCGEventFlagMaskAlternate,
             kCGEventTapDisabledByTimeout,
             kCGEventTapDisabledByUserInput,
             kCGHeadInsertEventTap,
             kCGSessionEventTap,
+            kCGKeyboardEventKeycode,
             CGEventTapEnable,
         )
         from CoreFoundation import (
@@ -48,9 +55,11 @@ def run(pipe):
         print(f"Key monitor: Quartz import failed: {e}", flush=True)
         return
 
-    fn_held = [False]
+    # Track which key is currently held for recording
+    # Only one can be active at a time
+    active_key = [None]  # None, "fn", or "ropt"
     last_event_time = [0.0]
-    tap_ref = [None]  # store tap reference for re-enable checks
+    tap_ref = [None]
 
     def callback(proxy, event_type, event, refcon):
         # macOS sends special event types when the tap is disabled
@@ -61,28 +70,36 @@ def run(pipe):
             return event
 
         now = time.monotonic()
-        # Debounce: ignore events within 30ms of each other
         if now - last_event_time[0] < 0.03:
             return event
         last_event_time[0] = now
 
         flags = CGEventGetFlags(event)
-        fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
+        keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
 
-        if fn_now and not fn_held[0]:
-            # Fn just pressed — start recording
-            fn_held[0] = True
-            try:
-                pipe.send("down")
-            except (BrokenPipeError, OSError):
-                pass
-        elif not fn_now and fn_held[0]:
-            # Fn just released — stop recording
-            fn_held[0] = False
-            try:
-                pipe.send("up")
-            except (BrokenPipeError, OSError):
-                pass
+        fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
+        opt_now = bool(flags & kCGEventFlagMaskAlternate)
+        is_right_opt = (keycode == KEYCODE_RIGHT_OPTION)
+
+        try:
+            if active_key[0] is None:
+                # No key held — check if one just pressed
+                if fn_now:
+                    active_key[0] = "fn"
+                    pipe.send("down:fast")
+                elif opt_now and is_right_opt:
+                    active_key[0] = "ropt"
+                    pipe.send("down:accurate")
+            elif active_key[0] == "fn":
+                if not fn_now:
+                    active_key[0] = None
+                    pipe.send("up")
+            elif active_key[0] == "ropt":
+                if not opt_now:
+                    active_key[0] = None
+                    pipe.send("up")
+        except (BrokenPipeError, OSError):
+            pass
 
         return event
 
@@ -98,12 +115,11 @@ def run(pipe):
     threading.Thread(target=_heartbeat, daemon=True).start()
 
     while True:
-        # Create event tap for flagsChanged events (modifier keys like Fn)
         mask = CGEventMaskBit(kCGEventFlagsChanged)
         tap = CGEventTapCreate(
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
-            0,  # active tap (can observe events)
+            0,
             mask,
             callback,
             None,
@@ -119,27 +135,22 @@ def run(pipe):
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
 
-        print("Key monitor: listener active (hold Fn to record, release to transcribe)", flush=True)
+        print("Key monitor: listener active (Fn=fast 0.6B, Right Option=accurate 1.7B)", flush=True)
 
-        # Run the event loop, but periodically check if the tap is still enabled
         while True:
-            # Run for 5 seconds at a time, then check tap health
             result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, False)
 
-            # Check if tap is still enabled
             if not CGEventTapIsEnabled(tap):
                 print("Key monitor: tap was disabled by macOS, re-enabling...", flush=True)
                 CGEventTapEnable(tap, True)
                 if not CGEventTapIsEnabled(tap):
                     print("Key monitor: re-enable failed, recreating tap...", flush=True)
-                    # Reset Fn state in case it was held when tap died
-                    if fn_held[0]:
-                        fn_held[0] = False
+                    if active_key[0] is not None:
+                        active_key[0] = None
                         try:
                             pipe.send("up")
                         except (BrokenPipeError, OSError):
                             pass
-                    break  # break inner loop to recreate tap
+                    break
 
-        # Small delay before recreating
         time.sleep(1)

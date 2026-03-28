@@ -6,14 +6,19 @@ import time
 
 # Restart worker after this many transcriptions to reclaim any non-cache memory leaks
 MAX_TRANSCRIPTIONS_BEFORE_RESTART = 50
-# Metal cache limit — caps GPU buffer cache to 2GB (model weights ~1.2GB + headroom)
-METAL_CACHE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+# Metal cache limit — caps GPU buffer cache to 6GB (both models + headroom)
+METAL_CACHE_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
 # Restart if MLX active memory exceeds this (catches leaks that clear_cache misses)
-MAX_ACTIVE_MEMORY_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ACTIVE_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
+
+MODEL_IDS = {
+    "fast": "Qwen/Qwen3-ASR-0.6B",
+    "accurate": "Qwen/Qwen3-ASR-1.7B",
+}
 
 
 def run(request_pipe, result_pipe):
-    """Receive wav paths via request_pipe, send results via result_pipe."""
+    """Receive requests via request_pipe, send results via result_pipe."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     print(f"Transcription worker started (PID {os.getpid()})", flush=True)
 
@@ -25,27 +30,37 @@ def run(request_pipe, result_pipe):
     except Exception as e:
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
 
-    model = None
+    transcribe_fn = None
     transcription_count = 0
 
     while True:
         try:
-            wav_path = request_pipe.recv()
+            request = request_pipe.recv()
         except (EOFError, OSError):
             break
 
-        if wav_path == "__quit__":
+        if request == "__quit__":
             break
 
+        # Support both old format (string path) and new format (dict with model_mode)
+        if isinstance(request, str):
+            wav_path = request
+            model_mode = "fast"
+        else:
+            wav_path = request["wav_path"]
+            model_mode = request.get("model_mode", "fast")
+
+        model_id = MODEL_IDS.get(model_mode, MODEL_IDS["fast"])
+
         try:
-            if model is None:
-                print("Transcription worker: loading model...", flush=True)
+            if transcribe_fn is None:
+                print("Transcription worker: loading transcribe function...", flush=True)
                 from mlx_qwen3_asr import transcribe as _transcribe_fn
-                model = _transcribe_fn
-                print("Transcription worker: model ready", flush=True)
+                transcribe_fn = _transcribe_fn
+                print("Transcription worker: ready", flush=True)
 
             t0 = time.time()
-            raw = model(wav_path)
+            raw = transcribe_fn(wav_path, model=model_id)
             elapsed = time.time() - t0
 
             # Clear MLX Metal cache after each transcription
@@ -67,12 +82,10 @@ def run(request_pipe, result_pipe):
             try:
                 active_mem = mx.get_active_memory()
                 cache_mem = mx.get_cache_memory()
-                total_mb = (active_mem + cache_mem) / (1024**2)
-                print(f"Transcription worker: #{transcription_count}, active={active_mem/(1024**2):.0f}MB, cache={cache_mem/(1024**2):.0f}MB", flush=True)
+                print(f"Transcription worker: #{transcription_count} [{model_mode}], active={active_mem/(1024**2):.0f}MB, cache={cache_mem/(1024**2):.0f}MB", flush=True)
             except Exception:
                 active_mem = 0
-                total_mb = 0
-                print(f"Transcription worker: #{transcription_count}", flush=True)
+                print(f"Transcription worker: #{transcription_count} [{model_mode}]", flush=True)
 
             result_pipe.send({"text": text, "time": elapsed, "error": None})
 

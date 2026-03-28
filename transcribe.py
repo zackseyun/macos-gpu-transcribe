@@ -104,14 +104,15 @@ class VoiceTranscribeApp(rumps.App):
         )
         self._tx_worker.start()
 
-    def _transcribe_via_worker(self, wav_path):
+    def _transcribe_via_worker(self, wav_path, model_mode="fast"):
         """Send wav to worker and wait for result with timeout. Returns dict or None."""
+        request = {"wav_path": wav_path, "model_mode": model_mode}
         try:
-            self._tx_req_parent.send(wav_path)
+            self._tx_req_parent.send(request)
         except (BrokenPipeError, OSError):
             print("Worker pipe broken, respawning...", flush=True)
             self._spawn_transcribe_worker()
-            self._tx_req_parent.send(wav_path)
+            self._tx_req_parent.send(request)
 
         # Wait for result with timeout
         if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
@@ -163,6 +164,7 @@ class VoiceTranscribeApp(rumps.App):
 
     def _poll_pipe(self):
         self._last_heartbeat = time.time()
+        self._pending_model = None  # which model to use for current recording
         while True:
             try:
                 # Use poll with timeout so we can check for dead key monitor
@@ -178,15 +180,20 @@ class VoiceTranscribeApp(rumps.App):
                 if msg == "heartbeat":
                     self._last_heartbeat = time.time()
                     continue
-                elif msg == "down":
+                elif msg.startswith("down:"):
                     if not self.is_recording and not self.is_processing:
-                        print("Fn hold → recording", flush=True)
+                        mode = msg.split(":")[1]  # "fast" or "accurate"
+                        self._pending_model = mode
+                        label = "Fn" if mode == "fast" else "Right Option"
+                        model_name = "0.6B" if mode == "fast" else "1.7B"
+                        print(f"{label} hold → recording ({model_name})", flush=True)
                         self._play_sound("Tink")
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
-                        print(f"Fn release → stop ({elapsed:.1f}s), transcribing...", flush=True)
+                        model_name = "0.6B" if self._pending_model == "fast" else "1.7B"
+                        print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_name}...", flush=True)
                         self._play_sound("Pop")
                         self._stop_recording()
             except (EOFError, OSError):
@@ -258,13 +265,14 @@ class VoiceTranscribeApp(rumps.App):
             self._set_title(ICON_IDLE)
             return
 
+        model_mode = self._pending_model or "fast"
         threading.Thread(
-            target=self._transcribe_and_paste, args=(audio_data,), daemon=True
+            target=self._transcribe_and_paste, args=(audio_data, model_mode), daemon=True
         ).start()
 
     # ── Transcription ──
 
-    def _transcribe_and_paste(self, audio_data):
+    def _transcribe_and_paste(self, audio_data, model_mode="fast"):
         self.is_processing = True
         wav_path = None
         try:
@@ -285,7 +293,7 @@ class VoiceTranscribeApp(rumps.App):
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
-            result = self._transcribe_via_worker(wav_path)
+            result = self._transcribe_via_worker(wav_path, model_mode)
 
             if result is None:
                 print("Transcription timed out, skipping.", flush=True)
