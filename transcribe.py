@@ -43,6 +43,7 @@ class VoiceTranscribeApp(rumps.App):
         super().__init__(ICON_IDLE, quit_button=None)
 
         self.key_pipe = key_pipe
+        self._key_monitor = None  # set by caller
         self.is_recording = False
         self.is_processing = False
         self.audio_buffer = []
@@ -50,6 +51,7 @@ class VoiceTranscribeApp(rumps.App):
         self.history = self._load_history()
         self._pending_title = None
         self._recording_start_time = None
+        self._last_heartbeat = time.time()
 
         # Transcription worker process
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -61,6 +63,27 @@ class VoiceTranscribeApp(rumps.App):
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
+
+    # ── Key Monitor Management ──
+
+    def _restart_key_monitor(self):
+        """Kill and restart the key monitor subprocess."""
+        if self._key_monitor and self._key_monitor.is_alive():
+            self._key_monitor.kill()
+            self._key_monitor.join(timeout=2)
+
+        # If we were recording when monitor died, stop recording
+        if self.is_recording:
+            self._stop_recording()
+
+        parent_conn, child_conn = multiprocessing.Pipe()
+        self.key_pipe = parent_conn
+        self._key_monitor = multiprocessing.Process(
+            target=key_monitor.run, args=(child_conn,), daemon=True
+        )
+        self._key_monitor.start()
+        self._last_heartbeat = time.time()
+        print(f"Key monitor restarted (PID {self._key_monitor.pid})", flush=True)
 
     # ── Transcription Worker Management ──
 
@@ -139,10 +162,23 @@ class VoiceTranscribeApp(rumps.App):
     # ── Pipe Polling ──
 
     def _poll_pipe(self):
+        self._last_heartbeat = time.time()
         while True:
             try:
-                msg = self.key_pipe.recv()
-                if msg == "down":
+                # Use poll with timeout so we can check for dead key monitor
+                if self.key_pipe.poll(timeout=30):
+                    msg = self.key_pipe.recv()
+                else:
+                    # No message in 30s — check if key monitor is dead
+                    if time.time() - self._last_heartbeat > 30:
+                        print("Key monitor appears dead (no heartbeat), restarting...", flush=True)
+                        self._restart_key_monitor()
+                    continue
+
+                if msg == "heartbeat":
+                    self._last_heartbeat = time.time()
+                    continue
+                elif msg == "down":
                     if not self.is_recording and not self.is_processing:
                         print("Fn hold → recording", flush=True)
                         self._play_sound("Tink")
@@ -154,7 +190,9 @@ class VoiceTranscribeApp(rumps.App):
                         self._play_sound("Pop")
                         self._stop_recording()
             except (EOFError, OSError):
-                break
+                print("Key monitor pipe broken, restarting...", flush=True)
+                self._restart_key_monitor()
+                continue
 
     # ── Recording ──
 
@@ -382,6 +420,7 @@ if __name__ == "__main__":
     monitor.start()
 
     app = VoiceTranscribeApp(parent_conn)
+    app._key_monitor = monitor
 
     # Ensure all child processes are killed on exit (prevents orphans)
     def _cleanup():
