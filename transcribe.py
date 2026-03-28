@@ -52,6 +52,7 @@ class VoiceTranscribeApp(rumps.App):
         self._pending_title = None
         self._recording_start_time = None
         self._last_heartbeat = time.time()
+        self._pending_stop = False  # queued stop from pipe thread → main thread
 
         # Transcription worker process
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -145,7 +146,12 @@ class VoiceTranscribeApp(rumps.App):
 
     @rumps.timer(0.1)
     def _tick(self, _):
-        """Main-thread timer: apply pending title + update recording duration."""
+        """Main-thread timer: apply pending title, process queued stop, update duration."""
+        # Process queued stop on main thread (avoids CoreAudio mutex deadlock)
+        if self._pending_stop:
+            self._pending_stop = False
+            self._stop_recording()
+
         if self._pending_title is not None:
             self.title = self._pending_title
             self._pending_title = None
@@ -195,7 +201,9 @@ class VoiceTranscribeApp(rumps.App):
                         model_name = "0.6B" if self._pending_model == "fast" else "1.7B"
                         print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_name}...", flush=True)
                         self._play_sound("Pop")
-                        self._stop_recording()
+                        # Queue stop for main thread — calling stream.stop() from
+                        # this thread deadlocks on CoreAudio's HALB_Mutex
+                        self._pending_stop = True
             except (EOFError, OSError):
                 print("Key monitor pipe broken, restarting...", flush=True)
                 self._restart_key_monitor()
