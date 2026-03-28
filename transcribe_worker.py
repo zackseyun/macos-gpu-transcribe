@@ -20,7 +20,7 @@ def run(request_pipe, result_pipe):
     # Set Metal cache limit upfront — prevents unbounded GPU buffer accumulation
     try:
         import mlx.core as mx
-        mx.metal.set_cache_limit(METAL_CACHE_LIMIT_BYTES)
+        mx.set_cache_limit(METAL_CACHE_LIMIT_BYTES)
         print(f"Transcription worker: Metal cache limit set to {METAL_CACHE_LIMIT_BYTES / (1024**3):.0f}GB", flush=True)
     except Exception as e:
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
