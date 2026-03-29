@@ -352,7 +352,12 @@ class VoiceTranscribeApp(rumps.App):
     # ── Paste ──
 
     def _paste_text(self, text):
-        """Set clipboard and simulate Cmd+V."""
+        """Paste text at cursor without clobbering the user's clipboard.
+
+        Saves the current clipboard, pastes the transcription via Cmd+V,
+        then restores the original clipboard contents. The user's previous
+        copy is preserved — transcription just gets inserted inline.
+        """
         from Quartz import (
             CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
             CGEventSourceCreate, kCGEventFlagMaskCommand,
@@ -360,6 +365,12 @@ class VoiceTranscribeApp(rumps.App):
         from AppKit import NSPasteboard, NSPasteboardTypeString
 
         pb = NSPasteboard.generalPasteboard()
+
+        # Save current clipboard contents
+        old_contents = pb.stringForType_(NSPasteboardTypeString)
+        old_change_count = pb.changeCount()
+
+        # Set clipboard to transcription and paste
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
 
@@ -372,6 +383,12 @@ class VoiceTranscribeApp(rumps.App):
         CGEventSetFlags(key_up, kCGEventFlagMaskCommand)
         CGEventPost(0, key_down)
         CGEventPost(0, key_up)
+
+        # Wait for paste to complete, then restore original clipboard
+        time.sleep(0.15)
+        if old_contents is not None:
+            pb.clearContents()
+            pb.setString_forType_(old_contents, NSPasteboardTypeString)
 
     # ── History ──
 
