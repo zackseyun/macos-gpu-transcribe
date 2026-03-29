@@ -1,8 +1,9 @@
 """Key monitor subprocess — hold-to-record via Quartz CGEvent tap.
 
-Supports two trigger keys:
-  - Hold Fn (Globe) → fast model (0.6B)
-  - Hold Right Option → accuracy model (1.7B)
+Supports three trigger keys:
+  - Hold Fn (Globe) → fast model (Qwen 0.6B via MLX)
+  - Hold Right Option → accurate model (Qwen 1.7B via MLX)
+  - Hold Right Command → best model (Cohere 2B via PyTorch MPS)
 
 Uses low-level Quartz event tap to detect actual key press/release state.
 Auto-recovers when macOS disables the event tap (sleep/wake, screen lock).
@@ -17,6 +18,7 @@ HEARTBEAT_INTERVAL = 10  # seconds
 
 # macOS key codes
 KEYCODE_RIGHT_OPTION = 61
+KEYCODE_RIGHT_COMMAND = 54
 
 
 def run(pipe):
@@ -34,6 +36,7 @@ def run(pipe):
             kCGEventFlagsChanged,
             kCGEventFlagMaskSecondaryFn,
             kCGEventFlagMaskAlternate,
+            kCGEventFlagMaskCommand,
             kCGEventTapDisabledByTimeout,
             kCGEventTapDisabledByUserInput,
             kCGHeadInsertEventTap,
@@ -57,7 +60,7 @@ def run(pipe):
 
     # Track which key is currently held for recording
     # Only one can be active at a time
-    active_key = [None]  # None, "fn", or "ropt"
+    active_key = [None]  # None, "fn", "ropt", or "rcmd"
     last_event_time = [0.0]
     tap_ref = [None]
 
@@ -79,7 +82,9 @@ def run(pipe):
 
         fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
         opt_now = bool(flags & kCGEventFlagMaskAlternate)
+        cmd_now = bool(flags & kCGEventFlagMaskCommand)
         is_right_opt = (keycode == KEYCODE_RIGHT_OPTION)
+        is_right_cmd = (keycode == KEYCODE_RIGHT_COMMAND)
 
         try:
             if active_key[0] is None:
@@ -90,12 +95,19 @@ def run(pipe):
                 elif opt_now and is_right_opt:
                     active_key[0] = "ropt"
                     pipe.send("down:accurate")
+                elif cmd_now and is_right_cmd:
+                    active_key[0] = "rcmd"
+                    pipe.send("down:cohere")
             elif active_key[0] == "fn":
                 if not fn_now:
                     active_key[0] = None
                     pipe.send("up")
             elif active_key[0] == "ropt":
                 if not opt_now:
+                    active_key[0] = None
+                    pipe.send("up")
+            elif active_key[0] == "rcmd":
+                if not cmd_now:
                     active_key[0] = None
                     pipe.send("up")
         except (BrokenPipeError, OSError):
@@ -135,7 +147,7 @@ def run(pipe):
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
 
-        print("Key monitor: listener active (Fn=fast 0.6B, Right Option=accurate 1.7B)", flush=True)
+        print("Key monitor: listener active (Fn=fast 0.6B, Right Opt=accurate 1.7B, Right Cmd=cohere 2B)", flush=True)
 
         while True:
             result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, False)
