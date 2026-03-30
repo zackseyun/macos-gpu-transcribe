@@ -10,12 +10,8 @@ import signal
 import time
 
 
-# Restart worker after this many transcriptions to reclaim any non-cache memory leaks
-MAX_TRANSCRIPTIONS_BEFORE_RESTART = 50
 # Metal cache limit — caps GPU buffer cache to 6GB (both models + headroom)
 METAL_CACHE_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
-# Restart if MLX active memory exceeds this (catches leaks that clear_cache misses)
-MAX_ACTIVE_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
 
 QWEN3_MODEL_IDS = {
     "fast": "Qwen/Qwen3-ASR-0.6B",
@@ -59,7 +55,6 @@ def run(request_pipe, result_pipe):
     qwen3_transcribe_fn = None
     cohere_processor = None
     cohere_model = None
-    transcription_count = 0
 
     while True:
         try:
@@ -120,28 +115,8 @@ def run(request_pipe, result_pipe):
                     text = str(raw).strip()
 
             elapsed = time.time() - t0
-            transcription_count += 1
-
-            # Memory tracking (MLX only — PyTorch/MPS doesn't have equivalent)
-            active_mem = 0
-            if mx is not None:
-                try:
-                    active_mem = mx.get_active_memory()
-                    cache_mem = mx.get_cache_memory()
-                    print(f"Transcription worker: #{transcription_count} [{model_mode}], active={active_mem/(1024**2):.0f}MB, cache={cache_mem/(1024**2):.0f}MB", flush=True)
-                except Exception:
-                    print(f"Transcription worker: #{transcription_count} [{model_mode}]", flush=True)
-            else:
-                print(f"Transcription worker: #{transcription_count} [{model_mode}], {elapsed:.1f}s", flush=True)
-
+            print(f"Transcription worker: [{model_mode}] {elapsed:.1f}s", flush=True)
             result_pipe.send({"text": text, "time": elapsed, "error": None})
-
-            # Restart if active memory is growing out of control or we've done enough transcriptions
-            if active_mem > MAX_ACTIVE_MEMORY_BYTES or transcription_count >= MAX_TRANSCRIPTIONS_BEFORE_RESTART:
-                reason = f"mem={active_mem/(1024**3):.1f}GB" if active_mem > MAX_ACTIVE_MEMORY_BYTES else f"count={transcription_count}"
-                print(f"Transcription worker: requesting restart ({reason})", flush=True)
-                result_pipe.send({"__restart__": True})
-                break
 
         except Exception as e:
             result_pipe.send({"text": "", "time": 0, "error": str(e)})
