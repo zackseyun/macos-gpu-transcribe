@@ -1,4 +1,10 @@
-"""Transcription worker subprocess — loads model once, transcribes on demand."""
+"""Transcription worker subprocess — loads model once, transcribes on demand.
+
+Supports three model modes:
+  - "fast": Qwen3-ASR 0.6B via MLX (Metal)
+  - "accurate": Qwen3-ASR 1.7B via MLX (Metal)
+  - "cohere": Cohere Transcribe 2B via PyTorch (MPS)
+"""
 import os
 import signal
 import time
@@ -11,10 +17,29 @@ METAL_CACHE_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
 # Restart if MLX active memory exceeds this (catches leaks that clear_cache misses)
 MAX_ACTIVE_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
 
-MODEL_IDS = {
+QWEN3_MODEL_IDS = {
     "fast": "Qwen/Qwen3-ASR-0.6B",
     "accurate": "Qwen/Qwen3-ASR-1.7B",
 }
+
+COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+
+
+def _transcribe_cohere(wav_path, processor, model):
+    """Transcribe using Cohere via PyTorch MPS."""
+    import torch
+    from transformers.audio_utils import load_audio
+
+    audio = load_audio(wav_path, sampling_rate=16000)
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt", language="en")
+    inputs = inputs.to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=512)
+
+    result = processor.decode(outputs, skip_special_tokens=True)
+    text = " ".join(result).strip() if isinstance(result, list) else result.strip()
+    return text
 
 
 def run(request_pipe, result_pipe):
@@ -23,6 +48,7 @@ def run(request_pipe, result_pipe):
     print(f"Transcription worker started (PID {os.getpid()})", flush=True)
 
     # Set Metal cache limit upfront — prevents unbounded GPU buffer accumulation
+    mx = None
     try:
         import mlx.core as mx
         mx.set_cache_limit(METAL_CACHE_LIMIT_BYTES)
@@ -30,7 +56,9 @@ def run(request_pipe, result_pipe):
     except Exception as e:
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
 
-    transcribe_fn = None
+    qwen3_transcribe_fn = None
+    cohere_processor = None
+    cohere_model = None
     transcription_count = 0
 
     while True:
@@ -50,42 +78,61 @@ def run(request_pipe, result_pipe):
             wav_path = request["wav_path"]
             model_mode = request.get("model_mode", "fast")
 
-        model_id = MODEL_IDS.get(model_mode, MODEL_IDS["fast"])
-
         try:
-            if transcribe_fn is None:
-                print("Transcription worker: loading transcribe function...", flush=True)
-                from mlx_qwen3_asr import transcribe as _transcribe_fn
-                transcribe_fn = _transcribe_fn
-                print("Transcription worker: ready", flush=True)
-
             t0 = time.time()
-            raw = transcribe_fn(wav_path, model=model_id)
-            elapsed = time.time() - t0
 
-            # Clear MLX Metal cache after each transcription
-            try:
-                mx.clear_cache()
-            except Exception:
-                pass
+            if model_mode == "cohere":
+                # Lazy-load Cohere model on first use
+                if cohere_model is None:
+                    print("Transcription worker: loading Cohere Transcribe...", flush=True)
+                    import torch
+                    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+                    cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
+                    cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
+                        COHERE_MODEL_ID, torch_dtype=torch.float32, device_map="auto",
+                    )
+                    print(f"Transcription worker: Cohere loaded on {cohere_model.device}", flush=True)
 
-            if isinstance(raw, dict):
-                text = raw.get("text", "").strip()
-            elif hasattr(raw, "text"):
-                text = raw.text.strip()
+                text = _transcribe_cohere(wav_path, cohere_processor, cohere_model)
             else:
-                text = str(raw).strip()
+                # Qwen3 via MLX
+                model_id = QWEN3_MODEL_IDS.get(model_mode, QWEN3_MODEL_IDS["fast"])
+                if qwen3_transcribe_fn is None:
+                    print("Transcription worker: loading Qwen3 transcribe function...", flush=True)
+                    from mlx_qwen3_asr import transcribe as _transcribe_fn
+                    qwen3_transcribe_fn = _transcribe_fn
+                    print("Transcription worker: Qwen3 ready", flush=True)
 
+                raw = qwen3_transcribe_fn(wav_path, model=model_id)
+
+                # Clear MLX Metal cache after each transcription
+                if mx is not None:
+                    try:
+                        mx.clear_cache()
+                    except Exception:
+                        pass
+
+                if isinstance(raw, dict):
+                    text = raw.get("text", "").strip()
+                elif hasattr(raw, "text"):
+                    text = raw.text.strip()
+                else:
+                    text = str(raw).strip()
+
+            elapsed = time.time() - t0
             transcription_count += 1
 
-            # Use MLX's own memory tracking (current, not peak)
-            try:
-                active_mem = mx.get_active_memory()
-                cache_mem = mx.get_cache_memory()
-                print(f"Transcription worker: #{transcription_count} [{model_mode}], active={active_mem/(1024**2):.0f}MB, cache={cache_mem/(1024**2):.0f}MB", flush=True)
-            except Exception:
-                active_mem = 0
-                print(f"Transcription worker: #{transcription_count} [{model_mode}]", flush=True)
+            # Memory tracking (MLX only — PyTorch/MPS doesn't have equivalent)
+            active_mem = 0
+            if mx is not None:
+                try:
+                    active_mem = mx.get_active_memory()
+                    cache_mem = mx.get_cache_memory()
+                    print(f"Transcription worker: #{transcription_count} [{model_mode}], active={active_mem/(1024**2):.0f}MB, cache={cache_mem/(1024**2):.0f}MB", flush=True)
+                except Exception:
+                    print(f"Transcription worker: #{transcription_count} [{model_mode}]", flush=True)
+            else:
+                print(f"Transcription worker: #{transcription_count} [{model_mode}], {elapsed:.1f}s", flush=True)
 
             result_pipe.send({"text": text, "time": elapsed, "error": None})
 

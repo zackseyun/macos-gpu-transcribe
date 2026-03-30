@@ -203,17 +203,20 @@ class VoiceTranscribeApp(rumps.App):
                     continue
                 elif msg.startswith("down:"):
                     if not self.is_recording and not self.is_processing:
-                        mode = msg.split(":")[1]  # "fast" or "accurate"
+                        mode = msg.split(":")[1]  # "fast", "accurate", or "cohere"
                         self._pending_model = mode
-                        label = "Fn" if mode == "fast" else "Right Option"
-                        model_name = "0.6B" if mode == "fast" else "1.7B"
+                        labels = {"fast": "Fn", "accurate": "Right Option", "cohere": "Right Cmd"}
+                        names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
+                        label = labels.get(mode, mode)
+                        model_name = names.get(mode, mode)
                         print(f"{label} hold → recording ({model_name})", flush=True)
                         self._play_sound("Tink")
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
-                        model_name = "0.6B" if self._pending_model == "fast" else "1.7B"
+                        names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
+                        model_name = names.get(self._pending_model, self._pending_model)
                         print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_name}...", flush=True)
                         self._play_sound("Pop")
                         self._stop_recording()
@@ -416,7 +419,7 @@ class VoiceTranscribeApp(rumps.App):
     def _rebuild_menu(self):
         self.menu.clear()
 
-        self.menu.add(rumps.MenuItem("Fn = fast (0.6B) | Right Opt = accurate (1.7B)", callback=None))
+        self.menu.add(rumps.MenuItem("Fn=Qwen3 0.6B | R.Opt=Qwen3 1.7B | R.Cmd=Cohere 2B", callback=None))
         self.menu.add(rumps.separator)
 
         if self.history:
