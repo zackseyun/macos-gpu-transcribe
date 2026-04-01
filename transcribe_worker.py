@@ -84,8 +84,8 @@ def run(request_pipe, result_pipe):
                     from transformers import AutoProcessor, CohereAsrForConditionalGeneration
                     cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
                     cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
-                        COHERE_MODEL_ID, torch_dtype=torch.float32, device_map="auto",
-                    )
+                        COHERE_MODEL_ID, torch_dtype=torch.float32,
+                    ).to("mps")
                     print(f"Transcription worker: Cohere loaded on {cohere_model.device}", flush=True)
 
                 text = _transcribe_cohere(wav_path, cohere_processor, cohere_model)

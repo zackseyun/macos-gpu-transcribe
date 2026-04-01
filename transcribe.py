@@ -47,7 +47,7 @@ MAX_HISTORY = 100
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
-TRANSCRIBE_TIMEOUT = 30  # seconds — kill worker if it takes longer
+TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
 
 
 class VoiceTranscribeApp(rumps.App):
