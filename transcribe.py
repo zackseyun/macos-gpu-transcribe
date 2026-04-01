@@ -205,7 +205,7 @@ class VoiceTranscribeApp(rumps.App):
                     if not self.is_recording and not self.is_processing:
                         mode = msg.split(":")[1]  # "fast", "accurate", or "cohere"
                         self._pending_model = mode
-                        labels = {"fast": "Fn", "accurate": "Right Option", "cohere": "Right Cmd"}
+                        labels = {"fast": "Fn", "accurate": "Right Option", "cohere": "Fn"}
                         names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
                         label = labels.get(mode, mode)
                         model_name = names.get(mode, mode)
@@ -419,7 +419,7 @@ class VoiceTranscribeApp(rumps.App):
     def _rebuild_menu(self):
         self.menu.clear()
 
-        self.menu.add(rumps.MenuItem("Fn=Qwen3 0.6B | R.Opt=Qwen3 1.7B | R.Cmd=Cohere 2B", callback=None))
+        self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
         self.menu.add(rumps.separator)
 
         if self.history:
