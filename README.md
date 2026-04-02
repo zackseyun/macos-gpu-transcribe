@@ -2,7 +2,7 @@
 
 A lightweight macOS menu bar app that transcribes speech to text using local AI models. **Hold a key** to record, **release** to transcribe — the text is automatically pasted at your cursor.
 
-Primary transcription runs on-device using Apple Silicon GPU acceleration. Optional **Screen Assist** now stays local too: it prefetches a screenshot of the **frontmost window**, extracts useful text locally, and injects those terms into ASR as context before decoding.
+Primary transcription runs on-device using Apple Silicon GPU acceleration. **Screen Assist is disabled by default** because it proved too unreliable for normal dictation.
 
 ## How It Works
 
@@ -46,18 +46,9 @@ Raw ASR output goes through `format_text.py` which normalizes:
 - Currency ("500 dollars" → "$500")
 - First-letter capitalization
 
-### Screen Assist (Optional)
+### Screen Assist
 
-When enabled from the menu bar, Voice Transcribe:
-- keeps a fresh screenshot of the **frontmost window** prefetched in the background
-- extracts fast local text from that screenshot plus frontmost app/window metadata
-- builds a compact glossary of visible names, labels, URLs, filenames, and other salient terms
-- retains frequently repeated glossary terms over time
-- injects both the fresh glossary and retained frequent terms into ASR **before** decoding
-
-There is **no post-transcription correction pass** in the current architecture. This keeps latency down and lets the visible screen text bias the transcription itself.
-
-For privacy, Screen Assist starts **off** by default until you enable it from the menu bar.
+Currently left **off by default**. The feature remains toggleable, but normal operation should be considered plain local ASR unless you explicitly turn it on again.
 
 ## Tech Stack
 

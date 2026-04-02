@@ -98,9 +98,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_thread_actions = queue.SimpleQueue()
         self._last_release_handled_at = 0.0
         self.screen_context_enabled = is_feature_enabled()
-        self._screen_assist_selftest_enabled = _env_flag(
-            "VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST"
-        )
+        self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
         self._screen_context_cached_at = 0.0
