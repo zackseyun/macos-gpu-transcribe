@@ -2,12 +2,13 @@
 """
 Voice Transcribe — hold Fn or Right Option to record, release to transcribe & paste.
 
-Menu bar app using Qwen3-ASR via MLX (Metal GPU accelerated).
+Menu bar app using local Cohere/Qwen ASR with optional screenshot-aware correction.
 
 Architecture:
   - Main process: rumps menu bar app + always-on audio stream
   - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
-  - Transcription worker subprocess: loads Qwen3-ASR model, transcribes on demand
+  - Transcription worker subprocess: loads local ASR model(s), transcribes on demand
+  - Optional screen assist: sends a screenshot + transcript to OpenRouter/Gemini
 
 IMPORTANT — CoreAudio threading constraints:
   The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
@@ -38,6 +39,11 @@ import sounddevice as sd
 import key_monitor
 import transcribe_worker
 from format_text import format_transcription
+from screen_context import (
+    capture_screen_snapshot,
+    is_feature_enabled,
+    refine_transcript_with_screen_context,
+)
 
 # -- Constants --
 SAMPLE_RATE = 16000
@@ -63,8 +69,9 @@ class VoiceTranscribeApp(rumps.App):
         self._pending_title = None
         self._recording_start_time = None
         self._last_heartbeat = time.time()
+        self.screen_context_enabled = is_feature_enabled()
 
-        # Transcription worker subprocess (holds the ML model in GPU memory)
+        # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
         self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
         self._tx_worker = None
@@ -103,7 +110,7 @@ class VoiceTranscribeApp(rumps.App):
         print(f"Key monitor restarted (PID {self._key_monitor.pid})", flush=True)
 
     # ── Transcription Worker Management ──
-    # The worker holds the Qwen3-ASR model in Metal GPU memory.
+    # The worker holds the local ASR model(s) in GPU memory.
     # It auto-restarts after 50 transcriptions or 4GB active memory to prevent
     # MLX Metal buffer leaks from accumulating (see transcribe_worker.py).
 
@@ -302,6 +309,7 @@ class VoiceTranscribeApp(rumps.App):
     def _transcribe_and_paste(self, audio_data, model_mode="fast"):
         self.is_processing = True
         wav_path = None
+        screenshot_path = None
         try:
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
@@ -319,6 +327,12 @@ class VoiceTranscribeApp(rumps.App):
                 wf.setsampwidth(2)
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+            if self.screen_context_enabled:
+                try:
+                    screenshot_path = capture_screen_snapshot()
+                except Exception as screen_err:
+                    print(f"Screen context capture skipped: {screen_err}", flush=True)
 
             result = self._transcribe_via_worker(wav_path, model_mode)
 
@@ -338,6 +352,28 @@ class VoiceTranscribeApp(rumps.App):
                 rumps.notification("Voice Transcribe", "No Speech", "No speech was detected in the recording.")
                 return
 
+            if self.screen_context_enabled and screenshot_path:
+                screen_result = refine_transcript_with_screen_context(
+                    transcript=text,
+                    screenshot_path=screenshot_path,
+                )
+                if screen_result.error:
+                    print(f"Screen assist skipped: {screen_result.error}", flush=True)
+                else:
+                    if screen_result.corrected:
+                        print(
+                            "Screen assist corrected transcript"
+                            f" (confidence={screen_result.confidence},"
+                            f" evidence={screen_result.evidence_terms}): {screen_result.text}",
+                            flush=True,
+                        )
+                    elif screen_result.screen_context:
+                        print(
+                            f"Screen assist checked context: {screen_result.screen_context}",
+                            flush=True,
+                        )
+                    text = screen_result.text
+
             text = format_transcription(text)
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s): {text}", flush=True)
             self._add_to_history(text)
@@ -351,6 +387,8 @@ class VoiceTranscribeApp(rumps.App):
             self._set_title(ICON_IDLE)
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
+            if screenshot_path and os.path.exists(screenshot_path):
+                os.unlink(screenshot_path)
 
     # ── Paste ──
 
@@ -420,6 +458,7 @@ class VoiceTranscribeApp(rumps.App):
         self.menu.clear()
 
         self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
+        self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.separator)
 
         if self.history:
@@ -452,6 +491,20 @@ class VoiceTranscribeApp(rumps.App):
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
         rumps.notification("Voice Transcribe", "Copied", text[:100])
+
+    def _screen_context_menu_title(self):
+        status = "On" if self.screen_context_enabled else "Off"
+        return f"Screen Assist: {status} (OpenRouter + Gemini 2.5 Flash)"
+
+    def _toggle_screen_context(self, _):
+        self.screen_context_enabled = not self.screen_context_enabled
+        self._rebuild_menu()
+        detail = (
+            "Enabled — screenshots will be sent to OpenRouter to refine the local transcript."
+            if self.screen_context_enabled
+            else "Disabled — only local ASR will be used."
+        )
+        rumps.notification("Voice Transcribe", "Screen Assist", detail)
 
     def _clear_history(self, _):
         self.history = []

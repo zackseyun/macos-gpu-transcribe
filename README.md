@@ -2,14 +2,15 @@
 
 A lightweight macOS menu bar app that transcribes speech to text using local AI models. **Hold a key** to record, **release** to transcribe — the text is automatically pasted at your cursor.
 
-**No cloud APIs, no subscriptions, no data leaves your machine.** Runs entirely on-device using Apple Silicon GPU acceleration.
+Primary transcription still runs on-device using Apple Silicon GPU acceleration. Optional **Screen Assist** can send a screenshot to OpenRouter + Gemini 2.5 Flash to correct visible names, UI labels, URLs, and other on-screen terms that local ASR may miss.
 
 ## How It Works
 
 1. **Hold Fn** (or **Right Option**) → "Tink" sound plays, menu bar shows `🔴 1s`, `🔴 2s`... (recording)
 2. **Speak**
 3. **Release** → "Pop" sound plays, menu bar shows `⏳` (transcribing)
-4. Text is pasted at your cursor via Cmd+V, menu bar returns to `🎙`
+4. Optional: a screenshot-aware correction pass fixes obvious on-screen terms
+5. Text is pasted at your cursor via Cmd+V, menu bar returns to `🎙`
 
 Click the 🎙 menu bar icon to see recent transcription history (last 20). Click any entry to copy it to clipboard.
 
@@ -45,6 +46,22 @@ Raw ASR output goes through `format_text.py` which normalizes:
 - Currency ("500 dollars" → "$500")
 - First-letter capitalization
 
+### Screen Assist (Optional)
+
+When enabled from the menu bar, Voice Transcribe captures a screenshot at key release and sends:
+- the local transcript
+- the screenshot
+
+to **OpenRouter** using **`google/gemini-2.5-flash`**. The model is instructed to make only conservative corrections grounded in visible screen content, such as:
+- app names and UI labels
+- filenames and URLs
+- proper nouns and branded terms
+- numbers, versions, and identifiers visible on screen
+
+If the screenshot does not clearly justify a change, the original local transcript is kept.
+
+For privacy, Screen Assist starts **off** by default until you enable it from the menu bar.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -56,6 +73,7 @@ Raw ASR output goes through `format_text.py` which normalizes:
 | Audio Recording | `sounddevice` (16kHz mono float32 PCM) |
 | Key Monitoring | Quartz CGEvent tap (in a subprocess — see Architecture) |
 | Clipboard/Paste | PyObjC (`AppKit.NSPasteboard` + `Quartz.CGEvent` Cmd+V simulation) |
+| Optional screen-aware correction | OpenRouter + `google/gemini-2.5-flash` |
 
 ## Architecture
 
@@ -153,12 +171,35 @@ python -c "from huggingface_hub import login; login()"
 
 **Microphone:** Will prompt automatically on first recording.
 
+**Screen Recording (for Screen Assist):**
+- System Settings → Privacy & Security → Screen Recording
+- Add the same `Python.app`
+
+### 2.5 AWS / OpenRouter setup
+
+Screen Assist looks for an OpenRouter API key in this order:
+
+1. `OPENROUTER_API_KEY` environment variable
+2. AWS Secrets Manager secret: `cartha/moltbot/openrouter-api-key`
+
+Expected secret payload:
+
+```json
+{"api_key":"<OPENROUTER_API_KEY>"}
+```
+
+Default region: `us-west-2`
+
 ### Run
 
 ```bash
-~/Desktop/voice-transcribe/run.sh
-# or in background:
-nohup ~/Desktop/voice-transcribe/run.sh > /tmp/voice-transcribe.log 2>&1 &
+./run.sh
+# or directly:
+./.venv/bin/python3 ./transcribe.py
+# start with Screen Assist enabled by default for this launch:
+VOICE_TRANSCRIBE_SCREEN_CONTEXT=1 ./run.sh
+# or background:
+nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 ```
 
 ## Files
@@ -167,6 +208,7 @@ nohup ~/Desktop/voice-transcribe/run.sh > /tmp/voice-transcribe.log 2>&1 &
 voice-transcribe/
 ├── transcribe.py          # Main app — menu bar UI, audio, paste logic
 ├── transcribe_worker.py   # Worker subprocess — model loading & inference
+├── screen_context.py      # Optional screenshot-aware correction via OpenRouter
 ├── key_monitor.py         # Key monitor subprocess — Quartz CGEvent tap
 ├── format_text.py         # Post-processing — numbers, currency, percentages
 ├── install.sh             # Install wizard — sets up everything automatically
@@ -183,6 +225,7 @@ voice-transcribe/
 |---------|----------|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart app |
 | No audio recording | Grant Microphone permission when prompted |
+| Screen Assist says it was skipped | Grant Screen Recording permission to Python.app and ensure AWS CLI can read `cartha/moltbot/openrouter-api-key` |
 | Menu bar icon doesn't change | Expected on first run — the `rumps.Timer` needs the app run loop |
 | Multiple menu bar icons | Kill all: `pkill -9 -f transcribe.py` then restart |
 | Cohere model: 401 Unauthorized | Request access at huggingface.co/CohereLabs/cohere-transcribe-03-2026, then re-run `install.sh` |
