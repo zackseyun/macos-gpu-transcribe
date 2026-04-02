@@ -31,7 +31,7 @@ OPENROUTER_SECRET_ID = os.getenv(
     "cartha/moltbot/openrouter-api-key",
 )
 AWS_REGION = os.getenv("VOICE_TRANSCRIBE_AWS_REGION", "us-west-2")
-REQUEST_TIMEOUT_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SCREEN_TIMEOUT_SECONDS", "8"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SCREEN_TIMEOUT_SECONDS", "20"))
 SCREENSHOT_MAX_DIMENSION = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_MAX_DIMENSION", "1800"))
 SCREENSHOT_TYPE = os.getenv("VOICE_TRANSCRIBE_SCREENSHOT_TYPE", "jpg")
 KEY_FETCH_COOLDOWN_SECONDS = 60.0
@@ -173,8 +173,18 @@ def _get_openrouter_api_key() -> str:
     if _last_key_error and now < _next_key_retry_at:
         raise RuntimeError(_last_key_error)
 
-    aws_bin = shutil.which("aws") or "/opt/homebrew/bin/aws" or "/usr/local/bin/aws"
-    if not aws_bin or not os.path.exists(aws_bin):
+    aws_bin = None
+    for candidate in (
+        shutil.which("aws"),
+        "/opt/homebrew/bin/aws",
+        "/usr/local/bin/aws",
+        "/usr/bin/aws",
+    ):
+        if candidate and os.path.exists(candidate):
+            aws_bin = candidate
+            break
+
+    if not aws_bin:
         _remember_key_error("aws CLI not found for OpenRouter secret lookup")
         raise RuntimeError(_last_key_error or "aws CLI not found")
 

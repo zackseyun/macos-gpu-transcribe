@@ -54,6 +54,19 @@ ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
+SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
+    os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
+)
+SCREEN_CONTEXT_MAX_AGE = float(
+    os.getenv("VOICE_TRANSCRIBE_SCREEN_MAX_AGE_SECONDS", "15")
+)
+
+
+def _env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
 
 
 class VoiceTranscribeApp(rumps.App):
@@ -70,6 +83,17 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_start_time = None
         self._last_heartbeat = time.time()
         self.screen_context_enabled = is_feature_enabled()
+        self._screen_assist_selftest_enabled = _env_flag(
+            "VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST"
+        )
+        self._screen_assist_selftest_prompt = os.getenv(
+            "VOICE_TRANSCRIBE_SCREEN_SELFTEST_PROMPT",
+            "open claw",
+        )
+        self._screen_context_cache_lock = threading.Lock()
+        self._screen_context_cached_path = None
+        self._screen_context_cached_at = 0.0
+        self._screen_context_cache_ready = threading.Event()
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -84,6 +108,10 @@ class VoiceTranscribeApp(rumps.App):
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
+        threading.Thread(target=self._screen_context_prefetch_loop, daemon=True).start()
+
+        if self._screen_assist_selftest_enabled:
+            threading.Thread(target=self._run_screen_assist_self_test, daemon=True).start()
 
     # ── Key Monitor Management ──
     # The key monitor runs as a subprocess with a Quartz CGEvent tap.
@@ -186,6 +214,131 @@ class VoiceTranscribeApp(rumps.App):
             ["afplay", f"/System/Library/Sounds/{name}.aiff"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+    def _screen_context_prefetch_loop(self):
+        """Keep a fresh screenshot ready while Screen Assist is enabled and idle."""
+        while True:
+            try:
+                if not self.screen_context_enabled:
+                    self._clear_screen_context_cache()
+                    time.sleep(1)
+                    continue
+
+                if self.is_recording or self.is_processing:
+                    time.sleep(0.5)
+                    continue
+
+                needs_refresh = False
+                with self._screen_context_cache_lock:
+                    if not self._screen_context_cached_path:
+                        needs_refresh = True
+                    else:
+                        age = time.time() - self._screen_context_cached_at
+                        needs_refresh = age >= SCREEN_CONTEXT_PREFETCH_INTERVAL
+
+                if needs_refresh:
+                    self._refresh_screen_context_cache(reason="prefetch")
+
+                time.sleep(1)
+            except Exception as exc:
+                print(f"Screen assist prefetch skipped: {exc}", flush=True)
+                time.sleep(2)
+
+    def _refresh_screen_context_cache(self, reason="prefetch"):
+        """Capture and store a fresh screenshot for later transcription use."""
+        screenshot_path = capture_screen_snapshot()
+        captured_at = time.time()
+        previous_path = None
+        had_previous = False
+
+        with self._screen_context_cache_lock:
+            previous_path = self._screen_context_cached_path
+            had_previous = previous_path is not None
+            self._screen_context_cached_path = screenshot_path
+            self._screen_context_cached_at = captured_at
+            self._screen_context_cache_ready.set()
+
+        if previous_path and previous_path != screenshot_path and os.path.exists(previous_path):
+            os.unlink(previous_path)
+
+        if reason != "prefetch" or not had_previous:
+            print(
+                "Screen assist cached screenshot "
+                f"({reason}, {os.path.getsize(screenshot_path)} bytes)",
+                flush=True,
+            )
+
+    def _clear_screen_context_cache(self):
+        """Delete any cached screenshot when Screen Assist is disabled."""
+        cached_path = None
+        with self._screen_context_cache_lock:
+            cached_path = self._screen_context_cached_path
+            self._screen_context_cached_path = None
+            self._screen_context_cached_at = 0.0
+            self._screen_context_cache_ready.clear()
+
+        if cached_path and os.path.exists(cached_path):
+            os.unlink(cached_path)
+
+    def _take_screen_context_snapshot(self):
+        """Return a ready screenshot path, preferring a prefetched screenshot."""
+        stale_path = None
+
+        with self._screen_context_cache_lock:
+            if self._screen_context_cached_path:
+                age = time.time() - self._screen_context_cached_at
+                path = self._screen_context_cached_path
+                self._screen_context_cached_path = None
+                self._screen_context_cached_at = 0.0
+                self._screen_context_cache_ready.clear()
+
+                if age <= SCREEN_CONTEXT_MAX_AGE:
+                    return path, "prefetched", age
+
+                stale_path = path
+
+        if stale_path and os.path.exists(stale_path):
+            os.unlink(stale_path)
+
+        screenshot_path = capture_screen_snapshot()
+        return screenshot_path, "on-demand", None
+
+    def _run_screen_assist_self_test(self):
+        """Run a one-shot screen assist probe inside the app process for verification."""
+        screenshot_path = None
+        prompt = self._screen_assist_selftest_prompt.strip() or "open claw"
+        try:
+            print(
+                "Screen assist self-test starting "
+                f"(screen_context_enabled={self.screen_context_enabled}, prompt={prompt!r})",
+                flush=True,
+            )
+            self._screen_context_cache_ready.wait(timeout=6)
+            screenshot_path, source, age = self._take_screen_context_snapshot()
+            print(
+                "Screen assist self-test using "
+                f"{source} screenshot "
+                f"({os.path.getsize(screenshot_path)} bytes"
+                f"{'' if age is None else f', age={age:.1f}s'})",
+                flush=True,
+            )
+            result = refine_transcript_with_screen_context(prompt, screenshot_path)
+            if result.error:
+                print(f"Screen assist self-test failed: {result.error}", flush=True)
+                return
+
+            status = "corrected" if result.corrected else "checked"
+            print(
+                "Screen assist self-test "
+                f"{status}: {result.text} "
+                f"(confidence={result.confidence}, evidence={result.evidence_terms})",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"Screen assist self-test crashed: {exc}", flush=True)
+        finally:
+            if screenshot_path and os.path.exists(screenshot_path):
+                os.unlink(screenshot_path)
 
     # ── Pipe Polling ──
     # Runs in a background thread. Receives messages from the key monitor subprocess.
@@ -310,6 +463,7 @@ class VoiceTranscribeApp(rumps.App):
         self.is_processing = True
         wav_path = None
         screenshot_path = None
+        screenshot_source = None
         try:
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
@@ -330,7 +484,14 @@ class VoiceTranscribeApp(rumps.App):
 
             if self.screen_context_enabled:
                 try:
-                    screenshot_path = capture_screen_snapshot()
+                    screenshot_path, screenshot_source, screenshot_age = self._take_screen_context_snapshot()
+                    if screenshot_source == "prefetched":
+                        print(
+                            f"Screen assist using prefetched screenshot (age={screenshot_age:.1f}s)",
+                            flush=True,
+                        )
+                    else:
+                        print("Screen assist cache miss; captured screenshot on demand", flush=True)
                 except Exception as screen_err:
                     print(f"Screen context capture skipped: {screen_err}", flush=True)
 
@@ -498,12 +659,20 @@ class VoiceTranscribeApp(rumps.App):
 
     def _toggle_screen_context(self, _):
         self.screen_context_enabled = not self.screen_context_enabled
+        if not self.screen_context_enabled:
+            self._clear_screen_context_cache()
         self._rebuild_menu()
         detail = (
-            "Enabled — screenshots will be sent to OpenRouter to refine the local transcript."
+            "Enabled — a fresh screenshot will be prefetched while idle and sent to OpenRouter to refine the local transcript."
             if self.screen_context_enabled
             else "Disabled — only local ASR will be used."
         )
+        if self.screen_context_enabled:
+            threading.Thread(
+                target=self._refresh_screen_context_cache,
+                kwargs={"reason": "enable"},
+                daemon=True,
+            ).start()
         rumps.notification("Voice Transcribe", "Screen Assist", detail)
 
     def _clear_history(self, _):

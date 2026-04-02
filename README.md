@@ -48,7 +48,7 @@ Raw ASR output goes through `format_text.py` which normalizes:
 
 ### Screen Assist (Optional)
 
-When enabled from the menu bar, Voice Transcribe captures a screenshot at key release and sends:
+When enabled from the menu bar, Voice Transcribe keeps a fresh screenshot prefetched while idle, then uses that cached screenshot when you stop speaking. It sends:
 - the local transcript
 - the screenshot
 
@@ -190,6 +190,17 @@ Expected secret payload:
 
 Default region: `us-west-2`
 
+Useful optional env vars:
+
+```bash
+VOICE_TRANSCRIBE_SCREEN_CONTEXT=1                 # start with Screen Assist enabled
+VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS=5
+VOICE_TRANSCRIBE_SCREEN_MAX_AGE_SECONDS=15
+VOICE_TRANSCRIBE_SCREEN_TIMEOUT_SECONDS=20        # OpenRouter timeout
+VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST=1 # run one-shot startup verification in logs
+VOICE_TRANSCRIBE_SCREEN_SELFTEST_PROMPT="open claw"
+```
+
 ### Run
 
 ```bash
@@ -198,6 +209,8 @@ Default region: `us-west-2`
 ./.venv/bin/python3 ./transcribe.py
 # start with Screen Assist enabled by default for this launch:
 VOICE_TRANSCRIBE_SCREEN_CONTEXT=1 ./run.sh
+# run a startup self-test and log the result:
+VOICE_TRANSCRIBE_SCREEN_CONTEXT=1 VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST=1 ./run.sh
 # or background:
 nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 ```
