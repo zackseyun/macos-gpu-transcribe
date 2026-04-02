@@ -44,7 +44,6 @@ from format_text import format_transcription
 from screen_context import (
     capture_frontmost_window_snapshot,
     extract_screen_text_context,
-    is_feature_enabled,
 )
 
 # -- Constants --
@@ -52,6 +51,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 HISTORY_FILE = Path(__file__).parent / "history.json"
 GLOSSARY_MEMORY_FILE = Path(__file__).parent / "screen_glossary_memory.json"
+SETTINGS_FILE = Path(__file__).parent / "settings.json"
 LOCK_FILE = Path("/tmp/voice-transcribe.lock")
 MAX_HISTORY = 100
 ICON_IDLE = "🎙"
@@ -92,12 +92,13 @@ class VoiceTranscribeApp(rumps.App):
         self.is_processing = False
         self.audio_buffer = []
         self.history = self._load_history()
+        self.settings = self._load_settings()
         self._pending_title = None
         self._recording_start_time = None
         self._last_heartbeat = time.time()
         self._main_thread_actions = queue.SimpleQueue()
         self._last_release_handled_at = 0.0
-        self.screen_context_enabled = is_feature_enabled()
+        self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
@@ -823,6 +824,22 @@ class VoiceTranscribeApp(rumps.App):
         except IOError as e:
             print(f"Failed to save history: {e}", flush=True)
 
+    def _load_settings(self):
+        if SETTINGS_FILE.exists():
+            try:
+                data = json.loads(SETTINGS_FILE.read_text())
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {"screen_context_enabled": False}
+
+    def _save_settings(self):
+        try:
+            SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2))
+        except IOError as e:
+            print(f"Failed to save settings: {e}", flush=True)
+
     def _load_glossary_memory(self):
         if GLOSSARY_MEMORY_FILE.exists():
             try:
@@ -966,6 +983,8 @@ class VoiceTranscribeApp(rumps.App):
 
     def _toggle_screen_context(self, _):
         self.screen_context_enabled = not self.screen_context_enabled
+        self.settings["screen_context_enabled"] = self.screen_context_enabled
+        self._save_settings()
         if not self.screen_context_enabled:
             self._clear_screen_context_cache()
         self._rebuild_menu()
