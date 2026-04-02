@@ -24,9 +24,9 @@ import json
 import multiprocessing
 import os
 import queue
+import threading
 import subprocess
 import tempfile
-import threading
 import time
 import wave
 from datetime import datetime
@@ -92,6 +92,7 @@ class VoiceTranscribeApp(rumps.App):
         self._pending_title = None
         self._recording_start_time = None
         self._last_heartbeat = time.time()
+        self._main_thread_actions = queue.SimpleQueue()
         self.screen_context_enabled = is_feature_enabled()
         self._screen_assist_selftest_enabled = _env_flag(
             "VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST"
@@ -264,12 +265,28 @@ class VoiceTranscribeApp(rumps.App):
     @rumps.timer(0.1)
     def _tick(self, _):
         """Main-thread timer: apply pending title + update recording duration."""
+        while True:
+            try:
+                action = self._main_thread_actions.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                action()
+            except Exception as exc:
+                print(f"Main-thread action failed: {exc}", flush=True)
+
         if self._pending_title is not None:
             self.title = self._pending_title
             self._pending_title = None
         elif self.is_recording and self._recording_start_time:
             elapsed = time.time() - self._recording_start_time
             self.title = f"🔴 {elapsed:.0f}s"
+
+    def _run_on_main_thread(self, action):
+        if threading.current_thread() is threading.main_thread():
+            action()
+        else:
+            self._main_thread_actions.put(action)
 
     def _play_sound(self, name):
         """Play a system sound (non-blocking)."""
@@ -917,6 +934,10 @@ class VoiceTranscribeApp(rumps.App):
         return context
 
     def _add_to_history(self, text):
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_main_thread(lambda: self._add_to_history(text))
+            return
+
         entry = {"text": text, "timestamp": datetime.now().isoformat()}
         self.history.insert(0, entry)
         self.history = self.history[:MAX_HISTORY]
@@ -924,6 +945,10 @@ class VoiceTranscribeApp(rumps.App):
         self._rebuild_menu()
 
     def _rebuild_menu(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_main_thread(self._rebuild_menu)
+            return
+
         self.menu.clear()
 
         self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
@@ -984,9 +1009,12 @@ class VoiceTranscribeApp(rumps.App):
         rumps.notification("Voice Transcribe", "Screen Assist", detail)
 
     def _clear_history(self, _):
-        self.history = []
-        self._save_history()
-        self._rebuild_menu()
+        def clear():
+            self.history = []
+            self._save_history()
+            self._rebuild_menu()
+
+        self._run_on_main_thread(clear)
 
 
 if __name__ == "__main__":
