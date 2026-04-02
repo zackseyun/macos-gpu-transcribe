@@ -12,6 +12,16 @@ from dataclasses import dataclass
 
 from AppKit import NSWorkspace
 from Foundation import NSURL
+from ApplicationServices import (
+    AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication,
+    kAXChildrenAttribute,
+    kAXDescriptionAttribute,
+    kAXFocusedWindowAttribute,
+    kAXRoleAttribute,
+    kAXTitleAttribute,
+    kAXValueAttribute,
+)
 import Quartz
 import Vision
 
@@ -47,6 +57,8 @@ class ScreenSnapshot:
     app_name: str = ""
     window_title: str = ""
     window_id: int | None = None
+    app_pid: int | None = None
+    accessibility_lines: list[str] | None = None
 
 
 @dataclass
@@ -56,6 +68,7 @@ class ScreenTextContext:
     lines: list[str] | None = None
     app_name: str = ""
     window_title: str = ""
+    source: str = ""
     recognition_time_ms: int = 0
     error: str | None = None
 
@@ -70,11 +83,17 @@ def is_feature_enabled(default: bool = False) -> bool:
 def capture_frontmost_window_snapshot() -> ScreenSnapshot:
     info = _get_frontmost_window_info()
     path = _capture_screen_snapshot(window_id=info.get("window_id"))
+    accessibility_lines = _extract_accessibility_lines_for_window(
+        pid=info.get("app_pid"),
+        window_title=info.get("window_title", ""),
+    )
     return ScreenSnapshot(
         path=path,
         app_name=info.get("app_name", ""),
         window_title=info.get("window_title", ""),
         window_id=info.get("window_id"),
+        app_pid=info.get("app_pid"),
+        accessibility_lines=accessibility_lines,
     )
 
 
@@ -83,10 +102,17 @@ def extract_screen_text_context(
     *,
     app_name: str = "",
     window_title: str = "",
+    accessibility_lines: list[str] | None = None,
 ) -> ScreenTextContext:
     started = time.time()
     try:
-        lines = _recognize_text_lines(screenshot_path)
+        lines = list(accessibility_lines or [])
+        source = "accessibility" if lines else ""
+        if not lines:
+            lines, source = _extract_accessibility_lines(app_name=app_name, window_title=window_title)
+        if not lines:
+            lines = _recognize_text_lines(screenshot_path)
+            source = "ocr"
         terms = _extract_salient_terms(lines, app_name=app_name, window_title=window_title)
         glossary = _build_glossary(
             terms=terms,
@@ -100,6 +126,7 @@ def extract_screen_text_context(
             lines=lines,
             app_name=app_name,
             window_title=window_title,
+            source=source,
             recognition_time_ms=int((time.time() - started) * 1000),
         )
     except Exception as exc:
@@ -107,6 +134,7 @@ def extract_screen_text_context(
             app_name=app_name,
             window_title=window_title,
             error=str(exc),
+            source="",
             recognition_time_ms=int((time.time() - started) * 1000),
         )
 
@@ -138,6 +166,7 @@ def _get_frontmost_window_info():
         "app_name": app_name,
         "window_title": str((selected or {}).get("kCGWindowName") or ""),
         "window_id": int((selected or {}).get("kCGWindowNumber")) if selected else None,
+        "app_pid": pid,
     }
 
 
@@ -213,6 +242,107 @@ def _recognize_text_lines(screenshot_path: str) -> list[str]:
             seen.add(key)
             deduped.append(line)
     return deduped
+
+
+def _ax_copy(element, attribute):
+    try:
+        err, value = AXUIElementCopyAttributeValue(element, attribute, None)
+        if err == 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _extract_accessibility_lines(*, app_name: str, window_title: str) -> tuple[list[str], str]:
+    workspace = NSWorkspace.sharedWorkspace()
+    app = workspace.frontmostApplication()
+    if not app:
+        return [], ""
+
+    if app_name and str(app.localizedName() or "") != app_name:
+        return [], ""
+
+    lines = _extract_accessibility_lines_for_window(
+        pid=int(app.processIdentifier()),
+        window_title=window_title,
+        app_name=app_name,
+    )
+    return lines, "accessibility" if lines else ""
+
+
+def _extract_accessibility_lines_for_window(*, pid: int | None, window_title: str, app_name: str = "") -> list[str]:
+    if pid is None:
+        return []
+
+    ax_app = AXUIElementCreateApplication(int(pid))
+    focused = _ax_copy(ax_app, kAXFocusedWindowAttribute)
+    if focused is None:
+        return []
+
+    lines = []
+    seen = set()
+
+    def add_line(text: str):
+        normalized = _normalize_line(text)
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        lines.append(normalized)
+
+    if app_name:
+        add_line(app_name)
+
+    focused_title = _ax_copy(focused, kAXTitleAttribute)
+    if isinstance(focused_title, str) and focused_title:
+        add_line(focused_title)
+
+    def walk(element, depth=0):
+        if depth > 6 or len(lines) >= OCR_MAX_LINES:
+            return
+
+        role = _ax_copy(element, kAXRoleAttribute)
+        title = _ax_copy(element, kAXTitleAttribute)
+        value = _ax_copy(element, kAXValueAttribute)
+        description = _ax_copy(element, kAXDescriptionAttribute)
+
+        for candidate in (title, value, description):
+            if isinstance(candidate, str) and candidate.strip():
+                for chunk in _split_accessibility_text(candidate):
+                    add_line(chunk)
+                    if len(lines) >= OCR_MAX_LINES:
+                        return
+
+        children = _ax_copy(element, kAXChildrenAttribute)
+        if children is None:
+            return
+        try:
+            iterable = list(children)
+        except TypeError:
+            return
+        for child in iterable[:24]:
+            walk(child, depth + 1)
+            if len(lines) >= OCR_MAX_LINES:
+                return
+
+    walk(focused)
+    return lines[:OCR_MAX_LINES]
+
+
+def _split_accessibility_text(text: str) -> list[str]:
+    text = text.replace("\r", "\n")
+    parts = []
+    for line in text.split("\n"):
+        cleaned = _normalize_line(line)
+        if not cleaned:
+            continue
+        if len(cleaned) > 180:
+            cleaned = cleaned[:180].rstrip() + "…"
+        parts.append(cleaned)
+    return parts
 
 
 def _normalize_line(text: str) -> str:

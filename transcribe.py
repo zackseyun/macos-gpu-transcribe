@@ -311,6 +311,7 @@ class VoiceTranscribeApp(rumps.App):
             reason,
             snapshot.app_name,
             snapshot.window_title,
+            snapshot.accessibility_lines or [],
         )
 
         if previous_path and previous_path != screenshot_path and os.path.exists(previous_path):
@@ -323,8 +324,8 @@ class VoiceTranscribeApp(rumps.App):
                 flush=True,
             )
 
-    def _submit_screen_extract_request(self, screenshot_path, captured_at, reason, app_name, window_title):
-        request = (screenshot_path, captured_at, reason, app_name, window_title)
+    def _submit_screen_extract_request(self, screenshot_path, captured_at, reason, app_name, window_title, accessibility_lines):
+        request = (screenshot_path, captured_at, reason, app_name, window_title, accessibility_lines)
         try:
             self._screen_ocr_requests.put_nowait(request)
         except queue.Full:
@@ -337,12 +338,13 @@ class VoiceTranscribeApp(rumps.App):
     def _screen_context_ocr_loop(self):
         """Extract fast screen glossary text from prefetched screenshots in the background."""
         while True:
-            screenshot_path, captured_at, reason, app_name, window_title = self._screen_ocr_requests.get()
+            screenshot_path, captured_at, reason, app_name, window_title, accessibility_lines = self._screen_ocr_requests.get()
             try:
                 result = extract_screen_text_context(
                     screenshot_path,
                     app_name=app_name,
                     window_title=window_title,
+                    accessibility_lines=accessibility_lines,
                 )
                 if result.error:
                     print(f"Screen assist extraction skipped ({reason}): {result.error}", flush=True)
@@ -367,8 +369,8 @@ class VoiceTranscribeApp(rumps.App):
 
                 if reason != "prefetch" or not had_previous:
                     print(
-                        "Screen assist extracted fast screen context "
-                        f"({reason}, {result.recognition_time_ms}ms, {len(terms)} terms): "
+                        "Screen assist extracted screen context "
+                        f"({reason}, source={result.source or 'unknown'}, {result.recognition_time_ms}ms, {len(terms)} terms): "
                         f"{glossary[:180]}",
                         flush=True,
                     )
@@ -424,6 +426,7 @@ class VoiceTranscribeApp(rumps.App):
             "on-demand",
             snapshot.app_name,
             snapshot.window_title,
+            snapshot.accessibility_lines or [],
         )
         return snapshot.path, "on-demand", None
 
