@@ -428,6 +428,7 @@ class VoiceTranscribeApp(rumps.App):
             glossary = self._screen_text_cached_glossary
             cached_for_path = self._screen_text_cached_for_path
             cached_at = self._screen_text_cached_at
+            fresh_terms = list(self._screen_text_cached_terms or [])
 
         retained_terms = self._get_retained_glossary_terms()
         if not glossary and not retained_terms:
@@ -436,8 +437,8 @@ class VoiceTranscribeApp(rumps.App):
         age = time.time() - cached_at if cached_at else None
         if glossary and age is not None and age > SCREEN_CONTEXT_MAX_AGE:
             glossary = ""
+            fresh_terms = []
 
-        fresh_terms = self._split_glossary_terms(glossary)
         merged_terms = []
         seen = set()
         for term in fresh_terms + retained_terms:
@@ -450,9 +451,7 @@ class VoiceTranscribeApp(rumps.App):
         if not merged_terms:
             return "", "stale", age
 
-        fresh_keys = {term.lower() for term in fresh_terms}
-        retained_unique = [term for term in retained_terms if term.lower() not in fresh_keys]
-        merged_context = self._build_screen_context_string(fresh_terms, retained_terms)
+        merged_context = self._build_screen_context_string(glossary, fresh_terms, retained_terms)
         memory_suffix = "+memory" if retained_terms else ""
 
         if fresh_terms and cached_for_path == screenshot_path:
@@ -876,28 +875,10 @@ class VoiceTranscribeApp(rumps.App):
         retained.sort(key=lambda item: (item[1], item[2]), reverse=True)
         return [term for term, _, _ in retained[:GLOSSARY_MEMORY_TOP_TERMS]]
 
-    def _split_glossary_terms(self, glossary):
-        if not glossary:
-            return []
-        prefix = "Visible terms:"
-        text = glossary[len(prefix):].strip() if glossary.startswith(prefix) else glossary
-        parts = [part.strip() for part in text.split(",")]
-        deduped = []
-        seen = set()
-        for part in parts:
-            if not part:
-                continue
-            key = part.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(part)
-        return deduped
-
-    def _build_screen_context_string(self, fresh_terms, retained_terms):
+    def _build_screen_context_string(self, fresh_glossary, fresh_terms, retained_terms):
         parts = []
-        if fresh_terms:
-            parts.append("Visible terms: " + ", ".join(fresh_terms))
+        if fresh_glossary:
+            parts.append(fresh_glossary)
 
         retained_unique = []
         fresh_keys = {term.lower() for term in fresh_terms}

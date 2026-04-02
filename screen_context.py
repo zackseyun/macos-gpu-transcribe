@@ -19,7 +19,7 @@ import Vision
 SCREENSHOT_MAX_DIMENSION = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_MAX_DIMENSION", "1800"))
 SCREENSHOT_TYPE = os.getenv("VOICE_TRANSCRIBE_SCREENSHOT_TYPE", "jpg")
 OCR_RECOGNITION_LEVEL = os.getenv("VOICE_TRANSCRIBE_SCREEN_OCR_LEVEL", "fast").strip().lower()
-OCR_MAX_LINES = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_OCR_MAX_LINES", "12"))
+OCR_MAX_LINES = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_OCR_MAX_LINES", "20"))
 OCR_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_OCR_MAX_TERMS", "18"))
 OCR_MAX_CONTEXT_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 
@@ -88,7 +88,12 @@ def extract_screen_text_context(
     try:
         lines = _recognize_text_lines(screenshot_path)
         terms = _extract_salient_terms(lines, app_name=app_name, window_title=window_title)
-        glossary = _build_glossary(terms=terms, app_name=app_name, window_title=window_title)
+        glossary = _build_glossary(
+            terms=terms,
+            lines=lines,
+            app_name=app_name,
+            window_title=window_title,
+        )
         return ScreenTextContext(
             glossary=glossary,
             terms=terms,
@@ -223,7 +228,7 @@ def _looks_reasonably_clean(text: str) -> bool:
     weird = sum(not (ch.isalnum() or ch in " .,:;/_-()[]{}@#%+&*'\"") for ch in text)
     if alpha + digits < 2:
         return False
-    if weird > max(2, len(text) // 10):
+    if weird > max(4, len(text) // 6):
         return False
     return True
 
@@ -294,13 +299,15 @@ def _looks_useful_token(token: str) -> bool:
     return False
 
 
-def _build_glossary(*, terms: list[str], app_name: str, window_title: str) -> str:
+def _build_glossary(*, terms: list[str], lines: list[str], app_name: str, window_title: str) -> str:
     parts = []
     if app_name:
         parts.append(f"App: {app_name}")
     if window_title:
         parts.append(f"Window: {window_title}")
-    if terms:
+    if lines:
+        parts.append("Visible text: " + " • ".join(lines[:OCR_MAX_LINES]))
+    elif terms:
         parts.append("Visible terms: " + ", ".join(terms[:OCR_MAX_TERMS]))
 
     glossary = " | ".join(part for part in parts if part).strip()
