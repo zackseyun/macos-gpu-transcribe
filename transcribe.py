@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import time
 import wave
+import fcntl
 from datetime import datetime
 from pathlib import Path
 
@@ -51,11 +52,13 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 HISTORY_FILE = Path(__file__).parent / "history.json"
 GLOSSARY_MEMORY_FILE = Path(__file__).parent / "screen_glossary_memory.json"
+LOCK_FILE = Path("/tmp/voice-transcribe.lock")
 MAX_HISTORY = 100
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
+MIN_RECORDING_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_MIN_RECORDING_SECONDS", "0.5"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -69,6 +72,7 @@ GLOSSARY_MEMORY_MIN_COUNT = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MIN_
 GLOSSARY_MEMORY_TOP_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_TOP_TERMS", "12"))
 GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_TERMS", "256"))
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
+RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
 
 
 def _env_flag(name, default=False):
@@ -92,6 +96,7 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_start_time = None
         self._last_heartbeat = time.time()
         self._main_thread_actions = queue.SimpleQueue()
+        self._last_release_handled_at = 0.0
         self.screen_context_enabled = is_feature_enabled()
         self._screen_assist_selftest_enabled = _env_flag(
             "VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST"
@@ -568,6 +573,11 @@ class VoiceTranscribeApp(rumps.App):
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
+                        now = time.monotonic()
+                        if now - self._last_release_handled_at < RELEASE_DEBOUNCE_SECONDS:
+                            print("Ignoring duplicate release event", flush=True)
+                            continue
+                        self._last_release_handled_at = now
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
                         names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
                         model_name = names.get(self._pending_model, self._pending_model)
@@ -673,9 +683,11 @@ class VoiceTranscribeApp(rumps.App):
             peak = np.max(np.abs(audio))
             print(f"Audio: {duration:.1f}s, peak={peak:.4f} ({'SILENT' if peak < 0.001 else 'OK'})", flush=True)
 
-            if duration < 0.3:
-                print("Recording too short, skipping.", flush=True)
-                rumps.notification("Voice Transcribe", "Too Short", "Recording was less than 0.3 seconds.")
+            if duration < MIN_RECORDING_SECONDS:
+                print(
+                    f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS:.2f}s), discarding.",
+                    flush=True,
+                )
                 return
 
             wav_path = tempfile.mktemp(suffix=".wav")
@@ -982,6 +994,16 @@ if __name__ == "__main__":
     import atexit
     import signal
 
+    lock_handle = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Another Voice Transcribe instance is already running; exiting duplicate launch.", flush=True)
+        raise SystemExit(0)
+
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+
     # Hide from dock — menu bar only
     from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
@@ -1000,6 +1022,14 @@ if __name__ == "__main__":
         for proc in multiprocessing.active_children():
             proc.kill()
             proc.join(timeout=2)
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            lock_handle.close()
+        except OSError:
+            pass
 
     atexit.register(_cleanup)
     signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), os._exit(0)))
