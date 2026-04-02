@@ -2,13 +2,13 @@
 """
 Voice Transcribe — hold Fn or Right Option to record, release to transcribe & paste.
 
-Menu bar app using local Cohere/Qwen ASR with optional screenshot-aware correction.
+Menu bar app using local Cohere/Qwen ASR with optional screenshot-aware context.
 
 Architecture:
   - Main process: rumps menu bar app + always-on audio stream
   - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
   - Transcription worker subprocess: loads local ASR model(s), transcribes on demand
-  - Optional screen assist: prefetches screenshots and injects local OCR context into ASR
+  - Optional screen assist: prefetches screenshots, runs local Qwen 2.5 VL, and injects glossary context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
   The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
@@ -38,11 +38,11 @@ import sounddevice as sd
 
 # Subprocess target functions live in separate files (no rumps/sd imports)
 import key_monitor
+import screen_vlm_worker
 import transcribe_worker
 from format_text import format_transcription
 from screen_context import (
     capture_screen_snapshot,
-    extract_screen_text_context,
     is_feature_enabled,
 )
 
@@ -50,11 +50,13 @@ from screen_context import (
 SAMPLE_RATE = 16000
 CHANNELS = 1
 HISTORY_FILE = Path(__file__).parent / "history.json"
+GLOSSARY_MEMORY_FILE = Path(__file__).parent / "screen_glossary_memory.json"
 MAX_HISTORY = 100
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
+SCREEN_VLM_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_SCREEN_VLM_TIMEOUT_SECONDS", "20"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -64,6 +66,10 @@ SCREEN_CONTEXT_MAX_AGE = float(
 SCREEN_CONTEXT_RECORDING_REFRESH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_RECORDING_REFRESH_INTERVAL_SECONDS", "2")
 )
+GLOSSARY_MEMORY_MIN_COUNT = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MIN_COUNT", "2"))
+GLOSSARY_MEMORY_TOP_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_TOP_TERMS", "12"))
+GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_TERMS", "256"))
+SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 
 
 def _env_flag(name, default=False):
@@ -103,6 +109,13 @@ class VoiceTranscribeApp(rumps.App):
         self._screen_text_cache_ready = threading.Event()
         self._screen_ocr_requests = queue.Queue(maxsize=1)
         self._last_recording_refresh = 0.0
+        self._glossary_memory = self._load_glossary_memory()
+
+        # Screen VLM worker subprocess (Qwen 2.5 VL on MLX)
+        self._screen_req_parent, self._screen_req_child = multiprocessing.Pipe()
+        self._screen_res_parent, self._screen_res_child = multiprocessing.Pipe()
+        self._screen_worker = None
+        self._spawn_screen_worker()
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -151,6 +164,22 @@ class VoiceTranscribeApp(rumps.App):
     # The worker holds the local ASR model(s) in GPU memory.
     # It auto-restarts after 50 transcriptions or 4GB active memory to prevent
     # MLX Metal buffer leaks from accumulating (see transcribe_worker.py).
+
+    def _spawn_screen_worker(self):
+        """Start (or restart) the screen glossary extraction worker process."""
+        if self._screen_worker and self._screen_worker.is_alive():
+            self._screen_worker.kill()
+            self._screen_worker.join(timeout=2)
+
+        self._screen_req_parent, self._screen_req_child = multiprocessing.Pipe()
+        self._screen_res_parent, self._screen_res_child = multiprocessing.Pipe()
+
+        self._screen_worker = multiprocessing.Process(
+            target=screen_vlm_worker.run,
+            args=(self._screen_req_child, self._screen_res_child),
+            daemon=True,
+        )
+        self._screen_worker.start()
 
     def _spawn_transcribe_worker(self):
         """Start (or restart) the transcription worker process."""
@@ -206,6 +235,26 @@ class VoiceTranscribeApp(rumps.App):
             self._spawn_transcribe_worker()
             return None
 
+    def _extract_screen_glossary_via_worker(self, screenshot_path):
+        """Send screenshot to the screen worker and wait for a glossary result."""
+        request = {"screenshot_path": screenshot_path}
+        try:
+            self._screen_req_parent.send(request)
+        except (BrokenPipeError, OSError):
+            print("Screen VLM worker pipe broken, respawning...", flush=True)
+            self._spawn_screen_worker()
+            self._screen_req_parent.send(request)
+
+        if self._screen_res_parent.poll(timeout=SCREEN_VLM_TIMEOUT):
+            return self._screen_res_parent.recv()
+
+        print(
+            f"Screen VLM extraction timed out after {SCREEN_VLM_TIMEOUT:.0f}s, respawning...",
+            flush=True,
+        )
+        self._spawn_screen_worker()
+        return {"glossary": "", "terms": [], "raw_text": "", "time_ms": 0, "error": "screen VLM timeout"}
+
     # ── UI Helpers ──
 
     def _set_title(self, icon):
@@ -238,6 +287,10 @@ class VoiceTranscribeApp(rumps.App):
                     time.sleep(1)
                     continue
 
+                if self.is_recording or self.is_processing:
+                    time.sleep(0.5)
+                    continue
+
                 needs_refresh = False
                 with self._screen_context_cache_lock:
                     if not self._screen_context_cached_path:
@@ -268,7 +321,7 @@ class VoiceTranscribeApp(rumps.App):
             self._screen_context_cached_at = captured_at
             self._screen_context_cache_ready.set()
 
-        self._submit_screen_ocr_request(screenshot_path, captured_at, reason)
+        self._submit_screen_extract_request(screenshot_path, captured_at, reason)
 
         if previous_path and previous_path != screenshot_path and os.path.exists(previous_path):
             os.unlink(previous_path)
@@ -280,7 +333,7 @@ class VoiceTranscribeApp(rumps.App):
                 flush=True,
             )
 
-    def _submit_screen_ocr_request(self, screenshot_path, captured_at, reason):
+    def _submit_screen_extract_request(self, screenshot_path, captured_at, reason):
         request = (screenshot_path, captured_at, reason)
         try:
             self._screen_ocr_requests.put_nowait(request)
@@ -292,18 +345,17 @@ class VoiceTranscribeApp(rumps.App):
             self._screen_ocr_requests.put_nowait(request)
 
     def _screen_context_ocr_loop(self):
-        """Extract OCR text from prefetched screenshots in the background."""
+        """Extract screen glossary text from prefetched screenshots in the background."""
         while True:
             screenshot_path, captured_at, reason = self._screen_ocr_requests.get()
             try:
-                result = extract_screen_text_context(screenshot_path)
-                if result.error:
-                    print(f"Screen assist OCR skipped ({reason}): {result.error}", flush=True)
+                result = self._extract_screen_glossary_via_worker(screenshot_path)
+                if result.get("error"):
+                    print(f"Screen assist extraction skipped ({reason}): {result['error']}", flush=True)
                     continue
 
-                glossary = result.glossary or ""
-                terms = result.terms or []
-                lines = result.lines or []
+                glossary = result.get("glossary") or ""
+                terms = result.get("terms") or []
                 if not glossary:
                     continue
 
@@ -314,18 +366,20 @@ class VoiceTranscribeApp(rumps.App):
                         self._screen_text_cached_at = captured_at
                         self._screen_text_cached_glossary = glossary
                         self._screen_text_cached_terms = terms
-                        self._screen_text_cached_lines = lines
+                        self._screen_text_cached_lines = []
                         self._screen_text_cache_ready.set()
+
+                self._remember_glossary_terms(terms)
 
                 if reason != "prefetch" or not had_previous:
                     print(
-                        "Screen assist extracted OCR context "
-                        f"({reason}, {result.recognition_time_ms}ms, {len(terms)} terms): "
+                        "Screen assist extracted Qwen glossary "
+                        f"({reason}, {result.get('time_ms', 0)}ms, {len(terms)} terms): "
                         f"{glossary[:180]}",
                         flush=True,
                     )
             except Exception as exc:
-                print(f"Screen assist OCR crashed ({reason}): {exc}", flush=True)
+                print(f"Screen assist extraction crashed ({reason}): {exc}", flush=True)
 
     def _clear_screen_context_cache(self):
         """Delete any cached screenshot when Screen Assist is disabled."""
@@ -368,30 +422,50 @@ class VoiceTranscribeApp(rumps.App):
             os.unlink(stale_path)
 
         screenshot_path = capture_screen_snapshot()
-        self._submit_screen_ocr_request(screenshot_path, time.time(), "on-demand")
+        self._submit_screen_extract_request(screenshot_path, time.time(), "on-demand")
         return screenshot_path, "on-demand", None
 
     def _get_screen_context_glossary(self, screenshot_path):
-        """Return the freshest OCR glossary without blocking transcription."""
+        """Return merged fresh + retained glossary context without blocking transcription."""
         with self._screen_text_cache_lock:
             glossary = self._screen_text_cached_glossary
             cached_for_path = self._screen_text_cached_for_path
             cached_at = self._screen_text_cached_at
 
-        if not glossary:
+        retained_terms = self._get_retained_glossary_terms()
+        if not glossary and not retained_terms:
             return "", "none", None
 
-        age = time.time() - cached_at
-        if age > SCREEN_CONTEXT_MAX_AGE:
+        age = time.time() - cached_at if cached_at else None
+        if glossary and age is not None and age > SCREEN_CONTEXT_MAX_AGE:
+            glossary = ""
+
+        fresh_terms = self._split_glossary_terms(glossary)
+        merged_terms = []
+        seen = set()
+        for term in fresh_terms + retained_terms:
+            key = term.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_terms.append(term)
+
+        if not merged_terms:
             return "", "stale", age
 
-        if cached_for_path == screenshot_path:
-            return glossary, "matching-prefetch", age
+        fresh_keys = {term.lower() for term in fresh_terms}
+        retained_unique = [term for term in retained_terms if term.lower() not in fresh_keys]
+        merged_context = self._build_screen_context_string(fresh_terms, retained_terms)
+        memory_suffix = "+memory" if retained_terms else ""
 
-        return glossary, "recent-prefetch", age
+        if fresh_terms and cached_for_path == screenshot_path:
+            return merged_context, f"matching-prefetch{memory_suffix}", age
+        if fresh_terms:
+            return merged_context, f"recent-prefetch{memory_suffix}", age
+        return merged_context, "memory-only", None
 
     def _run_screen_assist_self_test(self):
-        """Run a one-shot OCR probe inside the app process for verification."""
+        """Run a one-shot Qwen screen-context probe inside the app process for verification."""
         screenshot_path = None
         audio_path = None
         try:
@@ -402,7 +476,7 @@ class VoiceTranscribeApp(rumps.App):
             )
             self._screen_context_cache_ready.wait(timeout=6)
             screenshot_path, source, age = self._take_screen_context_snapshot()
-            self._screen_text_cache_ready.wait(timeout=4)
+            self._screen_text_cache_ready.wait(timeout=12)
             print(
                 "Screen assist self-test using "
                 f"{source} screenshot "
@@ -412,11 +486,11 @@ class VoiceTranscribeApp(rumps.App):
             )
             glossary, glossary_source, glossary_age = self._get_screen_context_glossary(screenshot_path)
             if not glossary:
-                print("Screen assist self-test failed: OCR glossary unavailable", flush=True)
+                print("Screen assist self-test failed: screen glossary unavailable", flush=True)
                 return
 
             print(
-                "Screen assist self-test OCR context ready "
+                "Screen assist self-test Qwen context ready "
                 f"({glossary_source}"
                 f"{'' if glossary_age is None else f', age={glossary_age:.1f}s'}): "
                 f"{glossary[:220]}",
@@ -438,7 +512,7 @@ class VoiceTranscribeApp(rumps.App):
                 stderr=subprocess.DEVNULL,
             )
             print(
-                f"Screen assist self-test injecting OCR glossary into ASR ({len(glossary)} chars)",
+                f"Screen assist self-test injecting Qwen glossary into ASR ({len(glossary)} chars)",
                 flush=True,
             )
             result = self._transcribe_via_worker(
@@ -631,7 +705,7 @@ class VoiceTranscribeApp(rumps.App):
                     )
                     if screen_context:
                         print(
-                            "Screen assist injecting OCR context "
+                            "Screen assist injecting Qwen context "
                             f"({context_source}"
                             f"{'' if context_age is None else f', age={context_age:.1f}s'}): "
                             f"{screen_context[:220]}",
@@ -639,7 +713,7 @@ class VoiceTranscribeApp(rumps.App):
                         )
                     else:
                         print(
-                            "Screen assist OCR context unavailable; transcribing without screen glossary",
+                            "Screen assist screen glossary unavailable; transcribing without screen context",
                             flush=True,
                         )
                 except Exception as screen_err:
@@ -740,6 +814,108 @@ class VoiceTranscribeApp(rumps.App):
         except IOError as e:
             print(f"Failed to save history: {e}", flush=True)
 
+    def _load_glossary_memory(self):
+        if GLOSSARY_MEMORY_FILE.exists():
+            try:
+                data = json.loads(GLOSSARY_MEMORY_FILE.read_text())
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {"terms": {}}
+
+    def _save_glossary_memory(self):
+        try:
+            GLOSSARY_MEMORY_FILE.write_text(json.dumps(self._glossary_memory, indent=2))
+        except IOError as e:
+            print(f"Failed to save glossary memory: {e}", flush=True)
+
+    def _should_persist_term(self, term):
+        cleaned = term.strip()
+        if len(cleaned) < 3:
+            return False
+        if not any(ch.isalpha() for ch in cleaned):
+            return False
+        if cleaned.islower() and " " not in cleaned and len(cleaned) < 5:
+            return False
+        return True
+
+    def _remember_glossary_terms(self, terms):
+        if not terms:
+            return
+
+        now = time.time()
+        bucket = self._glossary_memory.setdefault("terms", {})
+        changed = False
+        for term in terms:
+            if not self._should_persist_term(term):
+                continue
+            record = bucket.setdefault(term, {"count": 0, "last_seen": 0})
+            record["count"] += 1
+            record["last_seen"] = now
+            changed = True
+
+        if not changed:
+            return
+
+        sorted_items = sorted(
+            bucket.items(),
+            key=lambda item: (item[1].get("count", 0), item[1].get("last_seen", 0)),
+            reverse=True,
+        )[:GLOSSARY_MEMORY_MAX_TERMS]
+        self._glossary_memory["terms"] = {key: value for key, value in sorted_items}
+        self._save_glossary_memory()
+
+    def _get_retained_glossary_terms(self):
+        bucket = self._glossary_memory.get("terms", {})
+        if not isinstance(bucket, dict):
+            return []
+
+        retained = [
+            (term, meta.get("count", 0), meta.get("last_seen", 0))
+            for term, meta in bucket.items()
+            if meta.get("count", 0) >= GLOSSARY_MEMORY_MIN_COUNT
+        ]
+        retained.sort(key=lambda item: (item[1], item[2]), reverse=True)
+        return [term for term, _, _ in retained[:GLOSSARY_MEMORY_TOP_TERMS]]
+
+    def _split_glossary_terms(self, glossary):
+        if not glossary:
+            return []
+        prefix = "Visible terms:"
+        text = glossary[len(prefix):].strip() if glossary.startswith(prefix) else glossary
+        parts = [part.strip() for part in text.split(",")]
+        deduped = []
+        seen = set()
+        for part in parts:
+            if not part:
+                continue
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(part)
+        return deduped
+
+    def _build_screen_context_string(self, fresh_terms, retained_terms):
+        parts = []
+        if fresh_terms:
+            parts.append("Visible terms: " + ", ".join(fresh_terms))
+
+        retained_unique = []
+        fresh_keys = {term.lower() for term in fresh_terms}
+        for term in retained_terms:
+            if term.lower() not in fresh_keys:
+                retained_unique.append(term)
+
+        if retained_unique:
+            parts.append("Frequent terms: " + ", ".join(retained_unique))
+
+        context = " | ".join(parts).strip()
+        if len(context) > SCREEN_CONTEXT_MAX_CHARS:
+            context = context[: SCREEN_CONTEXT_MAX_CHARS - 1].rstrip() + "…"
+        return context
+
     def _add_to_history(self, text):
         entry = {"text": text, "timestamp": datetime.now().isoformat()}
         self.history.insert(0, entry)
@@ -787,7 +963,7 @@ class VoiceTranscribeApp(rumps.App):
 
     def _screen_context_menu_title(self):
         status = "On" if self.screen_context_enabled else "Off"
-        return f"Screen Assist: {status} (local OCR → ASR context)"
+        return f"Screen Assist: {status} (Qwen 2.5 VL → ASR context)"
 
     def _toggle_screen_context(self, _):
         self.screen_context_enabled = not self.screen_context_enabled
@@ -795,7 +971,7 @@ class VoiceTranscribeApp(rumps.App):
             self._clear_screen_context_cache()
         self._rebuild_menu()
         detail = (
-            "Enabled — screenshots will be prefetched and OCR text will be injected into ASR as screen context."
+            "Enabled — screenshots will be prefetched, Qwen 2.5 VL will extract glossary terms, and fresh + frequent terms will be injected into ASR."
             if self.screen_context_enabled
             else "Disabled — only local ASR will be used."
         )
