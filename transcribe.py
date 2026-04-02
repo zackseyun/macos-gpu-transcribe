@@ -8,7 +8,7 @@ Architecture:
   - Main process: rumps menu bar app + always-on audio stream
   - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
   - Transcription worker subprocess: loads local ASR model(s), transcribes on demand
-  - Optional screen assist: sends a screenshot + transcript to OpenRouter/Gemini
+  - Optional screen assist: prefetches screenshots and injects local OCR context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
   The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
@@ -23,6 +23,7 @@ IMPORTANT — CoreAudio threading constraints:
 import json
 import multiprocessing
 import os
+import queue
 import subprocess
 import tempfile
 import threading
@@ -41,8 +42,8 @@ import transcribe_worker
 from format_text import format_transcription
 from screen_context import (
     capture_screen_snapshot,
+    extract_screen_text_context,
     is_feature_enabled,
-    refine_transcript_with_screen_context,
 )
 
 # -- Constants --
@@ -59,6 +60,9 @@ SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
 )
 SCREEN_CONTEXT_MAX_AGE = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_MAX_AGE_SECONDS", "15")
+)
+SCREEN_CONTEXT_RECORDING_REFRESH_INTERVAL = float(
+    os.getenv("VOICE_TRANSCRIBE_SCREEN_RECORDING_REFRESH_INTERVAL_SECONDS", "2")
 )
 
 
@@ -86,14 +90,19 @@ class VoiceTranscribeApp(rumps.App):
         self._screen_assist_selftest_enabled = _env_flag(
             "VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST"
         )
-        self._screen_assist_selftest_prompt = os.getenv(
-            "VOICE_TRANSCRIBE_SCREEN_SELFTEST_PROMPT",
-            "open claw",
-        )
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
         self._screen_context_cached_at = 0.0
         self._screen_context_cache_ready = threading.Event()
+        self._screen_text_cache_lock = threading.Lock()
+        self._screen_text_cached_for_path = None
+        self._screen_text_cached_at = 0.0
+        self._screen_text_cached_glossary = ""
+        self._screen_text_cached_terms = []
+        self._screen_text_cached_lines = []
+        self._screen_text_cache_ready = threading.Event()
+        self._screen_ocr_requests = queue.Queue(maxsize=1)
+        self._last_recording_refresh = 0.0
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -109,6 +118,7 @@ class VoiceTranscribeApp(rumps.App):
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
         threading.Thread(target=self._screen_context_prefetch_loop, daemon=True).start()
+        threading.Thread(target=self._screen_context_ocr_loop, daemon=True).start()
 
         if self._screen_assist_selftest_enabled:
             threading.Thread(target=self._run_screen_assist_self_test, daemon=True).start()
@@ -159,9 +169,13 @@ class VoiceTranscribeApp(rumps.App):
         )
         self._tx_worker.start()
 
-    def _transcribe_via_worker(self, wav_path, model_mode="fast"):
+    def _transcribe_via_worker(self, wav_path, model_mode="fast", screen_context=""):
         """Send wav to worker and wait for result with timeout. Returns dict or None."""
-        request = {"wav_path": wav_path, "model_mode": model_mode}
+        request = {
+            "wav_path": wav_path,
+            "model_mode": model_mode,
+            "screen_context": screen_context,
+        }
         try:
             self._tx_req_parent.send(request)
         except (BrokenPipeError, OSError):
@@ -216,16 +230,12 @@ class VoiceTranscribeApp(rumps.App):
         )
 
     def _screen_context_prefetch_loop(self):
-        """Keep a fresh screenshot ready while Screen Assist is enabled and idle."""
+        """Keep a fresh screenshot ready while Screen Assist is enabled."""
         while True:
             try:
                 if not self.screen_context_enabled:
                     self._clear_screen_context_cache()
                     time.sleep(1)
-                    continue
-
-                if self.is_recording or self.is_processing:
-                    time.sleep(0.5)
                     continue
 
                 needs_refresh = False
@@ -258,6 +268,8 @@ class VoiceTranscribeApp(rumps.App):
             self._screen_context_cached_at = captured_at
             self._screen_context_cache_ready.set()
 
+        self._submit_screen_ocr_request(screenshot_path, captured_at, reason)
+
         if previous_path and previous_path != screenshot_path and os.path.exists(previous_path):
             os.unlink(previous_path)
 
@@ -267,6 +279,53 @@ class VoiceTranscribeApp(rumps.App):
                 f"({reason}, {os.path.getsize(screenshot_path)} bytes)",
                 flush=True,
             )
+
+    def _submit_screen_ocr_request(self, screenshot_path, captured_at, reason):
+        request = (screenshot_path, captured_at, reason)
+        try:
+            self._screen_ocr_requests.put_nowait(request)
+        except queue.Full:
+            try:
+                self._screen_ocr_requests.get_nowait()
+            except queue.Empty:
+                pass
+            self._screen_ocr_requests.put_nowait(request)
+
+    def _screen_context_ocr_loop(self):
+        """Extract OCR text from prefetched screenshots in the background."""
+        while True:
+            screenshot_path, captured_at, reason = self._screen_ocr_requests.get()
+            try:
+                result = extract_screen_text_context(screenshot_path)
+                if result.error:
+                    print(f"Screen assist OCR skipped ({reason}): {result.error}", flush=True)
+                    continue
+
+                glossary = result.glossary or ""
+                terms = result.terms or []
+                lines = result.lines or []
+                if not glossary:
+                    continue
+
+                with self._screen_text_cache_lock:
+                    had_previous = bool(self._screen_text_cached_glossary)
+                    if captured_at >= self._screen_text_cached_at:
+                        self._screen_text_cached_for_path = screenshot_path
+                        self._screen_text_cached_at = captured_at
+                        self._screen_text_cached_glossary = glossary
+                        self._screen_text_cached_terms = terms
+                        self._screen_text_cached_lines = lines
+                        self._screen_text_cache_ready.set()
+
+                if reason != "prefetch" or not had_previous:
+                    print(
+                        "Screen assist extracted OCR context "
+                        f"({reason}, {result.recognition_time_ms}ms, {len(terms)} terms): "
+                        f"{glossary[:180]}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"Screen assist OCR crashed ({reason}): {exc}", flush=True)
 
     def _clear_screen_context_cache(self):
         """Delete any cached screenshot when Screen Assist is disabled."""
@@ -279,6 +338,14 @@ class VoiceTranscribeApp(rumps.App):
 
         if cached_path and os.path.exists(cached_path):
             os.unlink(cached_path)
+
+        with self._screen_text_cache_lock:
+            self._screen_text_cached_for_path = None
+            self._screen_text_cached_at = 0.0
+            self._screen_text_cached_glossary = ""
+            self._screen_text_cached_terms = []
+            self._screen_text_cached_lines = []
+            self._screen_text_cache_ready.clear()
 
     def _take_screen_context_snapshot(self):
         """Return a ready screenshot path, preferring a prefetched screenshot."""
@@ -301,20 +368,41 @@ class VoiceTranscribeApp(rumps.App):
             os.unlink(stale_path)
 
         screenshot_path = capture_screen_snapshot()
+        self._submit_screen_ocr_request(screenshot_path, time.time(), "on-demand")
         return screenshot_path, "on-demand", None
 
+    def _get_screen_context_glossary(self, screenshot_path):
+        """Return the freshest OCR glossary without blocking transcription."""
+        with self._screen_text_cache_lock:
+            glossary = self._screen_text_cached_glossary
+            cached_for_path = self._screen_text_cached_for_path
+            cached_at = self._screen_text_cached_at
+
+        if not glossary:
+            return "", "none", None
+
+        age = time.time() - cached_at
+        if age > SCREEN_CONTEXT_MAX_AGE:
+            return "", "stale", age
+
+        if cached_for_path == screenshot_path:
+            return glossary, "matching-prefetch", age
+
+        return glossary, "recent-prefetch", age
+
     def _run_screen_assist_self_test(self):
-        """Run a one-shot screen assist probe inside the app process for verification."""
+        """Run a one-shot OCR probe inside the app process for verification."""
         screenshot_path = None
-        prompt = self._screen_assist_selftest_prompt.strip() or "open claw"
+        audio_path = None
         try:
             print(
                 "Screen assist self-test starting "
-                f"(screen_context_enabled={self.screen_context_enabled}, prompt={prompt!r})",
+                f"(screen_context_enabled={self.screen_context_enabled})",
                 flush=True,
             )
             self._screen_context_cache_ready.wait(timeout=6)
             screenshot_path, source, age = self._take_screen_context_snapshot()
+            self._screen_text_cache_ready.wait(timeout=4)
             print(
                 "Screen assist self-test using "
                 f"{source} screenshot "
@@ -322,23 +410,59 @@ class VoiceTranscribeApp(rumps.App):
                 f"{'' if age is None else f', age={age:.1f}s'})",
                 flush=True,
             )
-            result = refine_transcript_with_screen_context(prompt, screenshot_path)
-            if result.error:
-                print(f"Screen assist self-test failed: {result.error}", flush=True)
+            glossary, glossary_source, glossary_age = self._get_screen_context_glossary(screenshot_path)
+            if not glossary:
+                print("Screen assist self-test failed: OCR glossary unavailable", flush=True)
                 return
 
-            status = "corrected" if result.corrected else "checked"
             print(
-                "Screen assist self-test "
-                f"{status}: {result.text} "
-                f"(confidence={result.confidence}, evidence={result.evidence_terms})",
+                "Screen assist self-test OCR context ready "
+                f"({glossary_source}"
+                f"{'' if glossary_age is None else f', age={glossary_age:.1f}s'}): "
+                f"{glossary[:220]}",
                 flush=True,
             )
+
+            audio_path = tempfile.mktemp(suffix=".wav")
+            subprocess.run(
+                [
+                    "say",
+                    "-o",
+                    audio_path,
+                    "--file-format=WAVE",
+                    "--data-format=LEI16@16000",
+                    "Open Claude transcription test",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(
+                f"Screen assist self-test injecting OCR glossary into ASR ({len(glossary)} chars)",
+                flush=True,
+            )
+            result = self._transcribe_via_worker(
+                audio_path,
+                model_mode="fast",
+                screen_context=glossary,
+            )
+            if result is None:
+                print("Screen assist self-test ASR timed out", flush=True)
+            elif result.get("error"):
+                print(f"Screen assist self-test ASR failed: {result['error']}", flush=True)
+            else:
+                print(
+                    "Screen assist self-test ASR result: "
+                    f"{result.get('text', '').strip()}",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"Screen assist self-test crashed: {exc}", flush=True)
         finally:
             if screenshot_path and os.path.exists(screenshot_path):
                 os.unlink(screenshot_path)
+            if audio_path and os.path.exists(audio_path):
+                os.unlink(audio_path)
 
     # ── Pipe Polling ──
     # Runs in a background thread. Receives messages from the key monitor subprocess.
@@ -436,6 +560,15 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
         self.is_recording = True
         self._recording_start_time = time.time()
+        if self.screen_context_enabled:
+            now = time.time()
+            if now - self._last_recording_refresh >= SCREEN_CONTEXT_RECORDING_REFRESH_INTERVAL:
+                self._last_recording_refresh = now
+                threading.Thread(
+                    target=self._refresh_screen_context_cache,
+                    kwargs={"reason": "recording-start"},
+                    daemon=True,
+                ).start()
         self._set_title(ICON_RECORDING)
 
     def _stop_recording(self):
@@ -463,7 +596,7 @@ class VoiceTranscribeApp(rumps.App):
         self.is_processing = True
         wav_path = None
         screenshot_path = None
-        screenshot_source = None
+        screen_context = ""
         try:
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
@@ -492,10 +625,31 @@ class VoiceTranscribeApp(rumps.App):
                         )
                     else:
                         print("Screen assist cache miss; captured screenshot on demand", flush=True)
+
+                    screen_context, context_source, context_age = self._get_screen_context_glossary(
+                        screenshot_path
+                    )
+                    if screen_context:
+                        print(
+                            "Screen assist injecting OCR context "
+                            f"({context_source}"
+                            f"{'' if context_age is None else f', age={context_age:.1f}s'}): "
+                            f"{screen_context[:220]}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "Screen assist OCR context unavailable; transcribing without screen glossary",
+                            flush=True,
+                        )
                 except Exception as screen_err:
                     print(f"Screen context capture skipped: {screen_err}", flush=True)
 
-            result = self._transcribe_via_worker(wav_path, model_mode)
+            result = self._transcribe_via_worker(
+                wav_path,
+                model_mode,
+                screen_context=screen_context,
+            )
 
             if result is None:
                 print("Transcription timed out, skipping.", flush=True)
@@ -512,28 +666,6 @@ class VoiceTranscribeApp(rumps.App):
                 print("No speech detected.", flush=True)
                 rumps.notification("Voice Transcribe", "No Speech", "No speech was detected in the recording.")
                 return
-
-            if self.screen_context_enabled and screenshot_path:
-                screen_result = refine_transcript_with_screen_context(
-                    transcript=text,
-                    screenshot_path=screenshot_path,
-                )
-                if screen_result.error:
-                    print(f"Screen assist skipped: {screen_result.error}", flush=True)
-                else:
-                    if screen_result.corrected:
-                        print(
-                            "Screen assist corrected transcript"
-                            f" (confidence={screen_result.confidence},"
-                            f" evidence={screen_result.evidence_terms}): {screen_result.text}",
-                            flush=True,
-                        )
-                    elif screen_result.screen_context:
-                        print(
-                            f"Screen assist checked context: {screen_result.screen_context}",
-                            flush=True,
-                        )
-                    text = screen_result.text
 
             text = format_transcription(text)
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s): {text}", flush=True)
@@ -655,7 +787,7 @@ class VoiceTranscribeApp(rumps.App):
 
     def _screen_context_menu_title(self):
         status = "On" if self.screen_context_enabled else "Off"
-        return f"Screen Assist: {status} (OpenRouter + Gemini 2.5 Flash)"
+        return f"Screen Assist: {status} (local OCR → ASR context)"
 
     def _toggle_screen_context(self, _):
         self.screen_context_enabled = not self.screen_context_enabled
@@ -663,7 +795,7 @@ class VoiceTranscribeApp(rumps.App):
             self._clear_screen_context_cache()
         self._rebuild_menu()
         detail = (
-            "Enabled — a fresh screenshot will be prefetched while idle and sent to OpenRouter to refine the local transcript."
+            "Enabled — screenshots will be prefetched and OCR text will be injected into ASR as screen context."
             if self.screen_context_enabled
             else "Disabled — only local ASR will be used."
         )
