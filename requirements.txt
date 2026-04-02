@@ -3,4 +3,4 @@ sounddevice
 numpy
 pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
-mlx-vlm
+pyobjc-framework-Vision

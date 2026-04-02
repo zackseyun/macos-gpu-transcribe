@@ -8,7 +8,7 @@ Architecture:
   - Main process: rumps menu bar app + always-on audio stream
   - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
   - Transcription worker subprocess: loads local ASR model(s), transcribes on demand
-  - Optional screen assist: prefetches screenshots, runs local Qwen 2.5 VL, and injects glossary context into ASR
+  - Optional screen assist: prefetches frontmost-window screenshots and injects fast local text context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
   The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
@@ -38,11 +38,11 @@ import sounddevice as sd
 
 # Subprocess target functions live in separate files (no rumps/sd imports)
 import key_monitor
-import screen_vlm_worker
 import transcribe_worker
 from format_text import format_transcription
 from screen_context import (
-    capture_screen_snapshot,
+    capture_frontmost_window_snapshot,
+    extract_screen_text_context,
     is_feature_enabled,
 )
 
@@ -56,7 +56,6 @@ ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
-SCREEN_VLM_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_SCREEN_VLM_TIMEOUT_SECONDS", "20"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -100,6 +99,8 @@ class VoiceTranscribeApp(rumps.App):
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
         self._screen_context_cached_at = 0.0
+        self._screen_context_cached_app_name = ""
+        self._screen_context_cached_window_title = ""
         self._screen_context_cache_ready = threading.Event()
         self._screen_text_cache_lock = threading.Lock()
         self._screen_text_cached_for_path = None
@@ -111,12 +112,6 @@ class VoiceTranscribeApp(rumps.App):
         self._screen_ocr_requests = queue.Queue(maxsize=1)
         self._last_recording_refresh = 0.0
         self._glossary_memory = self._load_glossary_memory()
-
-        # Screen VLM worker subprocess (Qwen 2.5 VL on MLX)
-        self._screen_req_parent, self._screen_req_child = multiprocessing.Pipe()
-        self._screen_res_parent, self._screen_res_child = multiprocessing.Pipe()
-        self._screen_worker = None
-        self._spawn_screen_worker()
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -165,22 +160,6 @@ class VoiceTranscribeApp(rumps.App):
     # The worker holds the local ASR model(s) in GPU memory.
     # It auto-restarts after 50 transcriptions or 4GB active memory to prevent
     # MLX Metal buffer leaks from accumulating (see transcribe_worker.py).
-
-    def _spawn_screen_worker(self):
-        """Start (or restart) the screen glossary extraction worker process."""
-        if self._screen_worker and self._screen_worker.is_alive():
-            self._screen_worker.kill()
-            self._screen_worker.join(timeout=2)
-
-        self._screen_req_parent, self._screen_req_child = multiprocessing.Pipe()
-        self._screen_res_parent, self._screen_res_child = multiprocessing.Pipe()
-
-        self._screen_worker = multiprocessing.Process(
-            target=screen_vlm_worker.run,
-            args=(self._screen_req_child, self._screen_res_child),
-            daemon=True,
-        )
-        self._screen_worker.start()
 
     def _spawn_transcribe_worker(self):
         """Start (or restart) the transcription worker process."""
@@ -235,26 +214,6 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, killing worker...", flush=True)
             self._spawn_transcribe_worker()
             return None
-
-    def _extract_screen_glossary_via_worker(self, screenshot_path):
-        """Send screenshot to the screen worker and wait for a glossary result."""
-        request = {"screenshot_path": screenshot_path}
-        try:
-            self._screen_req_parent.send(request)
-        except (BrokenPipeError, OSError):
-            print("Screen VLM worker pipe broken, respawning...", flush=True)
-            self._spawn_screen_worker()
-            self._screen_req_parent.send(request)
-
-        if self._screen_res_parent.poll(timeout=SCREEN_VLM_TIMEOUT):
-            return self._screen_res_parent.recv()
-
-        print(
-            f"Screen VLM extraction timed out after {SCREEN_VLM_TIMEOUT:.0f}s, respawning...",
-            flush=True,
-        )
-        self._spawn_screen_worker()
-        return {"glossary": "", "terms": [], "raw_text": "", "time_ms": 0, "error": "screen VLM timeout"}
 
     # ── UI Helpers ──
 
@@ -326,7 +285,8 @@ class VoiceTranscribeApp(rumps.App):
 
     def _refresh_screen_context_cache(self, reason="prefetch"):
         """Capture and store a fresh screenshot for later transcription use."""
-        screenshot_path = capture_screen_snapshot()
+        snapshot = capture_frontmost_window_snapshot()
+        screenshot_path = snapshot.path
         captured_at = time.time()
         previous_path = None
         had_previous = False
@@ -336,9 +296,17 @@ class VoiceTranscribeApp(rumps.App):
             had_previous = previous_path is not None
             self._screen_context_cached_path = screenshot_path
             self._screen_context_cached_at = captured_at
+            self._screen_context_cached_app_name = snapshot.app_name
+            self._screen_context_cached_window_title = snapshot.window_title
             self._screen_context_cache_ready.set()
 
-        self._submit_screen_extract_request(screenshot_path, captured_at, reason)
+        self._submit_screen_extract_request(
+            screenshot_path,
+            captured_at,
+            reason,
+            snapshot.app_name,
+            snapshot.window_title,
+        )
 
         if previous_path and previous_path != screenshot_path and os.path.exists(previous_path):
             os.unlink(previous_path)
@@ -350,8 +318,8 @@ class VoiceTranscribeApp(rumps.App):
                 flush=True,
             )
 
-    def _submit_screen_extract_request(self, screenshot_path, captured_at, reason):
-        request = (screenshot_path, captured_at, reason)
+    def _submit_screen_extract_request(self, screenshot_path, captured_at, reason, app_name, window_title):
+        request = (screenshot_path, captured_at, reason, app_name, window_title)
         try:
             self._screen_ocr_requests.put_nowait(request)
         except queue.Full:
@@ -362,17 +330,21 @@ class VoiceTranscribeApp(rumps.App):
             self._screen_ocr_requests.put_nowait(request)
 
     def _screen_context_ocr_loop(self):
-        """Extract screen glossary text from prefetched screenshots in the background."""
+        """Extract fast screen glossary text from prefetched screenshots in the background."""
         while True:
-            screenshot_path, captured_at, reason = self._screen_ocr_requests.get()
+            screenshot_path, captured_at, reason, app_name, window_title = self._screen_ocr_requests.get()
             try:
-                result = self._extract_screen_glossary_via_worker(screenshot_path)
-                if result.get("error"):
-                    print(f"Screen assist extraction skipped ({reason}): {result['error']}", flush=True)
+                result = extract_screen_text_context(
+                    screenshot_path,
+                    app_name=app_name,
+                    window_title=window_title,
+                )
+                if result.error:
+                    print(f"Screen assist extraction skipped ({reason}): {result.error}", flush=True)
                     continue
 
-                glossary = result.get("glossary") or ""
-                terms = result.get("terms") or []
+                glossary = result.glossary or ""
+                terms = result.terms or []
                 if not glossary:
                     continue
 
@@ -390,8 +362,8 @@ class VoiceTranscribeApp(rumps.App):
 
                 if reason != "prefetch" or not had_previous:
                     print(
-                        "Screen assist extracted Qwen glossary "
-                        f"({reason}, {result.get('time_ms', 0)}ms, {len(terms)} terms): "
+                        "Screen assist extracted fast screen context "
+                        f"({reason}, {result.recognition_time_ms}ms, {len(terms)} terms): "
                         f"{glossary[:180]}",
                         flush=True,
                     )
@@ -405,6 +377,8 @@ class VoiceTranscribeApp(rumps.App):
             cached_path = self._screen_context_cached_path
             self._screen_context_cached_path = None
             self._screen_context_cached_at = 0.0
+            self._screen_context_cached_app_name = ""
+            self._screen_context_cached_window_title = ""
             self._screen_context_cache_ready.clear()
 
         if cached_path and os.path.exists(cached_path):
@@ -438,9 +412,15 @@ class VoiceTranscribeApp(rumps.App):
         if stale_path and os.path.exists(stale_path):
             os.unlink(stale_path)
 
-        screenshot_path = capture_screen_snapshot()
-        self._submit_screen_extract_request(screenshot_path, time.time(), "on-demand")
-        return screenshot_path, "on-demand", None
+        snapshot = capture_frontmost_window_snapshot()
+        self._submit_screen_extract_request(
+            snapshot.path,
+            time.time(),
+            "on-demand",
+            snapshot.app_name,
+            snapshot.window_title,
+        )
+        return snapshot.path, "on-demand", None
 
     def _get_screen_context_glossary(self, screenshot_path):
         """Return merged fresh + retained glossary context without blocking transcription."""
@@ -482,7 +462,7 @@ class VoiceTranscribeApp(rumps.App):
         return merged_context, "memory-only", None
 
     def _run_screen_assist_self_test(self):
-        """Run a one-shot Qwen screen-context probe inside the app process for verification."""
+        """Run a one-shot fast screen-context probe inside the app process for verification."""
         screenshot_path = None
         audio_path = None
         try:
@@ -507,7 +487,7 @@ class VoiceTranscribeApp(rumps.App):
                 return
 
             print(
-                "Screen assist self-test Qwen context ready "
+                "Screen assist self-test screen context ready "
                 f"({glossary_source}"
                 f"{'' if glossary_age is None else f', age={glossary_age:.1f}s'}): "
                 f"{glossary[:220]}",
@@ -529,7 +509,7 @@ class VoiceTranscribeApp(rumps.App):
                 stderr=subprocess.DEVNULL,
             )
             print(
-                f"Screen assist self-test injecting Qwen glossary into ASR ({len(glossary)} chars)",
+                f"Screen assist self-test injecting screen glossary into ASR ({len(glossary)} chars)",
                 flush=True,
             )
             result = self._transcribe_via_worker(
@@ -722,7 +702,7 @@ class VoiceTranscribeApp(rumps.App):
                     )
                     if screen_context:
                         print(
-                            "Screen assist injecting Qwen context "
+                            "Screen assist injecting screen context "
                             f"({context_source}"
                             f"{'' if context_age is None else f', age={context_age:.1f}s'}): "
                             f"{screen_context[:220]}",
@@ -988,7 +968,7 @@ class VoiceTranscribeApp(rumps.App):
 
     def _screen_context_menu_title(self):
         status = "On" if self.screen_context_enabled else "Off"
-        return f"Screen Assist: {status} (Qwen 2.5 VL → ASR context)"
+        return f"Screen Assist: {status} (fast local text → ASR context)"
 
     def _toggle_screen_context(self, _):
         self.screen_context_enabled = not self.screen_context_enabled
@@ -996,7 +976,7 @@ class VoiceTranscribeApp(rumps.App):
             self._clear_screen_context_cache()
         self._rebuild_menu()
         detail = (
-            "Enabled — screenshots will be prefetched, Qwen 2.5 VL will extract glossary terms, and fresh + frequent terms will be injected into ASR."
+            "Enabled — frontmost-window screenshots will be prefetched, fast local text will be extracted, and fresh + frequent terms will be injected into ASR."
             if self.screen_context_enabled
             else "Disabled — only local ASR will be used."
         )

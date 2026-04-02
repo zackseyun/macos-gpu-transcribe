@@ -2,7 +2,7 @@
 
 A lightweight macOS menu bar app that transcribes speech to text using local AI models. **Hold a key** to record, **release** to transcribe — the text is automatically pasted at your cursor.
 
-Primary transcription runs on-device using Apple Silicon GPU acceleration. Optional **Screen Assist** now stays local too: it prefetches screenshots, uses local **Qwen 2.5 VL** on MLX to extract a compact glossary, and injects those terms into ASR as context before decoding.
+Primary transcription runs on-device using Apple Silicon GPU acceleration. Optional **Screen Assist** now stays local too: it prefetches a screenshot of the **frontmost window**, extracts useful text locally, and injects those terms into ASR as context before decoding.
 
 ## How It Works
 
@@ -49,8 +49,8 @@ Raw ASR output goes through `format_text.py` which normalizes:
 ### Screen Assist (Optional)
 
 When enabled from the menu bar, Voice Transcribe:
-- keeps a fresh screenshot prefetched in the background
-- runs local **Qwen 2.5 VL** screenshot analysis on MLX
+- keeps a fresh screenshot of the **frontmost window** prefetched in the background
+- extracts fast local text from that screenshot plus frontmost app/window metadata
 - builds a compact glossary of visible names, labels, URLs, filenames, and other salient terms
 - retains frequently repeated glossary terms over time
 - injects both the fresh glossary and retained frequent terms into ASR **before** decoding
@@ -70,7 +70,7 @@ For privacy, Screen Assist starts **off** by default until you enable it from th
 | Audio Recording | `sounddevice` (16kHz mono float32 PCM) |
 | Key Monitoring | Quartz CGEvent tap (in a subprocess — see Architecture) |
 | Clipboard/Paste | PyObjC (`AppKit.NSPasteboard` + `Quartz.CGEvent` Cmd+V simulation) |
-| Optional screen-aware context | Qwen 2.5 VL 3B Instruct (MLX) + local ASR context injection |
+| Optional screen-aware context | Frontmost-window screenshot + local Vision text extraction + ASR context injection |
 
 ## Architecture
 
@@ -179,11 +179,10 @@ VOICE_TRANSCRIBE_SCREEN_CONTEXT=1                 # start with Screen Assist ena
 VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS=5
 VOICE_TRANSCRIBE_SCREEN_RECORDING_REFRESH_INTERVAL_SECONDS=2
 VOICE_TRANSCRIBE_SCREEN_MAX_AGE_SECONDS=15
-VOICE_TRANSCRIBE_SCREEN_VLM_MODEL=mlx-community/Qwen2.5-VL-3B-Instruct-4bit
-VOICE_TRANSCRIBE_SCREEN_VLM_TIMEOUT_SECONDS=20
+VOICE_TRANSCRIBE_SCREEN_OCR_LEVEL=fast            # fast|accurate
 VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MIN_COUNT=2
 VOICE_TRANSCRIBE_GLOSSARY_MEMORY_TOP_TERMS=12
-VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST=1 # run one-shot Qwen verification in logs
+VOICE_TRANSCRIBE_STARTUP_SCREEN_ASSIST_SELFTEST=1 # run one-shot screen-context verification in logs
 ```
 
 ### Run
@@ -206,8 +205,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 voice-transcribe/
 ├── transcribe.py          # Main app — menu bar UI, audio, paste logic
 ├── transcribe_worker.py   # Worker subprocess — model loading & inference
-├── screen_context.py      # Screenshot capture helpers
-├── screen_vlm_worker.py   # Qwen 2.5 VL glossary extraction on MLX
+├── screen_context.py      # Frontmost-window screenshot + local text extraction
 ├── key_monitor.py         # Key monitor subprocess — Quartz CGEvent tap
 ├── format_text.py         # Post-processing — numbers, currency, percentages
 ├── install.sh             # Install wizard — sets up everything automatically
@@ -224,7 +222,7 @@ voice-transcribe/
 |---------|----------|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart app |
 | No audio recording | Grant Microphone permission when prompted |
-| Screen Assist says screen glossary is unavailable | Grant Screen Recording permission to Python.app and make sure the Qwen 2.5 VL model can load locally |
+| Screen Assist says screen glossary is unavailable | Grant Screen Recording permission to Python.app and make sure `pyobjc-framework-Vision` is installed |
 | Menu bar icon doesn't change | Expected on first run — the `rumps.Timer` needs the app run loop |
 | Multiple menu bar icons | Kill all: `pkill -9 -f transcribe.py` then restart |
 | Cohere model: 401 Unauthorized | Request access at huggingface.co/CohereLabs/cohere-transcribe-03-2026, then re-run `install.sh` |
