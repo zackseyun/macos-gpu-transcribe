@@ -57,6 +57,20 @@ MAX_HISTORY = 100
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
 ICON_PROCESSING = "⏳"
+
+# Thermal state labels and icons (NSProcessInfoThermalState values)
+THERMAL_STATES = {
+    0: ("Normal", "✅"),
+    1: ("Fair", "⚠️"),
+    2: ("Serious", "🔥"),
+    3: ("Critical", "🛑"),
+}
+THERMAL_ICON_SUFFIX = {
+    0: "",       # Normal — no indicator
+    1: "",       # Fair — no indicator (minor)
+    2: "🔥",    # Serious — show fire on menu bar icon
+    3: "🛑",    # Critical — show stop on menu bar icon
+}
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
 MIN_RECORDING_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_MIN_RECORDING_SECONDS", "0.5"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
@@ -135,6 +149,35 @@ class VoiceTranscribeApp(rumps.App):
 
         if self._screen_assist_selftest_enabled:
             threading.Thread(target=self._run_screen_assist_self_test, daemon=True).start()
+
+    # ── Thermal Monitoring ──
+
+    def _get_thermal_state(self):
+        """Return macOS thermal state as (level_int, label, icon)."""
+        try:
+            from Foundation import NSProcessInfo
+            level = NSProcessInfo.processInfo().thermalState()
+        except Exception:
+            level = 0
+        label, icon = THERMAL_STATES.get(level, ("Unknown", "❓"))
+        return level, label, icon
+
+    def _thermal_menu_title(self):
+        level, label, icon = self._get_thermal_state()
+        suffix = ""
+        if level == 1:
+            suffix = " (minor slowdowns possible)"
+        elif level == 2:
+            suffix = " (GPU throttling — expect slow transcriptions)"
+        elif level >= 3:
+            suffix = " (heavily throttled — transcriptions will be very slow)"
+        return f"{icon} Thermal: {label}{suffix}"
+
+    def _idle_icon_with_thermal(self):
+        """Return the idle icon, appending a thermal warning if needed."""
+        level, _, _ = self._get_thermal_state()
+        suffix = THERMAL_ICON_SUFFIX.get(level, "")
+        return f"{ICON_IDLE}{suffix}" if suffix else ICON_IDLE
 
     # ── Key Monitor Management ──
     # The key monitor runs as a subprocess with a Quartz CGEvent tap.
@@ -664,7 +707,7 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
 
         if not audio_data:
-            self._set_title(ICON_IDLE)
+            self._set_title(self._idle_icon_with_thermal())
             return
 
         model_mode = self._pending_model or "fast"
@@ -683,13 +726,16 @@ class VoiceTranscribeApp(rumps.App):
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
             peak = np.max(np.abs(audio))
-            print(f"Audio: {duration:.1f}s, peak={peak:.4f} ({'SILENT' if peak < 0.001 else 'OK'})", flush=True)
+            thermal_level, thermal_label, thermal_icon = self._get_thermal_state()
+            thermal_note = f", thermal={thermal_label}" if thermal_level > 0 else ""
+            print(f"Audio: {duration:.1f}s, peak={peak:.4f} ({'SILENT' if peak < 0.001 else 'OK'}){thermal_note}", flush=True)
 
             if duration < MIN_RECORDING_SECONDS:
                 print(
                     f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS:.2f}s), discarding.",
                     flush=True,
                 )
+                self._set_title(self._idle_icon_with_thermal())
                 return
 
             wav_path = tempfile.mktemp(suffix=".wav")
@@ -752,7 +798,11 @@ class VoiceTranscribeApp(rumps.App):
                 return
 
             text = format_transcription(text)
-            print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s): {text}", flush=True)
+            post_thermal_level, post_thermal_label, _ = self._get_thermal_state()
+            slow_note = ""
+            if transcribe_time > 3.0:
+                slow_note = f" ⚠️ SLOW (thermal={post_thermal_label})"
+            print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
             self._add_to_history(text)
             self._paste_text(text)
 
@@ -761,7 +811,8 @@ class VoiceTranscribeApp(rumps.App):
             rumps.notification("Voice Transcribe", "Error", str(e))
         finally:
             self.is_processing = False
-            self._set_title(ICON_IDLE)
+            self._set_title(self._idle_icon_with_thermal())
+            self._run_on_main_thread(self._rebuild_menu)
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
             if screenshot_path and os.path.exists(screenshot_path):
@@ -944,6 +995,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
+        self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
         self.menu.add(rumps.separator)
 
         if self.history:
