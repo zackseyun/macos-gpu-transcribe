@@ -30,10 +30,20 @@ QWEN3_MODEL_IDS = {
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
 MAX_SCREEN_CONTEXT_CHARS = 320
 
-# Keep-warm cadence — must be short enough that MPS shader cache stays resident.
-# macOS evicts Metal state after ~30-60s of GPU idle, so 45s is a safe ceiling.
-KEEP_WARM_INTERVAL = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_INTERVAL", "45"))
+# Keep-warm cadence — must be SHORTER than MPS eviction window.
+# Empirically macOS evicts Metal shader state after ~30s of GPU idle. We use 20s
+# to stay comfortably under that. Sleep granularity is 2s so worst-case fire is ~22s.
+KEEP_WARM_INTERVAL = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_INTERVAL", "20"))
+KEEP_WARM_CHECK_INTERVAL = 2.0
 KEEP_WARM_AUDIO_SECONDS = 0.5  # 0.5s of silence = trivially fast dummy inference
+
+# After this many seconds of no real transcription, stop keep-warming. The next
+# user action will trigger an on-demand warm via the __warm__ message instead.
+# This prevents constant GPU heat during long idle periods.
+KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300"))
+
+# Skip on-demand warm if model was used within this many seconds (already hot).
+ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
 
 
 def _sanitize_screen_context(screen_context):
@@ -144,39 +154,56 @@ def run(request_pipe, result_pipe):
 
     # Lock serializes keep-warm with real transcriptions so they never race on MPS.
     inference_lock = threading.Lock()
-    last_inference_at = [time.time()]  # list = mutable for closure
+    last_real_inference_at = [time.time()]  # last real (non-warm) transcription
+    last_any_inference_at = [time.time()]   # last any inference (real OR warm)
+
+    def _do_warm(reason):
+        """Run a silent dummy inference. Returns True if it actually ran."""
+        if cohere_model is None or warm_wav_path is None:
+            return False
+        if not inference_lock.acquire(blocking=False):
+            return False
+        try:
+            t0 = time.time()
+            _transcribe_cohere(
+                warm_wav_path, cohere_processor, cohere_model, screen_context=""
+            )
+            last_any_inference_at[0] = time.time()
+            dt = time.time() - t0
+            if dt > 1.5:
+                print(
+                    f"Transcription worker: {reason}-warm took {dt:.1f}s "
+                    f"(MPS was cold — caught a stale state)",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            print(f"Transcription worker: {reason}-warm failed: {exc}", flush=True)
+            return False
+        finally:
+            inference_lock.release()
 
     def _keep_warm_loop():
-        """Background thread: run a silent dummy inference periodically to keep MPS hot."""
+        """Background thread: tight keep-warm loop that bounds itself to active sessions.
+
+        Fires every KEEP_WARM_INTERVAL seconds while a real transcription has happened
+        within KEEP_WARM_MAX_IDLE seconds. After that, it goes quiet — the next Fn press
+        will trigger on-demand warming via the __warm__ message instead. This prevents
+        wasted GPU/heat during long idle periods (overnight, walking away, etc.).
+        """
         while True:
             try:
-                time.sleep(5)
+                time.sleep(KEEP_WARM_CHECK_INTERVAL)
                 if cohere_model is None or warm_wav_path is None:
                     continue
-                idle = time.time() - last_inference_at[0]
-                if idle < KEEP_WARM_INTERVAL:
+                now = time.time()
+                # Stop keep-warming if no real activity recently — let GPU sleep.
+                if now - last_real_inference_at[0] > KEEP_WARM_MAX_IDLE:
                     continue
-                # Try to grab the lock without blocking real requests.
-                if not inference_lock.acquire(blocking=False):
+                # Don't warm if we just warmed/transcribed.
+                if now - last_any_inference_at[0] < KEEP_WARM_INTERVAL:
                     continue
-                try:
-                    t0 = time.time()
-                    _transcribe_cohere(
-                        warm_wav_path, cohere_processor, cohere_model, screen_context=""
-                    )
-                    last_inference_at[0] = time.time()
-                    # Only log if it was slow (indicates we caught a cold-start)
-                    dt = time.time() - t0
-                    if dt > 1.5:
-                        print(
-                            f"Transcription worker: keep-warm took {dt:.1f}s "
-                            f"(MPS was cold)",
-                            flush=True,
-                        )
-                except Exception as exc:
-                    print(f"Transcription worker: keep-warm failed: {exc}", flush=True)
-                finally:
-                    inference_lock.release()
+                _do_warm("keep")
             except Exception as exc:
                 print(f"Transcription worker: keep-warm loop error: {exc}", flush=True)
 
@@ -190,6 +217,21 @@ def run(request_pipe, result_pipe):
 
         if request == "__quit__":
             break
+
+        # On-demand warm signal: main app sends this when user presses the Fn key
+        # so by the time they release the key (1-15s later) MPS is already hot.
+        # Run in a thread so the request loop returns to recv() immediately for
+        # the upcoming real transcription request.
+        if isinstance(request, dict) and request.get("__warm__"):
+            if cohere_model is None or warm_wav_path is None:
+                continue
+            now = time.time()
+            if now - last_any_inference_at[0] < ON_DEMAND_WARM_SKIP_THRESHOLD:
+                continue  # already hot, skip
+            threading.Thread(
+                target=_do_warm, args=("on-demand",), daemon=True
+            ).start()
+            continue
 
         # Support both old format (string path) and new format (dict with model_mode)
         if isinstance(request, str):
@@ -223,6 +265,7 @@ def run(request_pipe, result_pipe):
                     # Pre-warm so the first real inference isn't 8s+ of MPS compile
                     if warm_wav_path is not None:
                         _prewarm_cohere(cohere_processor, cohere_model, warm_wav_path)
+                        last_any_inference_at[0] = time.time()
 
                 with inference_lock:
                     text = _transcribe_cohere(
@@ -231,7 +274,9 @@ def run(request_pipe, result_pipe):
                         cohere_model,
                         screen_context=screen_context,
                     )
-                    last_inference_at[0] = time.time()
+                    now = time.time()
+                    last_real_inference_at[0] = now
+                    last_any_inference_at[0] = now
             else:
                 # Qwen3 via MLX
                 model_id = QWEN3_MODEL_IDS.get(model_mode, QWEN3_MODEL_IDS["fast"])

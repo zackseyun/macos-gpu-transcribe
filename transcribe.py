@@ -225,6 +225,21 @@ class VoiceTranscribeApp(rumps.App):
         )
         self._tx_worker.start()
 
+    def _send_warm_signal(self):
+        """Tell the worker to pre-warm MPS while the user is recording.
+
+        Fired on Fn key down for Cohere mode. The worker checks if the model has
+        been idle long enough to need warming and runs a silent dummy inference
+        in a background thread. By the time the user releases the key, MPS is
+        hot and ready — eliminating the cold-start latency that otherwise hits
+        the first transcription after an idle period.
+        """
+        try:
+            self._tx_req_parent.send({"__warm__": True})
+        except (BrokenPipeError, OSError):
+            # Worker is dead — the next real request will respawn it.
+            pass
+
     def _transcribe_via_worker(self, wav_path, model_mode="fast", screen_context=""):
         """Send wav to worker and wait for result with timeout. Returns dict or None."""
         request = {
@@ -615,6 +630,11 @@ class VoiceTranscribeApp(rumps.App):
                         model_name = names.get(mode, mode)
                         print(f"{label} hold → recording ({model_name})", flush=True)
                         self._play_sound("Tink")
+                        # Speculatively warm MPS while user is recording. By the time
+                        # they release the key, the model will be hot and ready, so
+                        # cold-start latency is hidden inside the recording duration.
+                        if mode == "cohere":
+                            self._send_warm_signal()
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
