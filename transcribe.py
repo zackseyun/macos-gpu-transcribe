@@ -309,8 +309,19 @@ class VoiceTranscribeApp(rumps.App):
         else:
             self._main_thread_actions.put(action)
 
+    # Per-sound dedupe — guards against any duplicate trigger paths (key event
+    # echoes, race windows, synthetic Cmd+V observed by tap, etc.). 250ms is well
+    # under intentional repeat cadence but covers OS-level event bounces.
+    _SOUND_DEDUPE_WINDOW = 0.25
+
     def _play_sound(self, name):
-        """Play a system sound (non-blocking)."""
+        """Play a system sound (non-blocking, deduped within 250ms per name)."""
+        now = time.monotonic()
+        last = getattr(self, "_last_sound_at", {})
+        if now - last.get(name, 0.0) < self._SOUND_DEDUPE_WINDOW:
+            return
+        last[name] = now
+        self._last_sound_at = last
         subprocess.Popen(
             ["afplay", f"/System/Library/Sounds/{name}.aiff"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -721,12 +732,18 @@ class VoiceTranscribeApp(rumps.App):
             return
         self.is_recording = False
         self._recording_start_time = None
+        # Set is_processing synchronously here (not inside the worker thread) so
+        # there's no race window where both is_recording and is_processing are
+        # False — otherwise a stray flagsChanged echo arriving in that gap could
+        # trigger a duplicate Tink + recording start.
+        self.is_processing = True
         self._set_title(ICON_PROCESSING)
 
         audio_data = self.audio_buffer
         self.audio_buffer = []
 
         if not audio_data:
+            self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             return
 
