@@ -88,6 +88,45 @@ GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
 
+# Silence gate — if the loudest 200ms window in the recording has RMS below
+# this threshold, the audio is treated as silent and no transcription runs.
+# Prevents Whisper-style ASR hallucinations on silent/near-silent input
+# ("Thank you.", ".", "you", etc.). Tuned for MacBook Pro internal mic noise
+# floor (~0.002-0.005 RMS); real speech is typically 0.02+.
+SILENCE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_RMS", "0.008"))
+SILENCE_WINDOW_SECONDS = 0.2
+
+# Known ASR hallucination outputs on silent/near-silent audio. These are the
+# most common ones Whisper-family and Cohere Transcribe emit from training
+# data contamination (YouTube captions). Normalized lowercase, no trailing
+# punctuation. If the transcription collapses to one of these, drop it.
+ASR_HALLUCINATIONS = frozenset({
+    "",
+    "you",
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "thanks for watching!",
+    "thank you for watching",
+    "thank you so much",
+    "thank you very much",
+    "bye",
+    "bye bye",
+    "okay",
+    "ok",
+    "mm",
+    "mhm",
+    "uh",
+    "um",
+    ".",
+    "...",
+    "♪",
+    "♪♪",
+    "[music]",
+    "[silence]",
+    "(silence)",
+})
+
 
 def _env_flag(name, default=False):
     raw = os.getenv(name)
@@ -763,13 +802,42 @@ class VoiceTranscribeApp(rumps.App):
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
             peak = np.max(np.abs(audio))
+            # Max RMS over sliding 200ms windows — robust to brief pops and
+            # mic crackle that would fool a pure peak threshold.
+            window_samples = max(1, int(SILENCE_WINDOW_SECONDS * SAMPLE_RATE))
+            if len(audio) >= window_samples:
+                num_windows = len(audio) // window_samples
+                trimmed = audio[: num_windows * window_samples]
+                window_rms = np.sqrt(
+                    np.mean(trimmed.reshape(num_windows, window_samples) ** 2, axis=1)
+                )
+                max_rms = float(np.max(window_rms)) if num_windows > 0 else 0.0
+            else:
+                max_rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+
             thermal_level, thermal_label, thermal_icon = self._get_thermal_state()
             thermal_note = f", thermal={thermal_label}" if thermal_level > 0 else ""
-            print(f"Audio: {duration:.1f}s, peak={peak:.4f} ({'SILENT' if peak < 0.001 else 'OK'}){thermal_note}", flush=True)
+            print(
+                f"Audio: {duration:.1f}s, peak={peak:.4f}, max_rms={max_rms:.4f} "
+                f"({'SILENT' if peak < 0.001 else 'OK'}){thermal_note}",
+                flush=True,
+            )
 
             if duration < MIN_RECORDING_SECONDS:
                 print(
                     f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS:.2f}s), discarding.",
+                    flush=True,
+                )
+                self._set_title(self._idle_icon_with_thermal())
+                return
+
+            # Silence gate — skip ASR entirely on silent audio. This prevents
+            # the model from hallucinating "Thank you."-style outputs, and
+            # also saves a GPU roundtrip.
+            if max_rms < SILENCE_RMS_THRESHOLD:
+                print(
+                    f"Silent recording (max_rms={max_rms:.4f} < "
+                    f"{SILENCE_RMS_THRESHOLD}), skipping transcription.",
                     flush=True,
                 )
                 self._set_title(self._idle_icon_with_thermal())
@@ -831,7 +899,18 @@ class VoiceTranscribeApp(rumps.App):
 
             if not text:
                 print("No speech detected.", flush=True)
-                rumps.notification("Voice Transcribe", "No Speech", "No speech was detected in the recording.")
+                return
+
+            # Hallucination filter — ASR models trained on YouTube captions
+            # frequently emit "Thank you.", ".", "you", etc. on near-silent
+            # input. Collapse to a normalized form and drop if it matches a
+            # known hallucination.
+            normalized = text.strip().lower().rstrip(".!?,;: ").strip()
+            if normalized in ASR_HALLUCINATIONS:
+                print(
+                    f"Dropping ASR hallucination on low-content audio: {text!r}",
+                    flush=True,
+                )
                 return
 
             text = format_transcription(text)
