@@ -147,10 +147,72 @@ def _capitalize_first(text):
     return text
 
 
+def _strip_repetition_loop(text, min_phrase_words=3, max_phrase_words=30, min_repeats=3):
+    """Detect and truncate autoregressive loop degeneration in ASR output.
+
+    Scans for any phrase of min_phrase_words..max_phrase_words words that
+    repeats min_repeats or more times consecutively. When found, the text
+    is truncated to just before the first repetition. The earliest (longest)
+    loop start point wins, so we preserve as much real transcript as possible.
+
+    Returns (cleaned_text, was_truncated).
+    """
+    words = text.split()
+    if len(words) < min_phrase_words * min_repeats:
+        return text, False
+
+    best_cut = len(words)  # index in words[] where we'll cut
+
+    for phrase_len in range(min_phrase_words, min_phrase_words + max_phrase_words):
+        if phrase_len * min_repeats > len(words):
+            break
+        # Slide a window looking for consecutive repeats of this phrase length
+        i = 0
+        while i + phrase_len * min_repeats <= len(words):
+            phrase = words[i : i + phrase_len]
+            repeats = 1
+            j = i + phrase_len
+            while j + phrase_len <= len(words):
+                if words[j : j + phrase_len] == phrase:
+                    repeats += 1
+                    j += phrase_len
+                else:
+                    break
+            if repeats >= min_repeats and i < best_cut:
+                best_cut = i
+                break  # found earliest loop start for this phrase_len
+            i += 1
+
+    if best_cut < len(words):
+        cleaned = " ".join(words[:best_cut])
+        # Trim back to the last sentence-ending punctuation so we don't leave
+        # dangling fragments like "...see her and. The"
+        last_sentence_end = max(
+            cleaned.rfind("."), cleaned.rfind("!"), cleaned.rfind("?")
+        )
+        if last_sentence_end > len(cleaned) // 3:
+            cleaned = cleaned[: last_sentence_end + 1]
+        else:
+            # No good sentence boundary — just strip trailing connectors
+            cleaned = re.sub(
+                r"\s+(?:the|a|an|and|but|or|so|is|are|was|of|in|to|that|for|it|with)\s*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).rstrip(" ,.")
+        return cleaned.strip(), True
+
+    return text, False
+
+
 def format_transcription(text):
     """Apply all post-processing to ASR output."""
     if not text:
         return text
+
+    text, was_looping = _strip_repetition_loop(text)
+    if was_looping:
+        print(f"Stripped repetition loop, kept {len(text.split())} words", flush=True)
 
     text = _normalize_digit_multiplier(text)  # "3 thousand" → "3,000" (before word spans)
     text = _convert_number_spans(text)        # "twenty five" → "25"
