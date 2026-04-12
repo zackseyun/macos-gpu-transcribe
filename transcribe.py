@@ -152,6 +152,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_thread_actions = queue.SimpleQueue()
         self._last_release_handled_at = 0.0
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
+        self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
         self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
@@ -355,6 +356,8 @@ class VoiceTranscribeApp(rumps.App):
 
     def _play_sound(self, name):
         """Play a system sound (non-blocking, deduped within 250ms per name)."""
+        if not self.sound_effects_enabled:
+            return
         now = time.monotonic()
         last = getattr(self, "_last_sound_at", {})
         if now - last.get(name, 0.0) < self._SOUND_DEDUPE_WINDOW:
@@ -999,7 +1002,7 @@ class VoiceTranscribeApp(rumps.App):
                     return data
             except (json.JSONDecodeError, IOError):
                 pass
-        return {"screen_context_enabled": False}
+        return {"screen_context_enabled": False, "sound_effects_enabled": True}
 
     def _save_settings(self):
         try:
@@ -1111,6 +1114,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
+        self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
         self.menu.add(rumps.separator)
 
@@ -1168,6 +1172,16 @@ class VoiceTranscribeApp(rumps.App):
                 daemon=True,
             ).start()
         rumps.notification("Voice Transcribe", "Screen Assist", detail)
+
+    def _sound_effects_menu_title(self):
+        status = "On" if self.sound_effects_enabled else "Off"
+        return f"Sound Effects: {status}"
+
+    def _toggle_sound_effects(self, _):
+        self.sound_effects_enabled = not self.sound_effects_enabled
+        self.settings["sound_effects_enabled"] = self.sound_effects_enabled
+        self._save_settings()
+        self._rebuild_menu()
 
     def _clear_history(self, _):
         def clear():
