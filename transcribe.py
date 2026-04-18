@@ -41,6 +41,8 @@ import sounddevice as sd
 import key_monitor
 import transcribe_worker
 from format_text import format_transcription
+from hud_overlay import get_controller as get_hud_controller
+from main_window import get_controller as get_main_window_controller
 from screen_context import (
     capture_frontmost_window_snapshot,
     extract_screen_text_context,
@@ -72,7 +74,6 @@ THERMAL_ICON_SUFFIX = {
     3: "🛑",    # Critical — show stop on menu bar icon
 }
 TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
-MIN_RECORDING_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_MIN_RECORDING_SECONDS", "0.5"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -171,6 +172,16 @@ class VoiceTranscribeApp(rumps.App):
         self._last_recording_refresh = 0.0
         self._glossary_memory = self._load_glossary_memory()
 
+        # Visual feedback — floating HUD near cursor and optional main window
+        self._hud = get_hud_controller()
+        self._main_window = get_main_window_controller()
+        self._main_window.attachApp_(self)
+        self._hud_level_peak = 0.0
+        self._main_window_shown_once = False
+        # Per-model "has this ever completed a transcription this session" flag.
+        # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
+        self._model_warmed = {"fast": False, "accurate": False}
+
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
         self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
@@ -264,6 +275,10 @@ class VoiceTranscribeApp(rumps.App):
             daemon=True,
         )
         self._tx_worker.start()
+        # Fresh worker → models are cold again. Reset warm state so the HUD
+        # shows "Loading model…" on the next use.
+        if hasattr(self, "_model_warmed"):
+            self._model_warmed = {"fast": False, "accurate": False}
 
     def _send_warm_signal(self):
         """Tell the worker to pre-warm MPS while the user is recording.
@@ -342,6 +357,14 @@ class VoiceTranscribeApp(rumps.App):
         elif self.is_recording and self._recording_start_time:
             elapsed = time.time() - self._recording_start_time
             self.title = f"🔴 {elapsed:.0f}s"
+
+        # Open main window once the runloop is live (can't call before .run()).
+        if not self._main_window_shown_once:
+            self._main_window_shown_once = True
+            try:
+                self._main_window.showWindow()
+            except Exception as exc:
+                print(f"Main window open failed: {exc}", flush=True)
 
     def _run_on_main_thread(self, action):
         if threading.current_thread() is threading.main_thread():
@@ -739,6 +762,17 @@ class VoiceTranscribeApp(rumps.App):
                 print(f"Audio status: {status}", flush=True)
             if self.is_recording:
                 self.audio_buffer.append(indata.copy())
+                # Feed HUD waveform — one level per callback is enough for 30fps draw.
+                try:
+                    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                    # Noise gate below the mic noise floor (~0.004-0.006 RMS on
+                    # MacBook mics) → bars flatten when silent rather than
+                    # jittering on ambient noise. Real speech (~0.02+ RMS) still
+                    # produces full-height bars.
+                    level = max(0.0, min(1.0, (rms - 0.006) * 12.0))
+                    self._hud.pushLevel_(level)
+                except Exception:
+                    pass
 
         self._audio_stream = sd.InputStream(
             device=device_idx,
@@ -758,6 +792,7 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
         self.is_recording = True
         self._recording_start_time = time.time()
+        self._run_on_main_thread(self._hud.show)
         if self.screen_context_enabled:
             now = time.time()
             if now - self._last_recording_refresh >= SCREEN_CONTEXT_RECORDING_REFRESH_INTERVAL:
@@ -787,9 +822,13 @@ class VoiceTranscribeApp(rumps.App):
         if not audio_data:
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
+            self._run_on_main_thread(self._hud.hide)
             return
 
         model_mode = self._pending_model or "fast"
+        loading = not self._model_warmed.get(model_mode, False)
+        hud_label = "Loading model…" if loading else "Transcribing…"
+        self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
         threading.Thread(
             target=self._transcribe_and_paste, args=(audio_data, model_mode), daemon=True
         ).start()
@@ -826,17 +865,10 @@ class VoiceTranscribeApp(rumps.App):
                 flush=True,
             )
 
-            if duration < MIN_RECORDING_SECONDS:
-                print(
-                    f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS:.2f}s), discarding.",
-                    flush=True,
-                )
-                self._set_title(self._idle_icon_with_thermal())
-                return
-
             # Silence gate — skip ASR entirely on silent audio. This prevents
             # the model from hallucinating "Thank you."-style outputs, and
-            # also saves a GPU roundtrip.
+            # also saves a GPU roundtrip. Short-but-loud recordings (e.g. "yes",
+            # "no") pass through; short-and-quiet keypress artifacts don't.
             if max_rms < SILENCE_RMS_THRESHOLD:
                 print(
                     f"Silent recording (max_rms={max_rms:.4f} < "
@@ -897,6 +929,10 @@ class VoiceTranscribeApp(rumps.App):
             if result.get("error"):
                 raise Exception(result["error"])
 
+            # Model produced a result → it's warm now. Subsequent HUDs show
+            # "Transcribing…" instead of "Loading model…".
+            self._model_warmed[model_mode] = True
+
             text = result.get("text", "")
             transcribe_time = result.get("time", 0)
 
@@ -932,6 +968,7 @@ class VoiceTranscribeApp(rumps.App):
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             self._run_on_main_thread(self._rebuild_menu)
+            self._run_on_main_thread(self._hud.hide)
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
             if screenshot_path and os.path.exists(screenshot_path):
@@ -1112,6 +1149,8 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.clear()
 
+        self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
+        self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
@@ -1140,6 +1179,9 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
+
+    def _open_main_window(self, _sender=None):
+        self._run_on_main_thread(self._main_window.showWindow)
 
     def _copy_history_item(self, sender):
         from AppKit import NSPasteboard, NSPasteboardTypeString
@@ -1206,9 +1248,9 @@ if __name__ == "__main__":
     lock_handle.write(str(os.getpid()))
     lock_handle.flush()
 
-    # Hide from dock — menu bar only
-    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
-    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    # Regular app: shows in Dock, appears in ⌘-Tab. Also keeps the menu bar icon.
+    from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
 
     parent_conn, child_conn = multiprocessing.Pipe()
     monitor = multiprocessing.Process(target=key_monitor.run, args=(child_conn,), daemon=True)
