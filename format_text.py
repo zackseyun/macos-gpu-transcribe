@@ -9,6 +9,124 @@ try:
 except ImportError:
     _HAS_W2N = False
 
+
+# Word segmentation for merged tokens like "sidsleeping" → "side sleeping"
+try:
+    import wordninja
+    _HAS_WORDNINJA = True
+except ImportError:
+    _HAS_WORDNINJA = False
+
+
+def _wordninja_lm():
+    """Return wordninja's internal word-frequency vocabulary (~126k words
+    from Google N-grams), or None if wordninja isn't installed. This is
+    more modern than /usr/share/dict/words (Webster's 2nd) and covers
+    contemporary compounds like 'website', 'smartphone', etc."""
+    if not _HAS_WORDNINJA:
+        return None
+    return wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
+
+
+# Modern tech/compound words that wordninja's frequency list misses. Without
+# these, splits like "workflow" → "work flow" happen. Extend as false
+# positives are discovered.
+_TECH_COMPOUNDS = frozenset({
+    "workflow", "workflows", "keyword", "keywords", "keychain", "keychains",
+    "checkbox", "checkboxes", "backend", "frontend", "runtime", "runtimes",
+    "codebase", "codebases", "filesystem", "filesystems", "roadmap",
+    "pipelines", "datastore", "datasource", "metadata",
+    "hotkey", "hotkeys", "webhook", "webhooks", "subprocess", "subprocesses",
+    "screenshot", "screenshots", "livestream", "livestreams",
+    "changelog", "changelogs", "fallback", "fallbacks", "callback", "callbacks",
+    "eslint", "openai", "anthropic", "claude",
+})
+
+
+# Contractions, fillers, informal forms. These don't show up in the LM as
+# single tokens (apostrophes split them) so we whitelist them explicitly
+# to keep "she's", "don't" from being mangled.
+_SPEECH_WORDS = frozenset({
+    "i'm", "i've", "i'll", "i'd",
+    "you're", "you've", "you'll", "you'd",
+    "he's", "she's", "it's", "that's", "there's", "here's", "what's",
+    "we're", "we've", "we'll", "we'd",
+    "they're", "they've", "they'll", "they'd",
+    "don't", "doesn't", "didn't", "won't", "wouldn't", "can't", "couldn't",
+    "shouldn't", "mustn't", "isn't", "aren't", "wasn't", "weren't",
+    "haven't", "hasn't", "hadn't",
+    "let's", "who's", "y'all",
+    "gonna", "wanna", "gotta", "kinda", "sorta", "lemme", "gimme", "dunno",
+    "uh", "um", "hmm", "huh", "yeah", "yep", "nope", "ok", "okay",
+    "ya", "nah",
+})
+
+
+def _is_known_word(word):
+    """Does this word appear in any of our dictionaries?"""
+    if word in _TECH_COMPOUNDS or word in _SPEECH_WORDS:
+        return True
+    lm = _wordninja_lm()
+    if lm is not None and word in lm:
+        return True
+    return False
+
+
+def _fix_punctuation_spacing(text):
+    """Insert missing space after sentence / clause punctuation when the next
+    char is a letter. Catches the common ASR output "shift.should" → "shift. should"
+    and "um,she's" → "um, she's". Careful not to break decimals (3.14) or
+    ellipses (covered because next char is digit / dot)."""
+    # After . , ! ? ; : — add space if directly followed by a letter
+    return re.sub(r'([.,!?;:])([A-Za-z])', r'\1 \2', text)
+
+
+def _looks_like_merged_word(word):
+    """Heuristic: should we try to split this token?
+
+    Only lowercase alphabetic tokens ≥ 7 chars that aren't a recognized word
+    in any of our dictionaries. We'd rather leave an oddity than shred a
+    legitimate word.
+    """
+    if len(word) < 7:
+        return False
+    if not word.isalpha():
+        return False
+    if not word.islower():
+        return False  # skip proper nouns, acronyms
+    if _is_known_word(word):
+        return False
+    return True
+
+
+def _split_merged_words(text):
+    """Split merged tokens using wordninja, but only when every resulting
+    piece is itself a known word. Conservative: we'd rather leave a weird
+    token than break a legitimate one."""
+    if not _HAS_WORDNINJA:
+        return text
+
+    def check_and_split(match):
+        raw = match.group(0)
+        lower = raw.lower()
+        if not _looks_like_merged_word(lower):
+            return raw
+        pieces = wordninja.split(lower)
+        if len(pieces) < 2:
+            return raw
+        # Every piece must be ≥ 3 chars and a known word. The 3-char minimum
+        # blocks noise like "sidsleeping" → "sid sleeping" (since "sid" isn't
+        # a common English word) while still allowing "lotof" → "lot of"
+        # if we wanted (we don't — "lot" is 3 chars and known, "of" is 2).
+        # Net: both pieces must be 3+ chars AND known.
+        all_valid = all(len(p) >= 3 and _is_known_word(p) for p in pieces)
+        if not all_valid:
+            return raw
+        return " ".join(pieces)
+
+    # Match alphabetic runs (apostrophes handled separately by _SPEECH_WORDS)
+    return re.sub(r"[A-Za-z]+", check_and_split, text)
+
 # Multiplier suffixes that should attach to numbers
 _SUFFIXES = {"k": "K", "m": "M", "b": "B", "x": "x"}
 
@@ -213,6 +331,12 @@ def format_transcription(text):
     text, was_looping = _strip_repetition_loop(text)
     if was_looping:
         print(f"Stripped repetition loop, kept {len(text.split())} words", flush=True)
+
+    # Spacing repairs run BEFORE number conversion, because number spans are
+    # detected by splitting on whitespace — "3thousand" needs to become
+    # "3 thousand" first.
+    text = _fix_punctuation_spacing(text)      # "shift.should" → "shift. should"
+    text = _split_merged_words(text)           # "carcause" → "car cause"
 
     text = _normalize_digit_multiplier(text)  # "3 thousand" → "3,000" (before word spans)
     text = _convert_number_spans(text)        # "twenty five" → "25"

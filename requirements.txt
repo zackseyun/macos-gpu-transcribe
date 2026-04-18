@@ -4,3 +4,4 @@ numpy
 pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
 pyobjc-framework-Vision
+wordninja>=2.0
