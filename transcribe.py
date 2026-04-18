@@ -201,6 +201,13 @@ class VoiceTranscribeApp(rumps.App):
         if self._screen_assist_selftest_enabled:
             threading.Thread(target=self._run_screen_assist_self_test, daemon=True).start()
 
+        # Wake-from-sleep hook + periodic warm ping. Both call _send_warm_signal,
+        # which the worker treats as a no-op if the model is already hot and as
+        # a full re-warm if GPU state is cold. See _send_warm_signal docstring.
+        self._install_wake_observer()
+        threading.Thread(target=self._warm_ping_loop, daemon=True).start()
+        self._disable_app_nap()
+
     # ── Thermal Monitoring ──
 
     def _get_thermal_state(self):
@@ -279,6 +286,67 @@ class VoiceTranscribeApp(rumps.App):
         # shows "Loading model…" on the next use.
         if hasattr(self, "_model_warmed"):
             self._model_warmed = {"fast": False, "accurate": False}
+
+    # ── Wake / keep-warm ──
+    # macOS tears down Metal GPU state during sleep. The weights stay in the
+    # worker's Python heap, but the first inference after wake has to recompile
+    # kernels (~5-7s). A single dummy inference fixes it — so we fire one on
+    # wake events and on a slow periodic tick.
+
+    def _install_wake_observer(self):
+        try:
+            from AppKit import NSWorkspace
+            from Foundation import NSObject
+
+            app_self = self
+
+            class _WakeObserver(NSObject):
+                def wokeUp_(self, _notification):  # noqa: N802
+                    print("System woke from sleep → warming ASR model", flush=True)
+                    app_self._send_warm_signal()
+
+            self._wake_observer = _WakeObserver.alloc().init()
+            NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+                self._wake_observer,
+                b"wokeUp:",
+                "NSWorkspaceDidWakeNotification",
+                None,
+            )
+        except Exception as exc:
+            print(f"Wake observer install failed: {exc}", flush=True)
+
+    def _warm_ping_loop(self):
+        """Every 15 minutes, ping the worker to warm. No-op if already hot."""
+        interval = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_SECONDS", "900"))
+        while True:
+            time.sleep(interval)
+            try:
+                self._send_warm_signal()
+            except Exception as exc:
+                print(f"Warm ping failed: {exc}", flush=True)
+
+    def _disable_app_nap(self):
+        """Keep the main process active — macOS won't page it out or throttle it.
+
+        Stored as self._app_nap_activity so the activity doesn't get GC'd.
+        """
+        try:
+            from Foundation import NSProcessInfo
+
+            # Flags: background-ok + latency-critical + disable idle system sleep
+            # Combined bitmask = 0x00FFFFFF | (1 << 20) | (1 << 19) etc. Easier to
+            # use the documented constants.
+            pi = NSProcessInfo.processInfo()
+            # NSActivityUserInitiated (0x00FFFFFF) | NSActivityLatencyCritical (0xFF00000000)
+            # See NSProcessInfo.h. Encoded as one large long in Objective-C.
+            NSActivityUserInitiated = 0x00FFFFFF
+            NSActivityLatencyCritical = 0xFF00000000
+            options = NSActivityUserInitiated | NSActivityLatencyCritical
+            self._app_nap_activity = pi.beginActivityWithOptions_reason_(
+                options, "Keep ASR worker responsive across sleep/wake"
+            )
+        except Exception as exc:
+            print(f"App Nap disable failed: {exc}", flush=True)
 
     def _send_warm_signal(self):
         """Tell the worker to pre-warm MPS while the user is recording.

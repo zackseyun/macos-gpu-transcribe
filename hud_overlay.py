@@ -73,10 +73,16 @@ class WaveformView(NSView):
             if len(self._levels) > BAR_COUNT:
                 self._levels = self._levels[-BAR_COUNT:]
 
-    def decayLevels(self):  # noqa: N802
-        """Called by the redraw timer to gradually lower bars when no new audio arrives."""
+    def settleActiveBar(self):  # noqa: N802
+        """Decay only the rightmost (active) bar toward 0 when no audio arrives.
+
+        Older bars are snapshots of past audio — they scroll off the left edge
+        unchanged, preserving the shape of what was spoken. The active bar
+        gradually falls during silence instead of pinning at the last peak.
+        """
         with self._lock:
-            self._levels = [max(0.0, v * (1.0 - LEVEL_RELEASE * 0.25)) for v in self._levels]
+            if self._levels:
+                self._levels[-1] = max(0.0, self._levels[-1] * (1.0 - LEVEL_RELEASE * 0.5))
 
     def setState_(self, state):  # noqa: N802
         with self._lock:
@@ -275,9 +281,10 @@ class HUDController(NSObject):
 
     def _redrawTick_(self, _timer):  # noqa: N802
         if self._view is not None and self._visible:
-            # Gentle decay of bar levels — if no fresh audio arrives, bars fall
-            # smoothly toward 0 instead of freezing at the last value.
-            self._view.decayLevels()
+            # Let only the rightmost (active) bar drift to 0 during silence.
+            # Past bars stay at their captured level and just scroll off-screen,
+            # preserving the shape of what was spoken rather than melting away.
+            self._view.settleActiveBar()
             self._view.setNeedsDisplay_(True)
 
 
