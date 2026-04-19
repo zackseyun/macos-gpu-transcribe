@@ -1,13 +1,13 @@
 #!/Users/zackseyun/voice-transcribe/.venv/bin/python3
 """
-Voice Transcribe — hold Fn or Right Option to record, release to transcribe & paste.
+Voice Transcribe — hold Fn to record, release to transcribe & paste.
 
-Menu bar app using local Cohere/Qwen ASR with optional screenshot-aware context.
+Menu bar app using local Cohere ASR with optional screenshot-aware context.
 
 Architecture:
   - Main process: rumps menu bar app + always-on audio stream
-  - Key monitor subprocess: Quartz CGEvent tap for Fn/Right Option detection
-  - Transcription worker subprocess: loads local ASR model(s), transcribes on demand
+  - Key monitor subprocess: Quartz CGEvent tap for Fn detection
+  - Transcription worker subprocess: loads local ASR model, transcribes on demand
   - Optional screen assist: prefetches frontmost-window screenshots and injects fast local text context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
@@ -180,7 +180,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_window_shown_once = False
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
-        self._model_warmed = {"fast": False, "accurate": False}
+        self._model_warmed = {"cohere": False}
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -285,7 +285,7 @@ class VoiceTranscribeApp(rumps.App):
         # Fresh worker → models are cold again. Reset warm state so the HUD
         # shows "Loading model…" on the next use.
         if hasattr(self, "_model_warmed"):
-            self._model_warmed = {"fast": False, "accurate": False}
+            self._model_warmed = {"cohere": False}
 
     # ── Wake / keep-warm ──
     # macOS tears down Metal GPU state during sleep. The weights stay in the
@@ -745,11 +745,11 @@ class VoiceTranscribeApp(rumps.App):
 
     # ── Pipe Polling ──
     # Runs in a background thread. Receives messages from the key monitor subprocess.
-    # Messages: "heartbeat", "down:fast", "down:accurate", "up"
+    # Messages: "heartbeat", "down:cohere", "up"
 
     def _poll_pipe(self):
         self._last_heartbeat = time.time()
-        self._pending_model = None  # "fast" (0.6B) or "accurate" (1.7B)
+        self._pending_model = None  # "cohere"
         while True:
             try:
                 # Use poll with timeout so we can detect a dead key monitor
@@ -766,19 +766,13 @@ class VoiceTranscribeApp(rumps.App):
                     continue
                 elif msg.startswith("down:"):
                     if not self.is_recording and not self.is_processing:
-                        mode = msg.split(":")[1]  # "fast", "accurate", or "cohere"
-                        self._pending_model = mode
-                        labels = {"fast": "Fn", "accurate": "Right Option", "cohere": "Fn"}
-                        names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
-                        label = labels.get(mode, mode)
-                        model_name = names.get(mode, mode)
-                        print(f"{label} hold → recording ({model_name})", flush=True)
+                        self._pending_model = "cohere"
+                        print("Fn hold → recording (Cohere 2B)", flush=True)
                         self._play_sound("Tink")
                         # Speculatively warm MPS while user is recording. By the time
                         # they release the key, the model will be hot and ready, so
                         # cold-start latency is hidden inside the recording duration.
-                        if mode == "cohere":
-                            self._send_warm_signal()
+                        self._send_warm_signal()
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
@@ -788,9 +782,7 @@ class VoiceTranscribeApp(rumps.App):
                             continue
                         self._last_release_handled_at = now
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
-                        names = {"fast": "Qwen3 0.6B", "accurate": "Qwen3 1.7B", "cohere": "Cohere 2B"}
-                        model_name = names.get(self._pending_model, self._pending_model)
-                        print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_name}...", flush=True)
+                        print(f"Release → stop ({elapsed:.1f}s), transcribing with Cohere 2B...", flush=True)
                         self._play_sound("Pop")
                         self._stop_recording()
             except (EOFError, OSError):
@@ -893,7 +885,7 @@ class VoiceTranscribeApp(rumps.App):
             self._run_on_main_thread(self._hud.hide)
             return
 
-        model_mode = self._pending_model or "fast"
+        model_mode = self._pending_model or "cohere"
         loading = not self._model_warmed.get(model_mode, False)
         hud_label = "Loading model…" if loading else "Transcribing…"
         self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
@@ -1219,7 +1211,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Fn = Cohere 2B | Right Opt = Qwen3 1.7B", callback=None))
+        self.menu.add(rumps.MenuItem("Fn = Cohere 2B", callback=None))
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))

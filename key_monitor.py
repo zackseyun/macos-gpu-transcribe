@@ -1,8 +1,6 @@
 """Key monitor subprocess — hold-to-record via Quartz CGEvent tap.
 
-Supports two trigger keys:
-  - Hold Fn (Globe) → Cohere Transcribe (2B)
-  - Hold Right Option → Qwen3 1.7B (accurate)
+Hold Fn (Globe) → Cohere Transcribe (2B).
 
 Uses low-level Quartz event tap to detect actual key press/release state.
 Auto-recovers when macOS disables the event tap (sleep/wake, screen lock).
@@ -15,12 +13,9 @@ import time
 # Send heartbeats so parent can detect a dead monitor
 HEARTBEAT_INTERVAL = 10  # seconds
 
-# macOS key codes
-KEYCODE_RIGHT_OPTION = 61
-
 
 def run(pipe):
-    """Monitor Fn and Right Option key press/release. Hold = record, release = stop.
+    """Monitor Fn key press/release. Hold = record, release = stop.
     Auto-recovers when macOS disables the event tap."""
     print(f"Key monitor process started (PID {os.getpid()})", flush=True)
 
@@ -29,16 +24,13 @@ def run(pipe):
             CGEventTapCreate,
             CGEventMaskBit,
             CGEventGetFlags,
-            CGEventGetIntegerValueField,
             CGEventTapIsEnabled,
             kCGEventFlagsChanged,
             kCGEventFlagMaskSecondaryFn,
-            kCGEventFlagMaskAlternate,
             kCGEventTapDisabledByTimeout,
             kCGEventTapDisabledByUserInput,
             kCGHeadInsertEventTap,
             kCGSessionEventTap,
-            kCGKeyboardEventKeycode,
             CGEventTapEnable,
         )
         from CoreFoundation import (
@@ -55,9 +47,7 @@ def run(pipe):
         print(f"Key monitor: Quartz import failed: {e}", flush=True)
         return
 
-    # Track which key is currently held for recording
-    # Only one can be active at a time
-    active_key = [None]  # None, "fn", or "ropt"
+    is_held = [False]
     last_event_time = [0.0]
     tap_ref = [None]
 
@@ -75,29 +65,15 @@ def run(pipe):
         last_event_time[0] = now
 
         flags = CGEventGetFlags(event)
-        keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-
         fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
-        opt_now = bool(flags & kCGEventFlagMaskAlternate)
-        is_right_opt = (keycode == KEYCODE_RIGHT_OPTION)
 
         try:
-            if active_key[0] is None:
-                # No key held — check if one just pressed
-                if fn_now:
-                    active_key[0] = "fn"
-                    pipe.send("down:cohere")
-                elif opt_now and is_right_opt:
-                    active_key[0] = "ropt"
-                    pipe.send("down:accurate")
-            elif active_key[0] == "fn":
-                if not fn_now:
-                    active_key[0] = None
-                    pipe.send("up")
-            elif active_key[0] == "ropt":
-                if not opt_now:
-                    active_key[0] = None
-                    pipe.send("up")
+            if not is_held[0] and fn_now:
+                is_held[0] = True
+                pipe.send("down:cohere")
+            elif is_held[0] and not fn_now:
+                is_held[0] = False
+                pipe.send("up")
         except (BrokenPipeError, OSError):
             pass
 
@@ -135,7 +111,7 @@ def run(pipe):
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
 
-        print("Key monitor: listener active (Fn=Cohere 2B, Right Opt=Qwen3 1.7B)", flush=True)
+        print("Key monitor: listener active (Fn=Cohere 2B)", flush=True)
 
         while True:
             result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, False)
@@ -145,8 +121,8 @@ def run(pipe):
                 CGEventTapEnable(tap, True)
                 if not CGEventTapIsEnabled(tap):
                     print("Key monitor: re-enable failed, recreating tap...", flush=True)
-                    if active_key[0] is not None:
-                        active_key[0] = None
+                    if is_held[0]:
+                        is_held[0] = False
                         try:
                             pipe.send("up")
                         except (BrokenPipeError, OSError):

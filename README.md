@@ -10,13 +10,13 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 
 ## How it works
 
-1. **Hold Fn** (for Cohere 2B) or **Right Option** (for Qwen3 1.7B) anywhere in macOS.
+1. **Hold Fn** anywhere in macOS.
 2. A floating waveform HUD appears near your cursor showing the mic is live.
 3. **Speak**.
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max with Cohere 2B. MLX / Qwen3 1.7B is ~2x faster still.
+Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max with Cohere 2B.
 
 ## Interface
 
@@ -25,14 +25,15 @@ Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max w
 - **Main window** — regular Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. Opens automatically at launch; reopens when you click the Dock icon.
 - **Keep-warm** — wake-from-sleep hook + App Nap opt-out + 15-min background ping means the GPU kernels stay hot, so the first press after opening your laptop is instant instead of a 7-second cold start.
 
-## Models & key bindings
+## Model & key binding
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
 | **Hold Fn** | [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | PyTorch (MPS) | ~3–4× real-time |
-| **Hold Right Option** | [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | 1.7B | MLX (Metal) | ~5–6× real-time |
 
-**Cohere is the default.** It handles homophones, technical terms, and sentence boundaries more reliably than Qwen3 at this size. The ~1s throughput cost vs Qwen3 is worth it when the output doesn't need manual corrections.
+Cohere Transcribe handles homophones, technical terms, and sentence boundaries reliably at this size — the right tradeoff for dictation where the output should rarely need manual corrections.
+
+**Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
 ### Throughput explained
 
@@ -60,8 +61,8 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 │   (subprocess)      │                                  │   (rumps menu    │
 │                     │                                  │    bar app)      │
 │  Quartz CGEvent tap │                                  │                  │
-│  detects Fn / Right │      multiprocessing.Pipe        │  • Record audio  │
-│  Option hold/release│                                  │  • HUD + window  │
+│  detects Fn hold/   │      multiprocessing.Pipe        │  • Record audio  │
+│  release            │                                  │  • HUD + window  │
 └─────────────────────┘                                  │  • Dispatch to   │
                                                          │    worker        │
                                                          └────────┬─────────┘
@@ -74,9 +75,8 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
                                                          │  (subprocess)    │
                                                          │                  │
                                                          │  Cohere 2B (MPS) │
-                                                         │  Qwen3 1.7B (MLX)│
                                                          │                  │
-                                                         │  Models stay     │
+                                                         │  Model stays     │
                                                          │  resident in GPU │
                                                          │  memory          │
                                                          └──────────────────┘
@@ -97,8 +97,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 | Component | Technology |
 |-----------|-----------|
 | Language | Python 3.13+ (Homebrew) |
-| Primary ASR | Cohere Transcribe 2B via PyTorch (MPS) |
-| Secondary ASR | Qwen3-ASR-1.7B via `mlx-qwen3-asr` (Metal) |
+| ASR | Cohere Transcribe 2B via PyTorch (MPS) |
 | Menu bar | `rumps` |
 | HUD + main window | AppKit via PyObjC (NSWindow, NSBezierPath, NSTimer) |
 | Audio capture | `sounddevice` (16 kHz mono float32 PCM) |
@@ -126,7 +125,7 @@ The installer will:
 
 1. Detect or install Python 3.13/3.14 via Homebrew.
 2. Create a `.venv` with all dependencies.
-3. Install `mlx-qwen3-asr` system-wide for Qwen3 support.
+3. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
 4. Prompt for your HuggingFace token (Cohere model is gated).
 5. Auto-configure `run.sh` for your machine.
 6. Walk you through the required macOS permissions.
@@ -142,8 +141,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 pip install transformers torch librosa accelerate
 
-# 3. Install Qwen3 support system-wide
-pip3.13 install --break-system-packages mlx-qwen3-asr
+# 3. Disable Right Option key system-wide (deploys LaunchAgent)
+mkdir -p ~/Library/LaunchAgents
+cp com.local.DisableRightOption.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.local.DisableRightOption.plist
 
 # 4. Authenticate HuggingFace
 python -c "from huggingface_hub import login; login()"
@@ -192,6 +193,7 @@ macos-gpu-transcribe/
 ├── install.sh             # Install wizard
 ├── run.sh                 # Launcher
 ├── requirements.txt       # pip dependencies
+├── com.local.DisableRightOption.plist  # User LaunchAgent — disables Right Option via hidutil
 ├── settings.json          # Per-user toggles (auto-managed)
 ├── history.json           # Transcription log (last 100)
 └── README.md

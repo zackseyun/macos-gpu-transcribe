@@ -85,14 +85,16 @@ ok "Base dependencies installed"
 "$PIP" install --quiet transformers torch librosa accelerate
 ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
 
-# ── 5. Install mlx-qwen3-asr system-wide ────────────────────────────────────
-step "Installing mlx-qwen3-asr (Qwen3 model support)"
-if "$PYTHON_BIN" -c "import mlx_qwen3_asr" 2>/dev/null; then
-  ok "mlx-qwen3-asr already installed"
-else
-  "$PYTHON_BIN" -m pip install --break-system-packages --quiet mlx-qwen3-asr
-  ok "mlx-qwen3-asr installed"
-fi
+# ── 5. Disable Right Option key (system-wide HID remap) ─────────────────────
+step "Disabling Right Option key (HID-level remap)"
+# Right Option used to be a second hotkey, but it kept leaking stray special
+# characters (®, ¥, etc.) into focused fields when held. Disabling it system-wide
+# at the HID layer is the cleanest fix. The LaunchAgent re-applies on every login.
+mkdir -p "$HOME/Library/LaunchAgents"
+cp "$REPO_DIR/com.local.DisableRightOption.plist" "$HOME/Library/LaunchAgents/"
+launchctl unload "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist" 2>/dev/null || true
+launchctl load -w "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
+ok "Right Option disabled (LaunchAgent loaded)"
 
 # ── 6. HuggingFace login (Cohere model is gated) ────────────────────────────
 step "HuggingFace authentication (required for Cohere Transcribe model)"
@@ -162,7 +164,6 @@ echo "To run in background:"
 echo "  nohup ${REPO_DIR}/run.sh > /tmp/voice-transcribe.log 2>&1 &"
 echo ""
 echo "Usage:"
-echo "  Hold Fn          → record with Cohere 2B (most accurate)"
-echo "  Hold Right Opt   → record with Qwen3 1.7B (faster)"
-echo "  Release          → transcribes and pastes at cursor"
+echo "  Hold Fn  → record"
+echo "  Release  → transcribes and pastes at cursor"
 echo ""
