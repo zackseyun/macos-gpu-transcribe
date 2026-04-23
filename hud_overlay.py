@@ -84,6 +84,13 @@ class WaveformView(NSView):
             if self._levels:
                 self._levels[-1] = max(0.0, self._levels[-1] * (1.0 - LEVEL_RELEASE * 0.5))
 
+    def resetLevels(self):  # noqa: N802
+        """Clear the waveform so a newly shown HUD starts visually empty."""
+        with self._lock:
+            self._levels = [0.0] * BAR_COUNT
+            self._pulse_phase = 0.0
+            self._last_push_time = 0.0
+
     def setState_(self, state):  # noqa: N802
         with self._lock:
             self._state = state
@@ -210,8 +217,10 @@ class HUDController(NSObject):
     def show(self):
         self._ensure_window()
         if self._view is not None:
+            self._view.resetLevels()
             self._view.setState_("recording")
             self._view.setLabel_("")
+            self._view.setNeedsDisplay_(True)
         self._visible = True
         self._positionNearCursor()
         self._window.orderFrontRegardless()
