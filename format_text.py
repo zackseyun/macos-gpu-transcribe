@@ -43,6 +43,16 @@ _TECH_COMPOUNDS = frozenset({
 })
 
 
+# Common 1-2 char English words that appear as split pieces but aren't in
+# wordninja's frequency list. Allows "havea"→"have a", "totear"→"to tear",
+# "upso"→"up so", etc.
+_SHORT_VALID_PIECES = frozenset({
+    "a", "i",
+    "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it",
+    "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
+})
+
+
 # Contractions, fillers, informal forms. These don't show up in the LM as
 # single tokens (apostrophes split them) so we whitelist them explicitly
 # to keep "she's", "don't" from being mangled.
@@ -81,14 +91,21 @@ def _fix_punctuation_spacing(text):
     return re.sub(r'([.,!?;:])([A-Za-z])', r'\1 \2', text)
 
 
+def _is_valid_piece(p):
+    """Is this a valid word fragment when validating a split?"""
+    if p in _SHORT_VALID_PIECES:
+        return True
+    return len(p) >= 3 and _is_known_word(p)
+
+
 def _looks_like_merged_word(word):
     """Heuristic: should we try to split this token?
 
-    Only lowercase alphabetic tokens ≥ 7 chars that aren't a recognized word
+    Only lowercase alphabetic tokens ≥ 4 chars that aren't a recognized word
     in any of our dictionaries. We'd rather leave an oddity than shred a
     legitimate word.
     """
-    if len(word) < 7:
+    if len(word) < 4:
         return False
     if not word.isalpha():
         return False
@@ -114,12 +131,11 @@ def _split_merged_words(text):
         pieces = wordninja.split(lower)
         if len(pieces) < 2:
             return raw
-        # Every piece must be ≥ 3 chars and a known word. The 3-char minimum
-        # blocks noise like "sidsleeping" → "sid sleeping" (since "sid" isn't
-        # a common English word) while still allowing "lotof" → "lot of"
-        # if we wanted (we don't — "lot" is 3 chars and known, "of" is 2).
-        # Net: both pieces must be 3+ chars AND known.
-        all_valid = all(len(p) >= 3 and _is_known_word(p) for p in pieces)
+        # Every piece must be a known word. Short function words (a, to, up,
+        # so, in, …) are validated via _SHORT_VALID_PIECES since wordninja's
+        # frequency list doesn't cover them. Longer pieces need ≥ 3 chars AND
+        # a dictionary hit to prevent noise splits.
+        all_valid = all(_is_valid_piece(p) for p in pieces)
         if not all_valid:
             return raw
         return " ".join(pieces)
