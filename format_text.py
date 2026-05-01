@@ -281,6 +281,31 @@ def _capitalize_first(text):
     return text
 
 
+# Brand/product name corrections — Cohere Transcribe mishears these even with
+# decoder prompt biasing because the homophones ("cloud" vs "Claude") have
+# strong acoustic priors. Deterministic regex post-pass overrides the model.
+# Order matters: domain forms must be collapsed before any standalone
+# "Cartha" rule would re-touch the surrounding text.
+_BRAND_REPLACEMENTS = [
+    # Homophones — Claude Code ↔ "cloud code"
+    (re.compile(r"\bcloud\s+code\b", re.IGNORECASE), "Claude Code"),
+    # Cartha domain forms — collapse "Cartha. Ai. Mobile" → "cartha.ai.mobile"
+    (re.compile(r"\bcartha[\s,.]+ai[\s,.]+mobile\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(r"\bcartha[\s,.]+website\b", re.IGNORECASE), "cartha.website"),
+    (re.compile(r"\bcartha[\s,.]+com\b", re.IGNORECASE), "cartha.com"),
+    # Camel-case service names
+    (re.compile(r"\bcartha[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
+    # Common Anthropic/AI brand mishearings
+    (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
+]
+
+
+def _apply_brand_replacements(text):
+    for pattern, replacement in _BRAND_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _strip_repetition_loop(text, min_phrase_words=3, max_phrase_words=30, min_repeats=3):
     """Detect and truncate autoregressive loop degeneration in ASR output.
 
@@ -358,6 +383,7 @@ def format_transcription(text):
     text = _convert_number_spans(text)        # "twenty five" → "25"
     text = _normalize_percentages(text)
     text = _normalize_dollars(text)
+    text = _apply_brand_replacements(text)    # "cloud code" → "Claude Code", etc.
     text = _capitalize_first(text)
 
     return text
