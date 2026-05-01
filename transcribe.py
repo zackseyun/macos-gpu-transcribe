@@ -89,14 +89,13 @@ GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
 
-# Static vocabulary biased into the Cohere decoder on every transcription —
-# ensures product/brand terms spell correctly. Without it Cohere routinely
-# emits "cloud code" for "Claude Code" and mangles cartha.* domains. Cohere
-# only — Qwen3 path is left untouched.
-STATIC_VOCABULARY_DEFAULT = (
-    "Cartha, cartha.website, cartha.ai.mobile, CarthaCdkService, "
-    "Claude Code, Claude, Anthropic, Cohere, OpenClaw, Moltbot."
-)
+# Static vocabulary opt-in — prepended to the Cohere decoder prompt. Disabled
+# by default because biasing the decoder toward "Claude"/"Cartha" tokens on
+# every transcription causes degeneration on low-confidence audio (the model
+# starts cycling "Claudia, Claus, Claire, Claw, Clap, …"). Brand/homophone
+# corrections are now handled deterministically in format_text.py instead.
+# Set "vocabulary" in settings.json to opt back in for specialised dictation.
+STATIC_VOCABULARY_DEFAULT = ""
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
