@@ -290,7 +290,7 @@ _BRAND_REPLACEMENTS = [
     # Homophones — Claude Code ↔ "cloud code"
     (re.compile(r"\bcloud\s+code\b", re.IGNORECASE), "Claude Code"),
     # Cartha domain forms — collapse "Cartha. Ai. Mobile" → "cartha.ai.mobile"
-    (re.compile(r"\bcartha[\s,.]+ai[\s,.]+mobile\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(r"\bcartha[\s,.]+ai[\s,.]+mobile?\b", re.IGNORECASE), "cartha.ai.mobile"),
     (re.compile(r"\bcartha[\s,.]+website\b", re.IGNORECASE), "cartha.website"),
     (re.compile(r"\bcartha[\s,.]+com\b", re.IGNORECASE), "cartha.com"),
     # Camel-case service names
