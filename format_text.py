@@ -286,13 +286,18 @@ def _capitalize_first(text):
 # strong acoustic priors. Deterministic regex post-pass overrides the model.
 # Order matters: domain forms must be collapsed before any standalone
 # "Cartha" rule would re-touch the surrounding text.
+# Domain separator: punctuation, whitespace, or the literal word "dot"
+# (Cohere often spells the period out loud as "Dot" in URL dictation).
+_DOM_SEP = r"(?:[\s,.]+(?:dot[\s,.]+)?)+"
+
 _BRAND_REPLACEMENTS = [
-    # Homophones — Claude Code ↔ "cloud code"
-    (re.compile(r"\bcloud\s+code\b", re.IGNORECASE), "Claude Code"),
-    # Cartha domain forms — collapse "Cartha. Ai. Mobile" → "cartha.ai.mobile"
-    (re.compile(r"\bcartha[\s,.]+ai[\s,.]+mobile?\b", re.IGNORECASE), "cartha.ai.mobile"),
-    (re.compile(r"\bcartha[\s,.]+website\b", re.IGNORECASE), "cartha.website"),
-    (re.compile(r"\bcartha[\s,.]+com\b", re.IGNORECASE), "cartha.com"),
+    # Homophones — case-normalize "cloud code" / "claude code" → "Claude Code"
+    (re.compile(r"\b(?:cloud|claude)\s+code\b", re.IGNORECASE), "Claude Code"),
+    # Cartha domain forms — tolerates "dot" word, dropped trailing "e"
+    # ("Mobil"), and incorrect plural "websites".
+    (re.compile(rf"\bcartha{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(rf"\bcartha{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
+    (re.compile(rf"\bcartha{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
     # Camel-case service names
     (re.compile(r"\bcartha[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
     # Common Anthropic/AI brand mishearings
