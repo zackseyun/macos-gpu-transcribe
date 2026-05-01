@@ -89,6 +89,15 @@ GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
 
+# Static vocabulary biased into the Cohere decoder on every transcription —
+# ensures product/brand terms spell correctly. Without it Cohere routinely
+# emits "cloud code" for "Claude Code" and mangles cartha.* domains. Cohere
+# only — Qwen3 path is left untouched.
+STATIC_VOCABULARY_DEFAULT = (
+    "Cartha, cartha.website, cartha.ai.mobile, CarthaCdkService, "
+    "Claude Code, Claude, Anthropic, Cohere, OpenClaw, Moltbot."
+)
+
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
 # Prevents Whisper-style ASR hallucinations on silent/near-silent input
@@ -154,6 +163,7 @@ class VoiceTranscribeApp(rumps.App):
         self._last_release_handled_at = 0.0
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
+        self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
         self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
@@ -974,6 +984,15 @@ class VoiceTranscribeApp(rumps.App):
                         )
                 except Exception as screen_err:
                     print(f"Screen context capture skipped: {screen_err}", flush=True)
+
+            # Cohere-only: prepend the static vocabulary to whatever screen
+            # context was assembled. Qwen3 modes get the screen context as-is.
+            if model_mode == "cohere" and self.vocabulary:
+                screen_context = (
+                    f"{self.vocabulary} {screen_context}".strip()
+                    if screen_context
+                    else self.vocabulary
+                )
 
             result = self._transcribe_via_worker(
                 wav_path,
