@@ -383,9 +383,8 @@ class VoiceTranscribeApp(rumps.App):
     def _send_warm_signal(self, model_mode=None):
         """Tell the worker to pre-warm the selected model while recording.
 
-        Fired on Fn key down. The worker currently performs speculative warming
-        for warmable resident models (Cohere/MPS); CLI-backed models such as
-        Granite are allowed to no-op.
+        Fired on Fn key down. Cohere warms MPS kernels; Granite starts or reuses
+        the persistent CrispASR server so the 3GB GGUF is not reloaded per run.
         """
         try:
             self._tx_req_parent.send({
@@ -806,9 +805,9 @@ class VoiceTranscribeApp(rumps.App):
                         model_label = self._model_display_name(model_mode)
                         print(f"Fn hold → recording ({model_label})", flush=True)
                         self._play_sound("Tink")
-                        # Speculatively warm MPS while user is recording. By the time
-                        # they release the key, the model will be hot and ready, so
-                        # cold-start latency is hidden inside the recording duration.
+                        # Speculatively warm the selected model while user is recording.
+                        # Cohere warms MPS; Granite starts/reuses the resident CrispASR
+                        # server so cold-start latency is hidden inside recording time.
                         self._send_warm_signal(model_mode)
                         self._start_recording()
                 elif msg == "up":

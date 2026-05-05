@@ -40,16 +40,19 @@ COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
 GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
 GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
 GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
-# CrispASR server mode keeps the model resident, but as of CrispASR 0.5.7 the
-# Granite 4.1 NAR server endpoint returns punctuation-only output while the same
-# model works through the one-shot CLI path. Default to the reliable CLI path and
-# keep server mode available behind an env flag for future CrispASR fixes.
-GRANITE_USE_SERVER = os.getenv("VOICE_TRANSCRIBE_GRANITE_USE_SERVER", "0").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+# CrispASR server mode keeps Granite resident instead of reloading the 3GB GGUF
+# for every dictation. Leave an env opt-out because the one-shot CLI path is a
+# useful fallback while CrispASR's server support continues to evolve.
+GRANITE_USE_SERVER = _env_bool("VOICE_TRANSCRIBE_GRANITE_USE_SERVER", True)
 GRANITE_SERVER_HOST = os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_HOST", "127.0.0.1")
 GRANITE_SERVER_PORT = int(os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_PORT", "8765"))
 GRANITE_SERVER_STARTUP_TIMEOUT = float(
@@ -201,6 +204,10 @@ def _extract_crispasr_text(stdout):
     return " ".join(lines).strip()
 
 
+def _has_meaningful_text(text):
+    return any(ch.isalnum() for ch in text or "")
+
+
 def _transcribe_granite_crispasr(wav_path, screen_context=""):
     """One-shot Granite transcription through CrispASR's Metal-capable GGUF runtime."""
     crispasr_bin = _find_crispasr_bin()
@@ -323,6 +330,7 @@ class GraniteCrispasrServer:
     def __init__(self):
         self.proc = None
         self.url_base = f"http://{GRANITE_SERVER_HOST}:{GRANITE_SERVER_PORT}"
+        self._start_lock = threading.Lock()
 
     def _health(self):
         try:
@@ -337,76 +345,77 @@ class GraniteCrispasrServer:
             return sock.connect_ex((GRANITE_SERVER_HOST, GRANITE_SERVER_PORT)) == 0
 
     def ensure_started(self):
-        if self._health():
-            return
-
-        if self.proc is not None and self.proc.poll() is None:
-            # Existing child is still starting/loading.
-            pass
-        else:
-            crispasr_bin = _find_crispasr_bin()
-            if crispasr_bin is None:
-                raise RuntimeError(
-                    "Granite Speech is selected, but CrispASR is not installed. "
-                    "Run ./install.sh or build CrispASR at .crispasr/build/bin/crispasr."
-                )
-            if self._port_occupied():
-                raise RuntimeError(
-                    f"Port {GRANITE_SERVER_PORT} is already in use, but it is not a ready CrispASR server. "
-                    "Set VOICE_TRANSCRIBE_GRANITE_SERVER_PORT to another port and restart the app."
-                )
-
-            cmd = [
-                crispasr_bin,
-                "--server",
-                "--backend",
-                GRANITE_CRISPASR_BACKEND,
-                "-m",
-                GRANITE_CRISPASR_MODEL,
-                "-l",
-                GRANITE_CRISPASR_LANGUAGE,
-                "--auto-download",
-                "--host",
-                GRANITE_SERVER_HOST,
-                "--port",
-                str(GRANITE_SERVER_PORT),
-            ]
-            gpu_backend = os.getenv("VOICE_TRANSCRIBE_CRISPASR_GPU_BACKEND")
-            if gpu_backend:
-                cmd[1:1] = ["--gpu-backend", gpu_backend]
-
-            env = os.environ.copy()
-            log_path = Path(GRANITE_SERVER_LOG)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_fh = open(log_path, "ab", buffering=0)
-            print(
-                "Transcription worker: starting lazy Granite server "
-                f"on {self.url_base} (first use may download/load the model)",
-                flush=True,
-            )
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
-
-        deadline = time.time() + GRANITE_SERVER_STARTUP_TIMEOUT
-        while time.time() < deadline:
+        with self._start_lock:
             if self._health():
-                print("Transcription worker: Granite server ready", flush=True)
                 return
-            if self.proc is not None and self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"Granite server exited early ({self.proc.returncode}). "
-                    f"See {GRANITE_SERVER_LOG}"
-                )
-            time.sleep(1.0)
 
-        raise RuntimeError(
-            f"Granite server was not ready after {GRANITE_SERVER_STARTUP_TIMEOUT:.0f}s. "
-            f"See {GRANITE_SERVER_LOG}"
-        )
+            if self.proc is not None and self.proc.poll() is None:
+                # Existing child is still starting/loading.
+                pass
+            else:
+                crispasr_bin = _find_crispasr_bin()
+                if crispasr_bin is None:
+                    raise RuntimeError(
+                        "Granite Speech is selected, but CrispASR is not installed. "
+                        "Run ./install.sh or build CrispASR at .crispasr/build/bin/crispasr."
+                    )
+                if self._port_occupied():
+                    raise RuntimeError(
+                        f"Port {GRANITE_SERVER_PORT} is already in use, but it is not a ready CrispASR server. "
+                        "Set VOICE_TRANSCRIBE_GRANITE_SERVER_PORT to another port and restart the app."
+                    )
+
+                cmd = [
+                    crispasr_bin,
+                    "--server",
+                    "--backend",
+                    GRANITE_CRISPASR_BACKEND,
+                    "-m",
+                    GRANITE_CRISPASR_MODEL,
+                    "-l",
+                    GRANITE_CRISPASR_LANGUAGE,
+                    "--auto-download",
+                    "--host",
+                    GRANITE_SERVER_HOST,
+                    "--port",
+                    str(GRANITE_SERVER_PORT),
+                ]
+                gpu_backend = os.getenv("VOICE_TRANSCRIBE_CRISPASR_GPU_BACKEND")
+                if gpu_backend:
+                    cmd[1:1] = ["--gpu-backend", gpu_backend]
+
+                env = os.environ.copy()
+                log_path = Path(GRANITE_SERVER_LOG)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(log_path, "ab", buffering=0)
+                print(
+                    "Transcription worker: starting lazy Granite server "
+                    f"on {self.url_base} (first use may download/load the model)",
+                    flush=True,
+                )
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+
+            deadline = time.time() + GRANITE_SERVER_STARTUP_TIMEOUT
+            while time.time() < deadline:
+                if self._health():
+                    print("Transcription worker: Granite server ready", flush=True)
+                    return
+                if self.proc is not None and self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"Granite server exited early ({self.proc.returncode}). "
+                        f"See {GRANITE_SERVER_LOG}"
+                    )
+                time.sleep(1.0)
+
+            raise RuntimeError(
+                f"Granite server was not ready after {GRANITE_SERVER_STARTUP_TIMEOUT:.0f}s. "
+                f"See {GRANITE_SERVER_LOG}"
+            )
 
     def transcribe(self, wav_path, screen_context=""):
         if screen_context:
@@ -438,6 +447,11 @@ class GraniteCrispasrServer:
             text = response.strip()
         if not text:
             raise RuntimeError(f"Granite server returned no transcript. Output: {response[:1200]}")
+        if not _has_meaningful_text(text):
+            raise RuntimeError(
+                f"Granite server returned punctuation-only transcript {text!r}; "
+                "falling back to one-shot CLI."
+            )
         return text
 
     def stop(self):
@@ -555,7 +569,17 @@ def run(request_pipe, result_pipe):
         # Run in a thread so the request loop returns to recv() immediately for
         # the upcoming real transcription request.
         if isinstance(request, dict) and request.get("__warm__"):
-            if request.get("model_mode", "cohere") != "cohere":
+            warm_model_mode = request.get("model_mode", "cohere")
+            if warm_model_mode == "granite" and granite_server is not None:
+                def _warm_granite():
+                    try:
+                        granite_server.ensure_started()
+                    except Exception as exc:
+                        print(f"Transcription worker: Granite warm failed: {exc}", flush=True)
+
+                threading.Thread(target=_warm_granite, daemon=True).start()
+                continue
+            if warm_model_mode != "cohere":
                 continue
             if cohere_model is None or warm_wav_path is None:
                 continue
@@ -582,10 +606,21 @@ def run(request_pipe, result_pipe):
 
             if model_mode == "granite":
                 if granite_server is not None:
-                    text = granite_server.transcribe(
-                        wav_path,
-                        screen_context=screen_context,
-                    )
+                    try:
+                        text = granite_server.transcribe(
+                            wav_path,
+                            screen_context=screen_context,
+                        )
+                    except Exception as exc:
+                        print(
+                            "Transcription worker: Granite server path failed; "
+                            f"falling back to one-shot CLI: {exc}",
+                            flush=True,
+                        )
+                        text = _transcribe_granite_crispasr(
+                            wav_path,
+                            screen_context=screen_context,
+                        )
                 else:
                     text = _transcribe_granite_crispasr(
                         wav_path,
