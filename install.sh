@@ -85,7 +85,37 @@ ok "Base dependencies installed"
 "$PIP" install --quiet transformers torch librosa accelerate
 ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
 
-# ── 5. Disable Right Option key (system-wide HID remap) ─────────────────────
+# ── 5. CrispASR runtime for Granite Speech ─────────────────────────────────
+step "Installing CrispASR runtime for Granite Speech"
+CRISP_DIR="$REPO_DIR/.crispasr"
+CRISP_BIN="$CRISP_DIR/build/bin/crispasr"
+if [[ -x "$CRISP_BIN" ]]; then
+  ok "CrispASR already built at $CRISP_BIN"
+else
+  if ! command -v cmake >/dev/null 2>&1; then
+    warn "CMake not found; installing with Homebrew..."
+    brew install cmake
+  fi
+
+  if [[ ! -d "$CRISP_DIR/.git" ]]; then
+    git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git "$CRISP_DIR" || {
+      warn "Could not clone CrispASR. Granite Speech will not work until CrispASR is installed."
+    }
+  else
+    git -C "$CRISP_DIR" pull --ff-only || warn "Could not update existing CrispASR checkout; using local copy."
+  fi
+
+  if [[ -d "$CRISP_DIR/.git" ]]; then
+    if cmake -S "$CRISP_DIR" -B "$CRISP_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+      && cmake --build "$CRISP_DIR/build" -j"$(sysctl -n hw.ncpu)" --target crispasr-cli; then
+      ok "CrispASR built at $CRISP_BIN"
+    else
+      warn "CrispASR build failed. Switch the menu default back to Cohere until it is fixed."
+    fi
+  fi
+fi
+
+# ── 6. Disable Right Option key (system-wide HID remap) ─────────────────────
 step "Disabling Right Option key (HID-level remap)"
 # Right Option used to be a second hotkey, but it kept leaking stray special
 # characters (®, ¥, etc.) into focused fields when held. Disabling it system-wide
@@ -96,7 +126,7 @@ launchctl unload "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 launchctl load -w "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 ok "Right Option disabled (LaunchAgent loaded)"
 
-# ── 6. HuggingFace login (Cohere model is gated) ────────────────────────────
+# ── 7. HuggingFace login (Cohere model is gated) ────────────────────────────
 step "HuggingFace authentication (required for Cohere Transcribe model)"
 echo "The Cohere Transcribe model is gated."
 echo "You need a HuggingFace account with access granted at:"
@@ -117,7 +147,7 @@ else
   fi
 fi
 
-# ── 7. Update run.sh with correct paths ─────────────────────────────────────
+# ── 8. Update run.sh with correct paths ─────────────────────────────────────
 step "Configuring run.sh"
 cat > "$REPO_DIR/run.sh" << EOF
 #!/bin/bash
@@ -136,7 +166,7 @@ EOF
 chmod +x "$REPO_DIR/run.sh"
 ok "run.sh configured for this machine"
 
-# ── 8. macOS permissions reminder ───────────────────────────────────────────
+# ── 9. macOS permissions reminder ───────────────────────────────────────────
 step "macOS permissions required (one-time)"
 echo ""
 echo -e "${BOLD}You must grant these permissions manually:${NC}"
@@ -153,7 +183,7 @@ echo "     → Click + and add the same Python.app"
 echo ""
 read -rp "Press Enter once you've granted those permissions..."
 
-# ── 9. Done ─────────────────────────────────────────────────────────────────
+# ── 10. Done ────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}✓ Installation complete!${NC}"
 echo ""

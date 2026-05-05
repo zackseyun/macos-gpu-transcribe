@@ -1,6 +1,7 @@
 """Transcription worker subprocess — loads model once, transcribes on demand.
 
 Supports three model modes:
+  - "granite": Granite Speech 4.1 NAR via CrispASR/GGUF (Metal if available)
   - "fast": Qwen3-ASR 0.6B via MLX (Metal)
   - "accurate": Qwen3-ASR 1.7B via MLX (Metal)
   - "cohere": Cohere Transcribe 2B via PyTorch (MPS)
@@ -12,11 +13,15 @@ Cold-start mitigation:
   silent keep-warm inference every KEEP_WARM_INTERVAL seconds from a background
   thread. The keep-warm holds a lock so it never races with real transcriptions.
 """
+import json
 import os
 import signal
+import shutil
+import subprocess
 import threading
 import time
 import wave
+from pathlib import Path
 
 
 # Metal cache limit — caps GPU buffer cache to 6GB (both models + headroom)
@@ -28,6 +33,9 @@ QWEN3_MODEL_IDS = {
 }
 
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
+GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
+GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
 MAX_SCREEN_CONTEXT_CHARS = 320
 
 # Keep-warm cadence — must be SHORTER than MPS eviction window.
@@ -126,6 +134,109 @@ def _prewarm_cohere(processor, model, warm_wav_path):
         print(f"Transcription worker: Cohere pre-warm failed: {exc}", flush=True)
         return
     print(f"Transcription worker: Cohere pre-warm done ({time.time() - t0:.1f}s)", flush=True)
+
+
+def _find_crispasr_bin():
+    configured = os.getenv("VOICE_TRANSCRIBE_CRISPASR_BIN")
+    candidates = [
+        configured,
+        str(Path(__file__).resolve().parent / ".crispasr" / "build" / "bin" / "crispasr"),
+        shutil.which("crispasr"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _extract_crispasr_text(stdout):
+    """Parse CrispASR JSON output; fall back to cleaned stdout if needed."""
+    raw = (stdout or "").strip()
+    if not raw:
+        return ""
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            payload = json.loads(raw[start : end + 1])
+            segments = payload.get("transcription")
+            if isinstance(segments, list):
+                return " ".join(
+                    str(segment.get("text", "")).strip()
+                    for segment in segments
+                    if isinstance(segment, dict) and segment.get("text")
+                ).strip()
+            for key in ("text", "transcript", "result"):
+                if payload.get(key):
+                    return str(payload[key]).strip()
+        except Exception:
+            pass
+
+    lines = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith(("[", "{", "}"))
+    ]
+    return " ".join(lines).strip()
+
+
+def _transcribe_granite_crispasr(wav_path, screen_context=""):
+    """Transcribe Granite Speech 4.1 NAR through CrispASR's Metal-capable GGUF runtime."""
+    crispasr_bin = _find_crispasr_bin()
+    if crispasr_bin is None:
+        raise RuntimeError(
+            "Granite Speech is selected, but CrispASR is not installed. "
+            "Run ./install.sh or build CrispASR at .crispasr/build/bin/crispasr. "
+            "The Hugging Face PyTorch path for Granite NAR requires CUDA + flash_attention_2, "
+            "so the Mac app uses CrispASR/GGUF for local Granite inference."
+        )
+
+    if screen_context:
+        print(
+            "Transcription worker: Granite/CrispASR does not accept screen-context prompts yet; ignoring context.",
+            flush=True,
+        )
+
+    cmd = [
+        crispasr_bin,
+        "--backend",
+        GRANITE_CRISPASR_BACKEND,
+        "-m",
+        GRANITE_CRISPASR_MODEL,
+        "-f",
+        wav_path,
+        "-l",
+        GRANITE_CRISPASR_LANGUAGE,
+        "--auto-download",
+        "-np",
+        "-oj",
+    ]
+    gpu_backend = os.getenv("VOICE_TRANSCRIBE_CRISPASR_GPU_BACKEND")
+    if gpu_backend:
+        cmd[1:1] = ["--gpu-backend", gpu_backend]
+
+    env = os.environ.copy()
+    env.setdefault("CRISPASR_GGUF_MMAP", "1")
+    timeout = float(os.getenv("VOICE_TRANSCRIBE_CRISPASR_TIMEOUT_SECONDS", "900"))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if len(detail) > 1200:
+            detail = detail[-1200:]
+        raise RuntimeError(f"CrispASR Granite failed ({proc.returncode}): {detail}")
+
+    text = _extract_crispasr_text(proc.stdout)
+    if not text:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"CrispASR Granite returned no transcript. Output: {detail[:1200]}")
+    return text
 
 
 def run(request_pipe, result_pipe):
@@ -227,6 +338,8 @@ def run(request_pipe, result_pipe):
         # Run in a thread so the request loop returns to recv() immediately for
         # the upcoming real transcription request.
         if isinstance(request, dict) and request.get("__warm__"):
+            if request.get("model_mode", "cohere") != "cohere":
+                continue
             if cohere_model is None or warm_wav_path is None:
                 continue
             now = time.time()
@@ -250,7 +363,12 @@ def run(request_pipe, result_pipe):
         try:
             t0 = time.time()
 
-            if model_mode == "cohere":
+            if model_mode == "granite":
+                text = _transcribe_granite_crispasr(
+                    wav_path,
+                    screen_context=screen_context,
+                )
+            elif model_mode == "cohere":
                 # Lazy-load Cohere model on first use
                 if cohere_model is None:
                     load_t0 = time.time()

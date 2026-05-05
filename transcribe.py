@@ -2,7 +2,7 @@
 """
 Voice Transcribe — hold Fn to record, release to transcribe & paste.
 
-Menu bar app using local Cohere ASR with optional screenshot-aware context.
+Menu bar app using local ASR with optional screenshot-aware context.
 
 Architecture:
   - Main process: rumps menu bar app + always-on audio stream
@@ -73,7 +73,7 @@ THERMAL_ICON_SUFFIX = {
     2: "🔥",    # Serious — show fire on menu bar icon
     3: "🛑",    # Critical — show stop on menu bar icon
 }
-TRANSCRIBE_TIMEOUT = 300  # seconds — kill worker if it takes longer
+TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -96,6 +96,15 @@ RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SE
 # corrections are now handled deterministically in format_text.py instead.
 # Set "vocabulary" in settings.json to opt back in for specialised dictation.
 STATIC_VOCABULARY_DEFAULT = ""
+
+DEFAULT_MODEL_MODE = "granite"
+MODEL_LABELS = {
+    "granite": "Granite Speech 4.1 NAR",
+    "cohere": "Cohere Transcribe 2B",
+    "fast": "Qwen3-ASR 0.6B",
+    "accurate": "Qwen3-ASR 1.7B",
+}
+MENU_MODEL_MODES = ("granite", "cohere")
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -163,6 +172,12 @@ class VoiceTranscribeApp(rumps.App):
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
         self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
+        self.default_model_mode = self._normalize_model_mode(
+            self.settings.get("default_model_mode", DEFAULT_MODEL_MODE)
+        )
+        if self.settings.get("default_model_mode") != self.default_model_mode:
+            self.settings["default_model_mode"] = self.default_model_mode
+            self._save_settings()
         self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
@@ -189,7 +204,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_window_shown_once = False
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
-        self._model_warmed = {"cohere": False}
+        self._model_warmed = self._new_model_warm_state()
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -294,7 +309,7 @@ class VoiceTranscribeApp(rumps.App):
         # Fresh worker → models are cold again. Reset warm state so the HUD
         # shows "Loading model…" on the next use.
         if hasattr(self, "_model_warmed"):
-            self._model_warmed = {"cohere": False}
+            self._model_warmed = self._new_model_warm_state()
 
     # ── Wake / keep-warm ──
     # macOS tears down Metal GPU state during sleep. The weights stay in the
@@ -357,17 +372,20 @@ class VoiceTranscribeApp(rumps.App):
         except Exception as exc:
             print(f"App Nap disable failed: {exc}", flush=True)
 
-    def _send_warm_signal(self):
-        """Tell the worker to pre-warm MPS while the user is recording.
+    def _send_warm_signal(self, model_mode=None):
+        """Tell the worker to pre-warm the selected model while recording.
 
-        Fired on Fn key down for Cohere mode. The worker checks if the model has
-        been idle long enough to need warming and runs a silent dummy inference
-        in a background thread. By the time the user releases the key, MPS is
-        hot and ready — eliminating the cold-start latency that otherwise hits
-        the first transcription after an idle period.
+        Fired on Fn key down. The worker currently performs speculative warming
+        for warmable resident models (Cohere/MPS); CLI-backed models such as
+        Granite are allowed to no-op.
         """
         try:
-            self._tx_req_parent.send({"__warm__": True})
+            self._tx_req_parent.send({
+                "__warm__": True,
+                "model_mode": self._normalize_model_mode(
+                    model_mode or self.default_model_mode
+                ),
+            })
         except (BrokenPipeError, OSError):
             # Worker is dead — the next real request will respawn it.
             pass
@@ -754,11 +772,11 @@ class VoiceTranscribeApp(rumps.App):
 
     # ── Pipe Polling ──
     # Runs in a background thread. Receives messages from the key monitor subprocess.
-    # Messages: "heartbeat", "down:cohere", "up"
+    # Messages: "heartbeat", "down:default", "up"
 
     def _poll_pipe(self):
         self._last_heartbeat = time.time()
-        self._pending_model = None  # "cohere"
+        self._pending_model = None
         while True:
             try:
                 # Use poll with timeout so we can detect a dead key monitor
@@ -775,13 +793,15 @@ class VoiceTranscribeApp(rumps.App):
                     continue
                 elif msg.startswith("down:"):
                     if not self.is_recording and not self.is_processing:
-                        self._pending_model = "cohere"
-                        print("Fn hold → recording (Cohere 2B)", flush=True)
+                        model_mode = self.default_model_mode
+                        self._pending_model = model_mode
+                        model_label = self._model_display_name(model_mode)
+                        print(f"Fn hold → recording ({model_label})", flush=True)
                         self._play_sound("Tink")
                         # Speculatively warm MPS while user is recording. By the time
                         # they release the key, the model will be hot and ready, so
                         # cold-start latency is hidden inside the recording duration.
-                        self._send_warm_signal()
+                        self._send_warm_signal(model_mode)
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
@@ -791,7 +811,10 @@ class VoiceTranscribeApp(rumps.App):
                             continue
                         self._last_release_handled_at = now
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
-                        print(f"Release → stop ({elapsed:.1f}s), transcribing with Cohere 2B...", flush=True)
+                        model_label = self._model_display_name(
+                            self._pending_model or self.default_model_mode
+                        )
+                        print(f"Release → stop ({elapsed:.1f}s), transcribing with {model_label}...", flush=True)
                         self._play_sound("Pop")
                         self._stop_recording()
             except (EOFError, OSError):
@@ -894,7 +917,7 @@ class VoiceTranscribeApp(rumps.App):
             self._run_on_main_thread(self._hud.hide)
             return
 
-        model_mode = self._pending_model or "cohere"
+        model_mode = self._pending_model or self.default_model_mode
         loading = not self._model_warmed.get(model_mode, False)
         hud_label = "Loading model…" if loading else "Transcribing…"
         self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
@@ -1117,7 +1140,11 @@ class VoiceTranscribeApp(rumps.App):
                     return data
             except (json.JSONDecodeError, IOError):
                 pass
-        return {"screen_context_enabled": False, "sound_effects_enabled": True}
+        return {
+            "screen_context_enabled": False,
+            "sound_effects_enabled": True,
+            "default_model_mode": DEFAULT_MODEL_MODE,
+        }
 
     def _save_settings(self):
         try:
@@ -1229,7 +1256,22 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Fn = Cohere 2B", callback=None))
+        self.menu.add(rumps.MenuItem(
+            f"Fn = {self._model_display_name(self.default_model_mode)}",
+            callback=None,
+        ))
+        self.menu.add(rumps.MenuItem("Default Model", callback=None))
+        for mode in MENU_MODEL_MODES:
+            item = rumps.MenuItem(
+                self._default_model_menu_title(mode),
+                callback=self._set_default_model,
+            )
+            item.representedObject = mode
+            try:
+                item.state = 1 if mode == self.default_model_mode else 0
+            except Exception:
+                pass
+            self.menu.add(item)
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
@@ -1268,6 +1310,34 @@ class VoiceTranscribeApp(rumps.App):
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
         rumps.notification("Voice Transcribe", "Copied", text[:100])
+
+    def _normalize_model_mode(self, mode):
+        mode = str(mode or "").strip().lower()
+        return mode if mode in MODEL_LABELS else DEFAULT_MODEL_MODE
+
+    def _new_model_warm_state(self):
+        return {mode: False for mode in MODEL_LABELS}
+
+    def _model_display_name(self, mode):
+        return MODEL_LABELS.get(self._normalize_model_mode(mode), MODEL_LABELS[DEFAULT_MODEL_MODE])
+
+    def _default_model_menu_title(self, mode):
+        prefix = "✓ " if mode == self.default_model_mode else "   "
+        return f"{prefix}{self._model_display_name(mode)}"
+
+    def _set_default_model(self, sender):
+        mode = self._normalize_model_mode(getattr(sender, "representedObject", None))
+        if mode == self.default_model_mode:
+            return
+        self.default_model_mode = mode
+        self.settings["default_model_mode"] = mode
+        self._save_settings()
+        self._rebuild_menu()
+        rumps.notification(
+            "Voice Transcribe",
+            "Default Model",
+            f"Fn now uses {self._model_display_name(mode)}.",
+        )
 
     def _screen_context_menu_title(self):
         status = "On" if self.screen_context_enabled else "Off"

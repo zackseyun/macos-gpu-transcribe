@@ -1,6 +1,6 @@
 """Key monitor subprocess — hold-to-record via Quartz CGEvent tap.
 
-Hold Fn (Globe) → Cohere Transcribe (2B).
+Hold Fn (Globe) → record with the app's selected default model.
 
 Uses low-level Quartz event tap to detect actual key press/release state.
 Auto-recovers when macOS disables the event tap (sleep/wake, screen lock).
@@ -70,7 +70,7 @@ def run(pipe):
         try:
             if not is_held[0] and fn_now:
                 is_held[0] = True
-                pipe.send("down:cohere")
+                pipe.send("down:default")
             elif is_held[0] and not fn_now:
                 is_held[0] = False
                 pipe.send("up")
@@ -111,7 +111,7 @@ def run(pipe):
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
 
-        print("Key monitor: listener active (Fn=Cohere 2B)", flush=True)
+        print("Key monitor: listener active (Fn=selected default model)", flush=True)
 
         while True:
             result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, False)

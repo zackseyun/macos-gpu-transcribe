@@ -147,11 +147,8 @@ class MainWindowController(NSObject):
         # ── Hotkeys ──
         stack.addArrangedSubview_(_label("Hotkeys", size=13, bold=True))
         stack.addArrangedSubview_(
-            _label("Hold Fn  →  record (Cohere 2B)", size=12, color=NSColor.secondaryLabelColor())
-        )
-        stack.addArrangedSubview_(
             _label(
-                "Hold Right ⌥  →  record (Qwen 1.7B)",
+                "Hold Fn  →  record with the selected default model",
                 size=12,
                 color=NSColor.secondaryLabelColor(),
             )
@@ -258,8 +255,16 @@ class MainWindowController(NSObject):
             self._status_label.setStringValue_("●  Idle")
             self._status_label.setTextColor_(NSColor.secondaryLabelColor())
 
-        mode = getattr(self._app, "_pending_model", None) or "(none)"
-        self._model_label.setStringValue_(f"Model: {mode}")
+        pending = getattr(self._app, "_pending_model", None)
+        default = getattr(self._app, "default_model_mode", "granite")
+        mode = pending or default
+        label = (
+            self._app._model_display_name(mode)
+            if hasattr(self._app, "_model_display_name")
+            else mode
+        )
+        prefix = "Active model" if pending else "Default model"
+        self._model_label.setStringValue_(f"{prefix}: {label}")
 
         if len(self._app.history) != self._last_history_len:
             self._last_history_len = len(self._app.history)
