@@ -91,6 +91,31 @@ def _fix_punctuation_spacing(text):
     return re.sub(r'([.,!?;:])([A-Za-z])', r'\1 \2', text)
 
 
+def _collapse_duplicate_punctuation(text):
+    """Collapse ASR punctuation stutter.
+
+    Granite Speech already emits punctuation, and sometimes produces paired
+    marks such as ",,", ",.", "?.", or "..". The rest of the formatter assumes
+    punctuation is single-mark, so normalize those pairs before number/brand
+    post-processing.
+    """
+    # Exact repeats: ",," → ",", "??" → "?", ".." / "..." → "."
+    text = re.sub(r"([,;:!?])\1+", r"\1", text)
+    text = re.sub(r"\.{2,}", ".", text)
+
+    # A comma immediately followed by a sentence terminator is really a
+    # sentence terminator: "Okay,." → "Okay.", "top,?" → "top?"
+    text = re.sub(r",\s*([.!?])", r"\1", text)
+
+    # If a sentence terminator is immediately followed by more punctuation,
+    # keep the terminator: "what?." → "what?", "top.," → "top."
+    text = re.sub(r"([.!?])\s*[,;:.!?]+", r"\1", text)
+
+    # Mixed clause punctuation stutter: ",;" / ";," etc. Keep the first mark.
+    text = re.sub(r"([,;:])\s*[,;:]+", r"\1", text)
+    return text
+
+
 def _is_valid_piece(p):
     """Is this a valid word fragment when validating a split?"""
     if p in _SHORT_VALID_PIECES:
@@ -381,6 +406,7 @@ def format_transcription(text):
     # Spacing repairs run BEFORE number conversion, because number spans are
     # detected by splitting on whitespace — "3thousand" needs to become
     # "3 thousand" first.
+    text = _collapse_duplicate_punctuation(text)  # "Okay,." → "Okay.", "top.." → "top."
     text = _fix_punctuation_spacing(text)      # "shift.should" → "shift. should"
     text = _split_merged_words(text)           # "carcause" → "car cause"
 
