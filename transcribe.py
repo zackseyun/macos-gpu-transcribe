@@ -24,6 +24,7 @@ import json
 import multiprocessing
 import os
 import queue
+import shutil
 import threading
 import subprocess
 import tempfile
@@ -54,6 +55,8 @@ CHANNELS = 1
 HISTORY_FILE = Path(__file__).parent / "history.json"
 GLOSSARY_MEMORY_FILE = Path(__file__).parent / "screen_glossary_memory.json"
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
+LAST_RECORDING_FILE = Path(__file__).parent / "last_recording.wav"
+FAILED_RECORDINGS_DIR = Path(__file__).parent / "failed_recordings"
 LOCK_FILE = Path("/tmp/voice-transcribe.lock")
 MAX_HISTORY = 100
 ICON_IDLE = "🎙"
@@ -143,6 +146,11 @@ ASR_HALLUCINATIONS = frozenset({
     "[music]",
     "[silence]",
     "(silence)",
+    "!",
+    "!!",
+    "!!!",
+    "! !",
+    "! ! !",
 })
 
 
@@ -976,6 +984,7 @@ class VoiceTranscribeApp(rumps.App):
                 wf.setsampwidth(2)
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+            self._save_last_recording(wav_path)
 
             if self.screen_context_enabled:
                 try:
@@ -1028,7 +1037,27 @@ class VoiceTranscribeApp(rumps.App):
                 return
 
             if result.get("error"):
-                raise Exception(result["error"])
+                if model_mode == "granite":
+                    print(
+                        f"Granite transcription error, falling back to Cohere: {result['error']}",
+                        flush=True,
+                    )
+                    fallback = self._transcribe_via_worker(
+                        wav_path,
+                        "cohere",
+                        screen_context=screen_context,
+                    )
+                    if fallback is not None and not fallback.get("error"):
+                        result = fallback
+                        model_mode = "cohere"
+                    else:
+                        self._preserve_failed_recording(wav_path, "granite_error")
+                        if fallback is None:
+                            raise Exception(result["error"])
+                        raise Exception(fallback.get("error") or result["error"])
+                else:
+                    self._preserve_failed_recording(wav_path, "error")
+                    raise Exception(result["error"])
 
             # Model produced a result → it's warm now. Subsequent HUDs show
             # "Transcribing…" instead of "Loading model…".
@@ -1038,19 +1067,63 @@ class VoiceTranscribeApp(rumps.App):
             transcribe_time = result.get("time", 0)
 
             if not text:
-                print("No speech detected.", flush=True)
-                return
+                if model_mode == "granite":
+                    print("Granite returned no text; falling back to Cohere...", flush=True)
+                    fallback = self._transcribe_via_worker(
+                        wav_path,
+                        "cohere",
+                        screen_context=screen_context,
+                    )
+                    if fallback is not None and not fallback.get("error"):
+                        model_mode = "cohere"
+                        self._model_warmed["cohere"] = True
+                        text = fallback.get("text", "")
+                        transcribe_time = fallback.get("time", 0)
+                    else:
+                        self._preserve_failed_recording(wav_path, "empty")
+                        print("No speech detected.", flush=True)
+                        return
+                if not text:
+                    self._preserve_failed_recording(wav_path, "empty")
+                    print("No speech detected.", flush=True)
+                    return
 
             # Hallucination filter — ASR models trained on YouTube captions
             # frequently emit "Thank you.", ".", "you", etc. on near-silent
             # input. Collapse to a normalized form and drop if it matches a
             # known hallucination.
             normalized = text.strip().lower().rstrip(".!?,;: ").strip()
+            if normalized in ASR_HALLUCINATIONS and model_mode == "granite":
+                print(
+                    f"Granite returned low-content output {text!r}; falling back to Cohere...",
+                    flush=True,
+                )
+                fallback = self._transcribe_via_worker(
+                    wav_path,
+                    "cohere",
+                    screen_context=screen_context,
+                )
+                if fallback is not None and not fallback.get("error"):
+                    model_mode = "cohere"
+                    self._model_warmed["cohere"] = True
+                    text = fallback.get("text", "")
+                    transcribe_time = fallback.get("time", 0)
+                    normalized = text.strip().lower().rstrip(".!?,;: ").strip()
+                else:
+                    self._preserve_failed_recording(wav_path, "granite_hallucination")
+                    return
+
+            if not text:
+                self._preserve_failed_recording(wav_path, "empty")
+                print("No speech detected.", flush=True)
+                return
+
             if normalized in ASR_HALLUCINATIONS:
                 print(
                     f"Dropping ASR hallucination on low-content audio: {text!r}",
                     flush=True,
                 )
+                self._preserve_failed_recording(wav_path, "hallucination")
                 return
 
             text = format_transcription(text)
@@ -1115,6 +1188,28 @@ class VoiceTranscribeApp(rumps.App):
         if old_contents is not None:
             pb.clearContents()
             pb.setString_forType_(old_contents, NSPasteboardTypeString)
+
+    def _save_last_recording(self, wav_path):
+        """Keep a copy of the latest recording for manual recovery/debugging."""
+        try:
+            shutil.copy2(wav_path, LAST_RECORDING_FILE)
+        except Exception as exc:
+            print(f"Failed to save last recording: {exc}", flush=True)
+
+    def _preserve_failed_recording(self, wav_path, reason):
+        """Archive a failed recording before temp cleanup so audio is recoverable."""
+        if not wav_path or not os.path.exists(wav_path):
+            return None
+        try:
+            FAILED_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest = FAILED_RECORDINGS_DIR / f"{stamp}-{reason}.wav"
+            shutil.copy2(wav_path, dest)
+            print(f"Preserved failed recording: {dest}", flush=True)
+            return dest
+        except Exception as exc:
+            print(f"Failed to preserve failed recording: {exc}", flush=True)
+            return None
 
     # ── History ──
 

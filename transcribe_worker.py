@@ -40,7 +40,11 @@ COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
 GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
 GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
 GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
-GRANITE_USE_SERVER = os.getenv("VOICE_TRANSCRIBE_GRANITE_USE_SERVER", "1").strip().lower() not in {
+# CrispASR server mode keeps the model resident, but as of CrispASR 0.5.7 the
+# Granite 4.1 NAR server endpoint returns punctuation-only output while the same
+# model works through the one-shot CLI path. Default to the reliable CLI path and
+# keep server mode available behind an env flag for future CrispASR fixes.
+GRANITE_USE_SERVER = os.getenv("VOICE_TRANSCRIBE_GRANITE_USE_SERVER", "0").strip().lower() not in {
     "0",
     "false",
     "off",
@@ -233,7 +237,6 @@ def _transcribe_granite_crispasr(wav_path, screen_context=""):
         cmd[1:1] = ["--gpu-backend", gpu_backend]
 
     env = os.environ.copy()
-    env.setdefault("CRISPASR_GGUF_MMAP", "1")
     timeout = float(os.getenv("VOICE_TRANSCRIBE_CRISPASR_TIMEOUT_SECONDS", "900"))
     proc = subprocess.run(
         cmd,
@@ -242,13 +245,20 @@ def _transcribe_granite_crispasr(wav_path, screen_context=""):
         timeout=timeout,
         env=env,
     )
+    text = _extract_crispasr_text(proc.stdout)
+    if proc.returncode != 0 and text:
+        print(
+            "Transcription worker: CrispASR Granite exited non-zero after producing "
+            f"text ({proc.returncode}); using transcript anyway.",
+            flush=True,
+        )
+        return text
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         if len(detail) > 1200:
             detail = detail[-1200:]
         raise RuntimeError(f"CrispASR Granite failed ({proc.returncode}): {detail}")
 
-    text = _extract_crispasr_text(proc.stdout)
     if not text:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"CrispASR Granite returned no transcript. Output: {detail[:1200]}")
@@ -366,7 +376,6 @@ class GraniteCrispasrServer:
                 cmd[1:1] = ["--gpu-backend", gpu_backend]
 
             env = os.environ.copy()
-            env.setdefault("CRISPASR_GGUF_MMAP", "1")
             log_path = Path(GRANITE_SERVER_LOG)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_fh = open(log_path, "ab", buffering=0)

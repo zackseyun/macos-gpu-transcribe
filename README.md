@@ -31,7 +31,7 @@ Everything runs on the GPU. The current default is Granite Speech 4.1 NAR so it 
 |-----|-------|-----------|-----------|---------------------|
 | **Hold Fn** | Default selected in menu: [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) or [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | Granite via CrispASR/GGUF (Metal); Cohere via PyTorch (MPS) | TBD for Granite; Cohere ~3–4× real-time |
 
-Granite Speech 4.1 NAR is the default for now so it can be tested quickly. The original Hugging Face PyTorch path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. The Granite runtime starts lazily on the first Granite dictation, then stays resident in memory through CrispASR server mode for later dictations. Cohere remains one click away in the menu and still handles homophones, technical terms, and sentence boundaries reliably at this size.
+Granite Speech 4.1 NAR is the default for now so it can be tested quickly. The original Hugging Face PyTorch path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation. Cohere remains one click away in the menu and is also used as an automatic fallback if Granite returns low-content punctuation.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -187,7 +187,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
-| `VOICE_TRANSCRIBE_GRANITE_USE_SERVER` | `1` | Keep Granite loaded in a persistent local CrispASR server after first use |
+| `VOICE_TRANSCRIBE_GRANITE_USE_SERVER` | `0` | Experimental: keep Granite loaded in a persistent local CrispASR server after first use. Disabled because CrispASR 0.5.7 server mode returns punctuation-only Granite output on this Mac |
 | `VOICE_TRANSCRIBE_GRANITE_SERVER_PORT` | `8765` | Localhost port for the lazy Granite server |
 | `VOICE_TRANSCRIBE_SCREEN_CONTEXT` | unset | Start with screen context enabled |
 | `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
@@ -219,8 +219,9 @@ macos-gpu-transcribe/
 |---------|-----|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
 | No audio recording | Grant Microphone permission when prompted |
-| "Loading model…" takes a while on first Granite run | First use starts the local CrispASR server and may download/load the GGUF. Later Granite runs reuse the in-memory server |
+| "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF. If Granite fails or returns punctuation-only output, the app falls back to Cohere before deleting the recording |
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
+| Granite returns only punctuation | The app now falls back to Cohere before deleting the audio. Failed recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
 | First press after opening laptop is slow | Should be rare with the wake-hook; if it persists, check for "System woke from sleep → warming ASR model" in the log |
 | Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
 | Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |
