@@ -77,6 +77,8 @@ THERMAL_ICON_SUFFIX = {
     3: "🛑",    # Critical — show stop on menu bar icon
 }
 TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
+PASTEBOARD_PRE_PASTE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY", "0.03"))
+PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "0.10"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -209,6 +211,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_window = get_main_window_controller()
         self._main_window.attachApp_(self)
         self._hud_level_peak = 0.0
+        self._sound_cache = {}
         self._main_window_shown_once = False
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
@@ -440,7 +443,7 @@ class VoiceTranscribeApp(rumps.App):
         """Queue title change for main thread."""
         self._pending_title = icon
 
-    @rumps.timer(0.1)
+    @rumps.timer(0.2)
     def _tick(self, _):
         """Main-thread timer: apply pending title + update recording duration."""
         while True:
@@ -489,6 +492,26 @@ class VoiceTranscribeApp(rumps.App):
             return
         last[name] = now
         self._last_sound_at = last
+        try:
+            from AppKit import NSSound
+
+            sound = self._sound_cache.get(name)
+            if sound is None:
+                sound = NSSound.soundNamed_(name)
+                if sound is not None:
+                    self._sound_cache[name] = sound
+            if sound is not None:
+                # Rewind if the user taps quickly; NSSound.play is async.
+                try:
+                    sound.stop()
+                except Exception:
+                    pass
+                sound.play()
+                return
+        except Exception:
+            pass
+
+        # Fallback for environments where NSSound is unavailable.
         subprocess.Popen(
             ["afplay", f"/System/Library/Sounds/{name}.aiff"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -939,7 +962,11 @@ class VoiceTranscribeApp(rumps.App):
         wav_path = None
         screenshot_path = None
         screen_context = ""
+        history_queued = False
+        latency_t0 = time.perf_counter()
+        latency = {}
         try:
+            prep_t0 = time.perf_counter()
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
             peak = np.max(np.abs(audio))
@@ -984,8 +1011,10 @@ class VoiceTranscribeApp(rumps.App):
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes((audio * 32767).astype(np.int16).tobytes())
             self._save_last_recording(wav_path)
+            latency["prep"] = time.perf_counter() - prep_t0
 
             if self.screen_context_enabled:
+                context_t0 = time.perf_counter()
                 try:
                     screenshot_path, screenshot_source, screenshot_age = self._take_screen_context_snapshot()
                     if screenshot_source == "prefetched":
@@ -1014,6 +1043,8 @@ class VoiceTranscribeApp(rumps.App):
                         )
                 except Exception as screen_err:
                     print(f"Screen context capture skipped: {screen_err}", flush=True)
+                finally:
+                    latency["context"] = time.perf_counter() - context_t0
 
             # Cohere-only: prepend the static vocabulary to whatever screen
             # context was assembled. Qwen3 modes get the screen context as-is.
@@ -1024,11 +1055,13 @@ class VoiceTranscribeApp(rumps.App):
                     else self.vocabulary
                 )
 
+            asr_t0 = time.perf_counter()
             result = self._transcribe_via_worker(
                 wav_path,
                 model_mode,
                 screen_context=screen_context,
             )
+            latency["asr_wall"] = time.perf_counter() - asr_t0
 
             if result is None:
                 print("Transcription timed out, skipping.", flush=True)
@@ -1041,11 +1074,13 @@ class VoiceTranscribeApp(rumps.App):
                         f"Granite transcription error, falling back to Cohere: {result['error']}",
                         flush=True,
                     )
+                    fallback_t0 = time.perf_counter()
                     fallback = self._transcribe_via_worker(
                         wav_path,
                         "cohere",
                         screen_context=screen_context,
                     )
+                    latency["fallback_wall"] = time.perf_counter() - fallback_t0
                     if fallback is not None and not fallback.get("error"):
                         result = fallback
                         model_mode = "cohere"
@@ -1068,11 +1103,13 @@ class VoiceTranscribeApp(rumps.App):
             if not text:
                 if model_mode == "granite":
                     print("Granite returned no text; falling back to Cohere...", flush=True)
+                    fallback_t0 = time.perf_counter()
                     fallback = self._transcribe_via_worker(
                         wav_path,
                         "cohere",
                         screen_context=screen_context,
                     )
+                    latency["fallback_wall"] = time.perf_counter() - fallback_t0
                     if fallback is not None and not fallback.get("error"):
                         model_mode = "cohere"
                         self._model_warmed["cohere"] = True
@@ -1097,11 +1134,13 @@ class VoiceTranscribeApp(rumps.App):
                     f"Granite returned low-content output {text!r}; falling back to Cohere...",
                     flush=True,
                 )
+                fallback_t0 = time.perf_counter()
                 fallback = self._transcribe_via_worker(
                     wav_path,
                     "cohere",
                     screen_context=screen_context,
                 )
+                latency["fallback_wall"] = time.perf_counter() - fallback_t0
                 if fallback is not None and not fallback.get("error"):
                     model_mode = "cohere"
                     self._model_warmed["cohere"] = True
@@ -1125,14 +1164,33 @@ class VoiceTranscribeApp(rumps.App):
                 self._preserve_failed_recording(wav_path, "hallucination")
                 return
 
+            format_t0 = time.perf_counter()
             text = format_transcription(text)
+            latency["format"] = time.perf_counter() - format_t0
             post_thermal_level, post_thermal_label, _ = self._get_thermal_state()
             slow_note = ""
             if transcribe_time > 3.0:
                 slow_note = f" ⚠️ SLOW (thermal={post_thermal_label})"
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
             self._add_to_history(text)
+            history_queued = True
+            paste_t0 = time.perf_counter()
             self._paste_text(text)
+            latency["paste"] = time.perf_counter() - paste_t0
+            latency["total"] = time.perf_counter() - latency_t0
+            latency_parts = [
+                f"total={latency.get('total', 0):.2f}s",
+                f"prep={latency.get('prep', 0):.2f}s",
+                f"asr_wall={latency.get('asr_wall', 0):.2f}s",
+                f"asr_worker={transcribe_time:.2f}s",
+                f"format={latency.get('format', 0):.2f}s",
+                f"paste={latency.get('paste', 0):.2f}s",
+            ]
+            if latency.get("context"):
+                latency_parts.insert(2, f"context={latency['context']:.2f}s")
+            if latency.get("fallback_wall"):
+                latency_parts.insert(3, f"fallback_wall={latency['fallback_wall']:.2f}s")
+            print(f"Latency: model={model_mode} " + " ".join(latency_parts), flush=True)
 
         except Exception as e:
             print(f"Transcription error: {e}", flush=True)
@@ -1140,7 +1198,8 @@ class VoiceTranscribeApp(rumps.App):
         finally:
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
-            self._run_on_main_thread(self._rebuild_menu)
+            if not history_queued:
+                self._run_on_main_thread(self._rebuild_menu)
             self._run_on_main_thread(self._hud.hide)
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
@@ -1172,7 +1231,7 @@ class VoiceTranscribeApp(rumps.App):
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
 
-        time.sleep(0.05)
+        time.sleep(PASTEBOARD_PRE_PASTE_DELAY)
 
         source = CGEventSourceCreate(0)
         key_down = CGEventCreateKeyboardEvent(source, 9, True)
@@ -1183,7 +1242,7 @@ class VoiceTranscribeApp(rumps.App):
         CGEventPost(0, key_up)
 
         # Wait for paste to complete, then restore original clipboard
-        time.sleep(0.15)
+        time.sleep(PASTEBOARD_RESTORE_DELAY)
         if old_contents is not None:
             pb.clearContents()
             pb.setString_forType_(old_contents, NSPasteboardTypeString)
