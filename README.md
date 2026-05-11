@@ -31,13 +31,13 @@ Everything runs on the GPU. The current default is Granite Speech 4.1 NAR so it 
 |-----|-------|-----------|-----------|---------------------|
 | **Hold Fn** | Default selected in menu: [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) or [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | Granite via CrispASR/GGUF (Metal); Cohere via PyTorch (MPS) | TBD for Granite; Cohere ~3–4× real-time |
 
-Granite Speech 4.1 NAR is the default for now so it can be tested quickly. The original Hugging Face PyTorch path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere remains one click away in the menu and is also used as an automatic fallback if Granite returns low-content punctuation.
+Granite Speech 4.1 NAR is the default for now so it can be tested quickly. The original Hugging Face PyTorch path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere remains one click away in the menu and is used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
 ### Throughput explained
 
-Throughput = audio-duration ÷ wall-clock-transcribe-time. At 4× real-time, a 30-second clip transcribes in ~7.5s. The silence-RMS gate drops audio below the mic noise floor before ASR runs, which prevents the Whisper-family "Thank you." hallucination on near-silent clips.
+Throughput = audio-duration ÷ wall-clock-transcribe-time. At 4× real-time, a 30-second clip transcribes in ~7.5s. The silence gate checks both peak 200ms RMS and sustained active audio, so key clicks / mic pops do not send empty clips into ASR and the app can immediately return to idle.
 
 ### Post-processing
 
@@ -182,6 +182,11 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.008` | Silence gate threshold (raise if you get false transcriptions of ambient noise) |
+| `VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS` | `0.012` | Per-frame RMS level counted as active audio for smoother no-volume detection |
+| `VOICE_TRANSCRIBE_SILENCE_MIN_ACTIVE_SECONDS` | `0.28` | Minimum sustained active audio before a quiet recording is treated as a real clip |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS` | `0.010` | Overall RMS below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_MAX_RMS` | `0.040` | Max-window RMS below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO` | `0.16` | Sparse active-audio ratio below this keeps low-content Granite output from falling back to Cohere |
 | `VOICE_TRANSCRIBE_TIMEOUT_SECONDS` | `900` | Max wait for a transcription; long enough for first Granite model download |
 | `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `900` | How often to ping warmable resident models |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
@@ -221,7 +226,7 @@ macos-gpu-transcribe/
 | No audio recording | Grant Microphone permission when prompted |
 | "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF and start the local CrispASR server. Later runs should reuse the resident server; if they still look cold, check `/tmp/voice-transcribe.log` for worker restarts or server fallback |
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
-| Granite returns only punctuation | The app now falls back to Cohere before deleting the audio. Failed recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
+| Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
 | First press after opening laptop is slow | Should be rare with the wake-hook; if it persists, check for "System woke from sleep → warming ASR model" in the log |
 | Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
 | Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |

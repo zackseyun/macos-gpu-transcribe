@@ -118,6 +118,15 @@ MENU_MODEL_MODES = ("granite", "cohere")
 # floor (~0.002-0.005 RMS); real speech is typically 0.02+.
 SILENCE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_RMS", "0.008"))
 SILENCE_WINDOW_SECONDS = 0.2
+SILENCE_FRAME_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_FRAME_SECONDS", "0.03"))
+SILENCE_ACTIVE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS", "0.012"))
+SILENCE_MIN_RECORDING_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_MIN_RECORDING_SECONDS", "0.25"))
+SILENCE_MIN_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_MIN_ACTIVE_SECONDS", "0.28"))
+SILENCE_LOW_CONFIDENCE_FULL_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS", "0.010"))
+SILENCE_LOW_CONFIDENCE_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_MAX_RMS", "0.040"))
+SILENCE_LOW_CONFIDENCE_ACTIVE_RATIO = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO", "0.16"))
+SILENCE_SHORT_BLIP_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_SECONDS", "0.50"))
+SILENCE_SHORT_BLIP_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_MAX_RMS", "0.050"))
 
 # Known ASR hallucination outputs on silent/near-silent audio. These are the
 # most common ones Whisper-family and Cohere Transcribe emit from training
@@ -161,6 +170,142 @@ def _env_flag(name, default=False):
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _longest_true_run_seconds(mask, frame_seconds):
+    longest = 0
+    current = 0
+    for active in mask:
+        if bool(active):
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return float(longest * frame_seconds)
+
+
+def _analyze_audio_volume(audio):
+    """Return cheap volume stats used before sending audio to ASR.
+
+    Max RMS alone is too optimistic for silent clips because one key click,
+    mic pop, or CoreAudio blip can cross the old threshold and send the app
+    into Granite/Cohere fallback work. These stats also look for sustained
+    active audio so true silence/no-volume releases can unlock immediately.
+    """
+    audio = np.asarray(audio, dtype=np.float32).flatten()
+    if len(audio) == 0:
+        return {
+            "duration": 0.0,
+            "peak": 0.0,
+            "full_rms": 0.0,
+            "max_rms": 0.0,
+            "p95_rms": 0.0,
+            "active_seconds": 0.0,
+            "active_ratio": 0.0,
+            "longest_active_seconds": 0.0,
+        }
+
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    duration = len(audio) / SAMPLE_RATE
+    peak = float(np.max(np.abs(audio)))
+    full_rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+
+    window_samples = max(1, int(SILENCE_WINDOW_SECONDS * SAMPLE_RATE))
+    if len(audio) >= window_samples:
+        num_windows = len(audio) // window_samples
+        trimmed = audio[: num_windows * window_samples]
+        window_rms = np.sqrt(
+            np.mean(trimmed.reshape(num_windows, window_samples) ** 2, axis=1)
+        )
+        max_rms = float(np.max(window_rms)) if num_windows > 0 else full_rms
+        p95_rms = float(np.percentile(window_rms, 95)) if num_windows > 0 else full_rms
+    else:
+        max_rms = full_rms
+        p95_rms = full_rms
+
+    frame_samples = max(1, int(SILENCE_FRAME_SECONDS * SAMPLE_RATE))
+    if len(audio) >= frame_samples:
+        num_frames = len(audio) // frame_samples
+        frame_audio = audio[: num_frames * frame_samples]
+        frame_rms = np.sqrt(
+            np.mean(frame_audio.reshape(num_frames, frame_samples) ** 2, axis=1)
+        )
+        active_mask = frame_rms >= SILENCE_ACTIVE_RMS_THRESHOLD
+        active_seconds = float(np.sum(active_mask) * SILENCE_FRAME_SECONDS)
+        active_ratio = float(np.mean(active_mask)) if num_frames > 0 else 0.0
+        longest_active_seconds = _longest_true_run_seconds(
+            active_mask, SILENCE_FRAME_SECONDS
+        )
+    else:
+        active = full_rms >= SILENCE_ACTIVE_RMS_THRESHOLD
+        active_seconds = duration if active else 0.0
+        active_ratio = 1.0 if active else 0.0
+        longest_active_seconds = active_seconds
+
+    return {
+        "duration": float(duration),
+        "peak": peak,
+        "full_rms": full_rms,
+        "max_rms": max_rms,
+        "p95_rms": p95_rms,
+        "active_seconds": active_seconds,
+        "active_ratio": active_ratio,
+        "longest_active_seconds": longest_active_seconds,
+    }
+
+
+def _no_volume_skip_reason(stats):
+    """Return a reason when a recording should end without ASR, else None."""
+    duration = stats["duration"]
+    max_rms = stats["max_rms"]
+    full_rms = stats["full_rms"]
+    active_seconds = stats["active_seconds"]
+    longest_active_seconds = stats["longest_active_seconds"]
+
+    if duration <= 0:
+        return "no audio samples"
+    if duration < SILENCE_MIN_RECORDING_SECONDS:
+        return f"too short ({duration:.2f}s < {SILENCE_MIN_RECORDING_SECONDS:.2f}s)"
+    if max_rms < SILENCE_RMS_THRESHOLD:
+        return f"max_rms={max_rms:.4f} < {SILENCE_RMS_THRESHOLD:.4f}"
+    if (
+        duration < SILENCE_SHORT_BLIP_SECONDS
+        and active_seconds < 0.12
+        and max_rms < SILENCE_SHORT_BLIP_MAX_RMS
+    ):
+        return (
+            f"short blip only (active={active_seconds:.2f}s, "
+            f"max_rms={max_rms:.4f})"
+        )
+    if (
+        duration >= 0.75
+        and active_seconds < SILENCE_MIN_ACTIVE_SECONDS
+        and longest_active_seconds < SILENCE_MIN_ACTIVE_SECONDS
+        and full_rms < SILENCE_LOW_CONFIDENCE_FULL_RMS
+        and max_rms < SILENCE_LOW_CONFIDENCE_MAX_RMS
+    ):
+        return (
+            f"no sustained volume (active={active_seconds:.2f}s, "
+            f"longest={longest_active_seconds:.2f}s, full_rms={full_rms:.4f})"
+        )
+    return None
+
+
+def _is_low_confidence_no_volume(stats):
+    """True for clips where ASR fallback should not keep the app busy."""
+    return (
+        (
+            stats["full_rms"] < SILENCE_LOW_CONFIDENCE_FULL_RMS
+            and stats["max_rms"] < SILENCE_LOW_CONFIDENCE_MAX_RMS
+            and stats["active_seconds"] < max(0.45, SILENCE_MIN_ACTIVE_SECONDS)
+        )
+        or (
+            stats["duration"] >= 1.0
+            and stats["full_rms"] < SILENCE_LOW_CONFIDENCE_FULL_RMS
+            and stats["max_rms"] < SILENCE_LOW_CONFIDENCE_MAX_RMS
+            and stats["active_ratio"] < SILENCE_LOW_CONFIDENCE_ACTIVE_RATIO
+        )
+    )
 
 
 class VoiceTranscribeApp(rumps.App):
@@ -968,25 +1113,19 @@ class VoiceTranscribeApp(rumps.App):
         try:
             prep_t0 = time.perf_counter()
             audio = np.concatenate(audio_data, axis=0).flatten()
-            duration = len(audio) / SAMPLE_RATE
-            peak = np.max(np.abs(audio))
-            # Max RMS over sliding 200ms windows — robust to brief pops and
-            # mic crackle that would fool a pure peak threshold.
-            window_samples = max(1, int(SILENCE_WINDOW_SECONDS * SAMPLE_RATE))
-            if len(audio) >= window_samples:
-                num_windows = len(audio) // window_samples
-                trimmed = audio[: num_windows * window_samples]
-                window_rms = np.sqrt(
-                    np.mean(trimmed.reshape(num_windows, window_samples) ** 2, axis=1)
-                )
-                max_rms = float(np.max(window_rms)) if num_windows > 0 else 0.0
-            else:
-                max_rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+            volume_stats = _analyze_audio_volume(audio)
+            duration = volume_stats["duration"]
+            peak = volume_stats["peak"]
+            max_rms = volume_stats["max_rms"]
+            low_confidence_no_volume = _is_low_confidence_no_volume(volume_stats)
 
             thermal_level, thermal_label, thermal_icon = self._get_thermal_state()
             thermal_note = f", thermal={thermal_label}" if thermal_level > 0 else ""
             print(
                 f"Audio: {duration:.1f}s, peak={peak:.4f}, max_rms={max_rms:.4f} "
+                f"full_rms={volume_stats['full_rms']:.4f}, "
+                f"active={volume_stats['active_seconds']:.2f}s/"
+                f"{volume_stats['longest_active_seconds']:.2f}s "
                 f"({'SILENT' if peak < 0.001 else 'OK'}){thermal_note}",
                 flush=True,
             )
@@ -995,10 +1134,10 @@ class VoiceTranscribeApp(rumps.App):
             # the model from hallucinating "Thank you."-style outputs, and
             # also saves a GPU roundtrip. Short-but-loud recordings (e.g. "yes",
             # "no") pass through; short-and-quiet keypress artifacts don't.
-            if max_rms < SILENCE_RMS_THRESHOLD:
+            no_volume_reason = _no_volume_skip_reason(volume_stats)
+            if no_volume_reason:
                 print(
-                    f"Silent recording (max_rms={max_rms:.4f} < "
-                    f"{SILENCE_RMS_THRESHOLD}), skipping transcription.",
+                    f"No usable volume ({no_volume_reason}), ending immediately.",
                     flush=True,
                 )
                 self._set_title(self._idle_icon_with_thermal())
@@ -1070,6 +1209,13 @@ class VoiceTranscribeApp(rumps.App):
 
             if result.get("error"):
                 if model_mode == "granite":
+                    if low_confidence_no_volume:
+                        print(
+                            "Granite failed on low-volume audio; treating as no clip "
+                            "instead of falling back to Cohere.",
+                            flush=True,
+                        )
+                        return
                     print(
                         f"Granite transcription error, falling back to Cohere: {result['error']}",
                         flush=True,
@@ -1102,6 +1248,12 @@ class VoiceTranscribeApp(rumps.App):
 
             if not text:
                 if model_mode == "granite":
+                    if low_confidence_no_volume:
+                        print(
+                            "Granite returned no text on low-volume audio; ending immediately.",
+                            flush=True,
+                        )
+                        return
                     print("Granite returned no text; falling back to Cohere...", flush=True)
                     fallback_t0 = time.perf_counter()
                     fallback = self._transcribe_via_worker(
@@ -1130,6 +1282,13 @@ class VoiceTranscribeApp(rumps.App):
             # known hallucination.
             normalized = text.strip().lower().rstrip(".!?,;: ").strip()
             if normalized in ASR_HALLUCINATIONS and model_mode == "granite":
+                if low_confidence_no_volume:
+                    print(
+                        f"Granite returned low-content output {text!r} on low-volume audio; "
+                        "ending immediately.",
+                        flush=True,
+                    )
+                    return
                 print(
                     f"Granite returned low-content output {text!r}; falling back to Cohere...",
                     flush=True,
