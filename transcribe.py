@@ -102,14 +102,14 @@ RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SE
 # Set "vocabulary" in settings.json to opt back in for specialised dictation.
 STATIC_VOCABULARY_DEFAULT = ""
 
-DEFAULT_MODEL_MODE = "granite"
+DEFAULT_MODEL_MODE = "cohere"
 MODEL_LABELS = {
     "granite": "Granite Speech 4.1 NAR",
     "cohere": "Cohere Transcribe 2B",
     "fast": "Qwen3-ASR 0.6B",
     "accurate": "Qwen3-ASR 1.7B",
 }
-MENU_MODEL_MODES = ("granite", "cohere")
+MENU_MODEL_MODES = ("cohere", "granite")
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.

@@ -16,7 +16,7 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. The current default is Granite Speech 4.1 NAR so it is easy to compare against Cohere; switch back from the menu bar if Granite is not ready on your machine yet. Granite is lazy at launch, then stays resident in a local CrispASR server after the first warm/load so later dictations do not reload the 3GB GGUF.
+Everything runs on the GPU. The current default is Cohere Transcribe 2B because it is the steadier day-to-day Fn dictation path right now. Granite Speech 4.1 NAR remains available from the menu bar for side-by-side comparisons; when selected, it resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
@@ -29,9 +29,9 @@ Everything runs on the GPU. The current default is Granite Speech 4.1 NAR so it 
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | Default selected in menu: [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) or [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | Granite via CrispASR/GGUF (Metal); Cohere via PyTorch (MPS) | TBD for Granite; Cohere ~3–4× real-time |
+| **Hold Fn** | Default selected in menu: [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) by default, or [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 2B | Cohere via PyTorch (MPS); Granite via CrispASR/GGUF (Metal) | Cohere ~3–4× real-time; Granite varies by warm/server state |
 
-Granite Speech 4.1 NAR is the default for now so it can be tested quickly. The original Hugging Face PyTorch path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere remains one click away in the menu and is used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
+Cohere Transcribe 2B is the default for Fn dictation again. Granite stays one click away in the menu for experiments and comparisons. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -110,7 +110,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 - **macOS** on Apple Silicon (M1/M2/M3/M4)
 - **Python 3.13 or 3.14** (Homebrew)
 - **CMake + Xcode command line tools** for the Granite/CrispASR runtime
-- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) if you switch back to Cohere
+- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) for the default Cohere model
 
 ## Setup
 
