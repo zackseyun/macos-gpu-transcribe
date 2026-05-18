@@ -11,19 +11,21 @@ Architecture:
   - Optional screen assist: prefetches frontmost-window screenshots and injects fast local text context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
-  The audio stream (sounddevice/PortAudio) is opened ONCE at startup and NEVER
-  stopped or restarted. This is intentional. PortAudio's Pa_StopStream and
+  The audio stream (sounddevice/PortAudio) is opened at startup and is NEVER
+  stopped or closed. This is intentional. PortAudio's Pa_StopStream and
   Pa_AbortStream both call AudioDeviceStop, which tries to acquire CoreAudio's
   internal HALB_Mutex. If the audio callback is running (which it is every ~10ms),
   the callback thread already holds that mutex → DEADLOCK. This happens regardless
-  of which thread calls stop/abort. The only safe approach is to never call them.
-  Recording is controlled by toggling a boolean flag that the callback checks.
+  of which thread calls stop/abort. The safe refresh path is to open a new input
+  stream and retire the old object until process exit, never stop it in-place.
+  Recording is controlled by toggling a boolean flag that the active callback checks.
 """
 
 import json
 import multiprocessing
 import os
 import queue
+import re
 import shutil
 import threading
 import subprocess
@@ -93,6 +95,22 @@ GLOSSARY_MEMORY_TOP_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_TOP_
 GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_TERMS", "256"))
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
+
+# Audio health / mic refresh. We still avoid PortAudio stop/abort/close because
+# those can deadlock CoreAudio while the callback thread is active. A refresh
+# therefore opens a new input stream and retires the old object until process
+# exit. This is intentionally rare and cooldown-gated.
+AUDIO_CALLBACK_STALE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS", "2.5"))
+AUDIO_HEALTH_CHECK_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_HEALTH_CHECK_SECONDS", "5"))
+AUDIO_REFRESH_COOLDOWN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS", "4"))
+AUDIO_MAX_RETIRED_STREAMS = int(os.getenv("VOICE_TRANSCRIBE_AUDIO_MAX_RETIRED_STREAMS", "3"))
+AUDIO_DEAD_INPUT_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS", "0.90"))
+AUDIO_DEAD_INPUT_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MAX_RMS", "0.008"))
+AUDIO_DEAD_INPUT_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_ACTIVE_SECONDS", "0.12"))
+
+BACKGROUND_WARM_INTERVAL_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_SECONDS", "240"))
+BACKGROUND_WARM_LOW_POWER_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS", "900"))
+BACKGROUND_WARM_LOW_BATTERY_PERCENT = int(os.getenv("VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT", "25"))
 
 # Static vocabulary opt-in — prepended to the Cohere decoder prompt. Disabled
 # by default because biasing the decoder toward "Claude"/"Cartha" tokens on
@@ -308,6 +326,60 @@ def _is_low_confidence_no_volume(stats):
     )
 
 
+def _dead_input_refresh_reason(stats):
+    """Return a mic-refresh reason when a real hold captured almost no signal.
+
+    A quick accidental tap should just end. A long hold with flat audio is more
+    suspicious: the mic stream may have wedged, the selected input may have
+    disappeared, or CoreAudio may be delivering near-zero samples. In that case
+    we refresh the input stream before the next recording.
+    """
+    duration = stats.get("duration", 0.0)
+    if duration < AUDIO_DEAD_INPUT_MIN_SECONDS:
+        return None
+
+    max_rms = stats.get("max_rms", 0.0)
+    full_rms = stats.get("full_rms", 0.0)
+    active_seconds = stats.get("active_seconds", 0.0)
+    longest_active_seconds = stats.get("longest_active_seconds", 0.0)
+
+    if max_rms < AUDIO_DEAD_INPUT_MAX_RMS:
+        return (
+            f"flat input for {duration:.1f}s "
+            f"(max_rms={max_rms:.4f} < {AUDIO_DEAD_INPUT_MAX_RMS:.4f})"
+        )
+    if (
+        active_seconds < AUDIO_DEAD_INPUT_ACTIVE_SECONDS
+        and longest_active_seconds < AUDIO_DEAD_INPUT_ACTIVE_SECONDS
+        and full_rms < SILENCE_LOW_CONFIDENCE_FULL_RMS
+        and max_rms < SILENCE_LOW_CONFIDENCE_MAX_RMS
+    ):
+        return (
+            f"no sustained input for {duration:.1f}s "
+            f"(active={active_seconds:.2f}s, full_rms={full_rms:.4f})"
+        )
+    return None
+
+
+def _parse_pmset_battery_output(output):
+    """Parse `pmset -g batt` enough for low-power diagnostics/logging."""
+    text = output or ""
+    source = "unknown"
+    source_match = re.search(r"Now drawing from '([^']+)'", text)
+    if source_match:
+        source = source_match.group(1)
+
+    percent = None
+    percent_match = re.search(r"(\d{1,3})%;", text)
+    if percent_match:
+        try:
+            percent = int(percent_match.group(1))
+        except ValueError:
+            percent = None
+
+    return {"source": source, "percent": percent}
+
+
 class VoiceTranscribeApp(rumps.App):
     def __init__(self, key_pipe):
         super().__init__(ICON_IDLE, quit_button=None)
@@ -362,6 +434,24 @@ class VoiceTranscribeApp(rumps.App):
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
         self._model_warmed = self._new_model_warm_state()
 
+        # Audio stream health. We keep the capture stream always-on, but track
+        # callback freshness and can soft-refresh by opening a replacement stream
+        # if CoreAudio/device state goes stale.
+        self._audio_stream = None
+        self._retired_audio_streams = []
+        self._audio_generation = 0
+        self._audio_refresh_count = 0
+        self._audio_stream_lock = threading.Lock()
+        self._audio_refresh_lock = threading.Lock()
+        self._last_audio_callback_at = 0.0
+        self._last_audio_nonzero_at = 0.0
+        self._last_audio_status = ""
+        self._last_audio_status_at = 0.0
+        self._last_audio_rms = 0.0
+        self._last_audio_refresh_at = 0.0
+        self._audio_stream_device_idx = None
+        self._audio_stream_device_name = "unknown"
+
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
         self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
@@ -375,6 +465,7 @@ class VoiceTranscribeApp(rumps.App):
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
+        threading.Thread(target=self._audio_health_watchdog_loop, daemon=True).start()
         threading.Thread(target=self._screen_context_prefetch_loop, daemon=True).start()
         threading.Thread(target=self._screen_context_ocr_loop, daemon=True).start()
 
@@ -399,6 +490,74 @@ class VoiceTranscribeApp(rumps.App):
             level = 0
         label, icon = THERMAL_STATES.get(level, ("Unknown", "❓"))
         return level, label, icon
+
+    def _get_power_state(self):
+        """Return battery / low-power state for performance diagnostics."""
+        state = {"source": "unknown", "percent": None, "low_power": None}
+
+        try:
+            from Foundation import NSProcessInfo
+
+            pi = NSProcessInfo.processInfo()
+            if hasattr(pi, "isLowPowerModeEnabled"):
+                state["low_power"] = bool(pi.isLowPowerModeEnabled())
+        except Exception:
+            pass
+
+        try:
+            proc = subprocess.run(
+                ["pmset", "-g", "batt"],
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            )
+            if proc.stdout:
+                state.update(_parse_pmset_battery_output(proc.stdout))
+        except Exception:
+            pass
+
+        return state
+
+    def _power_log_summary(self, power_state=None):
+        power_state = power_state or self._get_power_state()
+        source = power_state.get("source") or "unknown"
+        percent = power_state.get("percent")
+        low_power = power_state.get("low_power")
+
+        parts = []
+        if source != "unknown" or percent is not None:
+            suffix = f" {percent}%" if percent is not None else ""
+            parts.append(f"power={source}{suffix}")
+        if low_power is not None:
+            parts.append(f"low_power={'on' if low_power else 'off'}")
+        return ", ".join(parts) if parts else "power=unknown"
+
+    def _performance_log_summary(self, thermal_level=None, thermal_label=None, power_state=None):
+        if thermal_level is None or thermal_label is None:
+            thermal_level, thermal_label, _ = self._get_thermal_state()
+        power_state = power_state or self._get_power_state()
+        parts = [f"thermal={thermal_label}", self._power_log_summary(power_state)]
+
+        source = str(power_state.get("source") or "").lower()
+        percent = power_state.get("percent")
+        low_power = bool(power_state.get("low_power"))
+        battery_low = "battery" in source and percent is not None and percent <= BACKGROUND_WARM_LOW_BATTERY_PERCENT
+        if thermal_level >= 2 or low_power or battery_low:
+            parts.append("energy-throttle-likely")
+        else:
+            parts.append("if slow, likely cold GPU/model state")
+        return ", ".join(part for part in parts if part)
+
+    def _should_skip_background_warm(self, power_state=None, thermal_level=None):
+        power_state = power_state or self._get_power_state()
+        if thermal_level is None:
+            thermal_level, _, _ = self._get_thermal_state()
+
+        source = str(power_state.get("source") or "").lower()
+        percent = power_state.get("percent")
+        low_power = bool(power_state.get("low_power"))
+        battery_low = "battery" in source and percent is not None and percent <= BACKGROUND_WARM_LOW_BATTERY_PERCENT
+        return thermal_level >= 2 or low_power or battery_low
 
     def _thermal_menu_title(self):
         level, label, icon = self._get_thermal_state()
@@ -496,11 +655,33 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Wake observer install failed: {exc}", flush=True)
 
     def _warm_ping_loop(self):
-        """Every 15 minutes, ping the worker to warm. No-op if already hot."""
-        interval = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_SECONDS", "900"))
+        """Periodically ping the worker to warm when power/thermal state allows."""
         while True:
+            thermal_level, _, _ = self._get_thermal_state()
+            power_state = self._get_power_state()
+            low_power_mode = self._should_skip_background_warm(
+                power_state=power_state,
+                thermal_level=thermal_level,
+            )
+            interval = (
+                BACKGROUND_WARM_LOW_POWER_SECONDS
+                if low_power_mode
+                else BACKGROUND_WARM_INTERVAL_SECONDS
+            )
             time.sleep(interval)
             try:
+                thermal_level, thermal_label, _ = self._get_thermal_state()
+                power_state = self._get_power_state()
+                if self._should_skip_background_warm(
+                    power_state=power_state,
+                    thermal_level=thermal_level,
+                ):
+                    print(
+                        "Background ASR warm skipped "
+                        f"({self._performance_log_summary(thermal_level, thermal_label, power_state)})",
+                        flush=True,
+                    )
+                    continue
                 self._send_warm_signal()
             except Exception as exc:
                 print(f"Warm ping failed: {exc}", flush=True)
@@ -1001,12 +1182,7 @@ class VoiceTranscribeApp(rumps.App):
     # DO NOT add stream.stop(), stream.abort(), or stream.close() anywhere.
     # See module docstring for the CoreAudio HALB_Mutex deadlock explanation.
 
-    def _open_audio_stream(self):
-        """Open a persistent audio input stream. Runs for the lifetime of the app.
-
-        The callback always fires (~every 10ms). When is_recording is False, it
-        discards the data (negligible CPU). When True, it appends to audio_buffer.
-        """
+    def _select_input_device(self):
         device_idx = None
         try:
             for i, dev in enumerate(sd.query_devices()):
@@ -1021,17 +1197,45 @@ class VoiceTranscribeApp(rumps.App):
         except Exception:
             pass
 
-        dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
-        print(f"Audio stream opened on device {device_idx}: {dev_name}", flush=True)
+        try:
+            dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
+        except Exception:
+            dev_name = 'default'
+        return device_idx, dev_name
+
+    def _open_audio_stream(self, reason="startup"):
+        """Open a persistent audio input stream.
+
+        The callback always fires (~every 10ms). When is_recording is False, it
+        discards the data (negligible CPU). When True, it appends to audio_buffer.
+
+        Refresh note: we do not stop/close old streams because that can deadlock
+        CoreAudio/PortAudio. A refresh opens a replacement stream and retires the
+        previous object until process exit.
+        """
+        device_idx, dev_name = self._select_input_device()
+        generation = self._audio_generation + 1
 
         def audio_callback(indata, frames, time_info, status):
+            if generation != self._audio_generation:
+                return
+            now = time.monotonic()
+            self._last_audio_callback_at = now
             if status:
+                self._last_audio_status = str(status)
+                self._last_audio_status_at = now
                 print(f"Audio status: {status}", flush=True)
+            try:
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                self._last_audio_rms = rms
+                if rms >= 0.001:
+                    self._last_audio_nonzero_at = now
+            except Exception:
+                rms = 0.0
             if self.is_recording:
                 self.audio_buffer.append(indata.copy())
                 # Feed HUD waveform — one level per callback is enough for 30fps draw.
                 try:
-                    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
                     # Noise gate below the mic noise floor (~0.004-0.006 RMS on
                     # MacBook mics) → bars flatten when silent rather than
                     # jittering on ambient noise. Real speech (~0.02+ RMS) still
@@ -1041,14 +1245,124 @@ class VoiceTranscribeApp(rumps.App):
                 except Exception:
                     pass
 
-        self._audio_stream = sd.InputStream(
+        stream = sd.InputStream(
             device=device_idx,
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
             callback=audio_callback,
         )
-        self._audio_stream.start()
+        stream.start()
+
+        with self._audio_stream_lock:
+            previous = self._audio_stream
+            self._audio_generation = generation
+            self._audio_stream = stream
+            self._audio_stream_device_idx = device_idx
+            self._audio_stream_device_name = dev_name
+            if previous is not None:
+                self._retired_audio_streams.append(previous)
+                self._audio_refresh_count += 1
+                self._last_audio_refresh_at = time.monotonic()
+
+        retired_note = (
+            f", retired_streams={len(self._retired_audio_streams)}"
+            if self._retired_audio_streams
+            else ""
+        )
+        print(
+            f"Audio stream opened on device {device_idx}: {dev_name} "
+            f"(reason={reason}, generation={generation}{retired_note})",
+            flush=True,
+        )
+
+    def _audio_health_snapshot(self):
+        now = time.monotonic()
+        callback_age = None
+        if self._last_audio_callback_at:
+            callback_age = now - self._last_audio_callback_at
+        status_age = None
+        if self._last_audio_status_at:
+            status_age = now - self._last_audio_status_at
+        return {
+            "callback_age": callback_age,
+            "status_age": status_age,
+            "last_status": self._last_audio_status,
+            "last_rms": self._last_audio_rms,
+            "device_idx": self._audio_stream_device_idx,
+            "device_name": self._audio_stream_device_name,
+            "generation": self._audio_generation,
+            "refresh_count": self._audio_refresh_count,
+            "retired_streams": len(self._retired_audio_streams),
+        }
+
+    def _refresh_audio_stream_async(self, reason, force=False):
+        threading.Thread(
+            target=self._refresh_audio_stream,
+            kwargs={"reason": reason, "force": force},
+            daemon=True,
+        ).start()
+
+    def _refresh_audio_stream(self, reason, force=False):
+        """Soft-refresh input without stopping the old CoreAudio stream."""
+        if not self._audio_refresh_lock.acquire(blocking=False):
+            return False
+        try:
+            now = time.monotonic()
+            if (
+                not force
+                and self._last_audio_refresh_at
+                and now - self._last_audio_refresh_at < AUDIO_REFRESH_COOLDOWN_SECONDS
+            ):
+                return False
+            if len(self._retired_audio_streams) >= AUDIO_MAX_RETIRED_STREAMS:
+                print(
+                    "Audio stream refresh skipped: retired-stream safety cap reached; "
+                    "restart the app if the mic still feels wedged.",
+                    flush=True,
+                )
+                return False
+
+            snapshot = self._audio_health_snapshot()
+            age = snapshot["callback_age"]
+            age_text = "never" if age is None else f"{age:.1f}s ago"
+            print(
+                "Refreshing audio input stream "
+                f"({reason}; last_callback={age_text}, "
+                f"last_rms={snapshot['last_rms']:.4f}, "
+                f"device={snapshot['device_idx']}:{snapshot['device_name']})",
+                flush=True,
+            )
+            self._open_audio_stream(reason=reason)
+            return True
+        except Exception as exc:
+            print(f"Audio stream refresh failed ({reason}): {exc}", flush=True)
+            return False
+        finally:
+            self._audio_refresh_lock.release()
+
+    def _ensure_audio_stream_healthy(self, reason):
+        snapshot = self._audio_health_snapshot()
+        callback_age = snapshot["callback_age"]
+        if self._audio_stream is None:
+            return self._refresh_audio_stream(reason=f"{reason}: no stream", force=True)
+        if callback_age is None or callback_age > AUDIO_CALLBACK_STALE_SECONDS:
+            age_text = "never" if callback_age is None else f"{callback_age:.1f}s"
+            return self._refresh_audio_stream(
+                reason=f"{reason}: callback stale ({age_text})",
+                force=True,
+            )
+        return False
+
+    def _audio_health_watchdog_loop(self):
+        while True:
+            time.sleep(AUDIO_HEALTH_CHECK_SECONDS)
+            try:
+                if self.is_recording or self.is_processing:
+                    continue
+                self._ensure_audio_stream_healthy("watchdog")
+            except Exception as exc:
+                print(f"Audio health watchdog failed: {exc}", flush=True)
 
     # ── Recording ──
     # Start/stop are just flag toggles — no CoreAudio calls, no mutex, no deadlock.
@@ -1056,6 +1370,7 @@ class VoiceTranscribeApp(rumps.App):
     def _start_recording(self):
         if self.is_recording or self.is_processing:
             return
+        self._ensure_audio_stream_healthy("recording-start")
         self.audio_buffer = []
         self.is_recording = True
         self._recording_start_time = time.time()
@@ -1087,6 +1402,11 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
 
         if not audio_data:
+            print(
+                "No audio callbacks captured during recording; refreshing mic input.",
+                flush=True,
+            )
+            self._refresh_audio_stream_async("empty-recording", force=True)
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             self._run_on_main_thread(self._hud.hide)
@@ -1140,6 +1460,16 @@ class VoiceTranscribeApp(rumps.App):
                     f"No usable volume ({no_volume_reason}), ending immediately.",
                     flush=True,
                 )
+                refresh_reason = _dead_input_refresh_reason(volume_stats)
+                if refresh_reason:
+                    print(
+                        f"Mic input looked wedged ({refresh_reason}); refreshing before next recording.",
+                        flush=True,
+                    )
+                    self._refresh_audio_stream_async(
+                        f"dead-input after no-volume: {refresh_reason}",
+                        force=False,
+                    )
                 self._set_title(self._idle_icon_with_thermal())
                 return
 
@@ -1329,7 +1659,10 @@ class VoiceTranscribeApp(rumps.App):
             post_thermal_level, post_thermal_label, _ = self._get_thermal_state()
             slow_note = ""
             if transcribe_time > 3.0:
-                slow_note = f" ⚠️ SLOW (thermal={post_thermal_label})"
+                slow_note = (
+                    " ⚠️ SLOW "
+                    f"({self._performance_log_summary(post_thermal_level, post_thermal_label)})"
+                )
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
             self._add_to_history(text)
             history_queued = True

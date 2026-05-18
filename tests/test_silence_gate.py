@@ -44,6 +44,20 @@ class SilenceGateTest(unittest.TestCase):
         self.assertGreaterEqual(stats["active_seconds"], 0.28)
         self.assertIsNone(reason)
         self.assertFalse(transcribe._is_low_confidence_no_volume(stats))
+        self.assertIsNone(transcribe._dead_input_refresh_reason(stats))
+
+    def test_long_flat_recording_requests_mic_refresh(self):
+        audio = np.zeros(int(transcribe.SAMPLE_RATE * 2.0), dtype=np.float32)
+        stats, reason = self.decision_for(audio)
+        self.assertIsNotNone(reason)
+        self.assertIn("flat input", transcribe._dead_input_refresh_reason(stats))
+
+    def test_pmset_battery_parser(self):
+        parsed = transcribe._parse_pmset_battery_output(
+            "Now drawing from 'Battery Power'\\n -InternalBattery-0 (id=1234567)\\t42%; discharging;"
+        )
+        self.assertEqual(parsed["source"], "Battery Power")
+        self.assertEqual(parsed["percent"], 42)
 
 
 if __name__ == "__main__":

@@ -86,11 +86,11 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
 2. **Transcription Worker** — Holds the ML models in GPU memory permanently. Isolates model-loading crashes, compile warm-up, and Metal buffer leaks from the UI process. Auto-restarts after 50 transcriptions or 4 GB active memory to cap leak accumulation.
-3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens once at startup and is never stopped — CoreAudio's `HALB_Mutex` deadlocks if you call `Pa_StopStream` while the callback is active. Recording is controlled by a boolean flag checked inside the callback.
+3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. If the mic callback goes stale or a long hold captures flat audio, the app now opens a replacement input stream and retires the old object until process exit.
 
 **Hold-to-talk, not toggle.** The key monitor uses a low-level Quartz event tap for press/release fidelity — not a global hotkey. macOS disables event taps after sleep/wake; the monitor auto-recovers, and a heartbeat watchdog restarts it if it dies completely.
 
-**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on a 15-minute periodic ping. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during idle stretches.
+**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on an adaptive background ping. On AC / healthy thermal state it pings more often; on low battery, Low Power Mode, or serious thermal pressure it backs off and logs that the slow path is energy-related. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during active stretches.
 
 ## Tech stack
 
@@ -187,8 +187,13 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS` | `0.010` | Overall RMS below this keeps low-content Granite output from falling back to Cohere |
 | `VOICE_TRANSCRIBE_SILENCE_LOW_MAX_RMS` | `0.040` | Max-window RMS below this keeps low-content Granite output from falling back to Cohere |
 | `VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO` | `0.16` | Sparse active-audio ratio below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS` | `2.5` | If no active audio callback has fired this recently, open a replacement mic stream |
+| `VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS` | `4` | Minimum gap between automatic mic stream refreshes |
+| `VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS` | `0.90` | Minimum held recording length before flat audio is considered a possible wedged mic |
 | `VOICE_TRANSCRIBE_TIMEOUT_SECONDS` | `900` | Max wait for a transcription; long enough for first Granite model download |
-| `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `900` | How often to ping warmable resident models |
+| `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
+| `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
+| `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
@@ -223,11 +228,11 @@ macos-gpu-transcribe/
 | Problem | Fix |
 |---------|-----|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
-| No audio recording | Grant Microphone permission when prompted |
+| No audio recording | Grant Microphone permission when prompted. If the stream wedges after sleep/device changes, the app logs `Refreshing audio input stream...` and opens a replacement mic stream automatically |
 | "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF and start the local CrispASR server. Later runs should reuse the resident server; if they still look cold, check `/tmp/voice-transcribe.log` for worker restarts or server fallback |
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
 | Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
-| First press after opening laptop is slow | Should be rare with the wake-hook; if it persists, check for "System woke from sleep → warming ASR model" in the log |
+| First press after opening laptop is slow | Check `/tmp/voice-transcribe.log` for `SLOW (...)`: it now includes thermal, battery, and Low Power Mode context. If energy state is healthy, the likely cause is cold GPU/model state; the adaptive warm ping should reduce that |
 | Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
 | Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |
 | Broken pipe error on quit | Expected — subprocesses shutting down |
