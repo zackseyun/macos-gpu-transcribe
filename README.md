@@ -193,10 +193,13 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP` | `true` | Relaunch the app when the retired-stream cap is hit, giving CoreAudio a clean reset |
 | `VOICE_TRANSCRIBE_AUDIO_DEVICE` | unset | Optional input override by numeric CoreAudio index or case-insensitive device-name fragment |
 | `VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS` | `0.90` | Minimum held recording length before flat audio is considered a possible wedged mic |
+| `VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME` | `true` | Before every Fn recording, force macOS input volume to 100 via `osascript`; set to `0`/`false`/`off`/`no` to disable |
+| `VOICE_TRANSCRIBE_INPUT_VOLUME_TIMEOUT_SECONDS` | `1.5` | Max time to wait for that input-volume safety check before recording continues anyway |
 | `VOICE_TRANSCRIBE_TIMEOUT_SECONDS` | `900` | Max wait for a transcription; long enough for first Granite model download |
 | `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
 | `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
 | `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
+| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `true` | Load + prewarm Cohere as soon as the worker starts, so a post-relaunch first dictation does not pay the 10–15s model load |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |

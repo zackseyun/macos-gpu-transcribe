@@ -30,7 +30,6 @@ import shutil
 import shlex
 import threading
 import subprocess
-import sys
 import tempfile
 import time
 import wave
@@ -117,6 +116,12 @@ AUDIO_RELAUNCH_LOG_FILE = Path(os.getenv("VOICE_TRANSCRIBE_AUDIO_RELAUNCH_LOG_FI
 AUDIO_DEAD_INPUT_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS", "0.90"))
 AUDIO_DEAD_INPUT_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MAX_RMS", "0.008"))
 AUDIO_DEAD_INPUT_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_ACTIVE_SECONDS", "0.12"))
+INPUT_VOLUME_FORCE_ON_RECORDING = os.getenv(
+    "VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
+INPUT_VOLUME_OSASCRIPT_TIMEOUT_SECONDS = float(
+    os.getenv("VOICE_TRANSCRIBE_INPUT_VOLUME_TIMEOUT_SECONDS", "1.5")
+)
 
 BACKGROUND_WARM_INTERVAL_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_SECONDS", "240"))
 BACKGROUND_WARM_LOW_POWER_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS", "900"))
@@ -193,11 +198,41 @@ ASR_HALLUCINATIONS = frozenset({
 })
 
 
-def _env_flag(name, default=False):
-    raw = os.getenv(name)
+def _env_flag_value(raw, default=False):
     if raw is None:
         return default
-    return raw.strip().lower() not in {"0", "false", "off", "no"}
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_flag(name, default=False):
+    return _env_flag_value(os.getenv(name), default=default)
+
+
+def _parse_input_volume_osascript_output(output):
+    """Parse osascript output as (previous_volume, current_volume).
+
+    The AppleScript returns comma-separated integers, but this parser is
+    intentionally tolerant so failures can be logged instead of crashing the
+    recording path.
+    """
+    numbers = re.findall(r"\d+", output or "")
+    if len(numbers) < 2:
+        return None, None
+    try:
+        previous = max(0, min(100, int(numbers[0])))
+        current = max(0, min(100, int(numbers[1])))
+        return previous, current
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _input_volume_should_log(previous, current, error=None):
+    """Return True when the volume bump path should emit a log line."""
+    if error:
+        return True
+    if previous is None or current is None:
+        return True
+    return previous != current
 
 
 def _longest_true_run_seconds(mask, frame_seconds):
@@ -406,6 +441,79 @@ def _is_input_device(device):
         return False
 
 
+def _force_macos_input_volume_to_max(
+    timeout_seconds=INPUT_VOLUME_OSASCRIPT_TIMEOUT_SECONDS,
+    runner=subprocess.run,
+):
+    """Best-effort macOS input-volume bump before recording starts.
+
+    Uses AppleScript's public `set volume input volume 100` path. The caller
+    treats every error as non-fatal so dictation can still start if macOS is
+    slow, osascript is unavailable, or permissions behave unexpectedly.
+    """
+    script = """
+set previousInputVolume to input volume of (get volume settings)
+if previousInputVolume is not equal to 100 then
+    set volume input volume 100
+end if
+set currentInputVolume to input volume of (get volume settings)
+return (previousInputVolume as text) & "," & (currentInputVolume as text)
+""".strip()
+    result = {"previous": None, "current": None, "error": None}
+    try:
+        completed = runner(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=max(0.05, float(timeout_seconds)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result["error"] = f"osascript timed out after {timeout_seconds:.2f}s"
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+    previous, current = _parse_input_volume_osascript_output(completed.stdout)
+    result["previous"] = previous
+    result["current"] = current
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        result["error"] = stderr or f"osascript exited {completed.returncode}"
+    elif previous is None or current is None:
+        output = (completed.stdout or "").strip()
+        result["error"] = f"unparseable osascript output: {output!r}"
+    elif current != 100:
+        result["error"] = f"input volume remained at {current}"
+    return result
+
+
+def _build_self_relaunch_script(repo_dir, log_path, delay_seconds):
+    """Build a relaunch command that preserves the repo's Python environment."""
+    repo_dir = Path(repo_dir)
+    log_path = Path(log_path)
+    launcher = repo_dir / "run.sh"
+    venv_python = repo_dir / ".venv" / "bin" / "python3"
+    script = repo_dir / "transcribe.py"
+
+    if launcher.exists() and os.access(launcher, os.X_OK):
+        exec_part = f"exec {shlex.quote(str(launcher))}"
+    elif venv_python.exists() and os.access(venv_python, os.X_OK):
+        exec_part = (
+            f"exec {shlex.quote(str(venv_python))} "
+            f"{shlex.quote(str(script))}"
+        )
+    else:
+        exec_part = f"exec python3 {shlex.quote(str(script))}"
+
+    return (
+        f"sleep {max(0.1, float(delay_seconds)):.2f}; "
+        f"cd {shlex.quote(str(repo_dir))}; "
+        f"{exec_part} >> {shlex.quote(str(log_path))} 2>&1"
+    )
+
+
 def _choose_input_device_index(devices, default_device=None, preferred_name=None):
     """Choose a CoreAudio input device in the same order macOS users expect.
 
@@ -536,6 +644,11 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_last_active_at = 0.0
         self._recording_auto_refresh_requested = False
         self._relaunch_requested = False
+
+        # Make the system input gain safe before the worker starts its heavy
+        # model preload. We still repeat this on each Fn recording, but doing it
+        # here avoids the first dictation racing osascript against model load.
+        self._force_input_volume_before_recording(context="startup")
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -1404,14 +1517,10 @@ class VoiceTranscribeApp(rumps.App):
         )
 
         repo_dir = Path(__file__).resolve().parent
-        python_exe = Path(sys.executable).resolve()
-        script = Path(__file__).resolve()
-        log_path = AUDIO_RELAUNCH_LOG_FILE
-        relaunch_script = (
-            f"sleep {max(0.1, AUDIO_RELAUNCH_DELAY_SECONDS):.2f}; "
-            f"cd {shlex.quote(str(repo_dir))}; "
-            f"exec {shlex.quote(str(python_exe))} {shlex.quote(str(script))} "
-            f">> {shlex.quote(str(log_path))} 2>&1"
+        relaunch_script = _build_self_relaunch_script(
+            repo_dir,
+            AUDIO_RELAUNCH_LOG_FILE,
+            AUDIO_RELAUNCH_DELAY_SECONDS,
         )
 
         try:
@@ -1478,6 +1587,29 @@ class VoiceTranscribeApp(rumps.App):
             return False
         finally:
             self._audio_refresh_lock.release()
+
+    def _force_input_volume_before_recording(self, context="before recording"):
+        if not INPUT_VOLUME_FORCE_ON_RECORDING:
+            return
+        result = _force_macos_input_volume_to_max()
+        previous = result.get("previous")
+        current = result.get("current")
+        error = result.get("error")
+        if not _input_volume_should_log(previous, current, error=error):
+            return
+
+        if error:
+            print(
+                f"Input volume max check failed ({context}) "
+                f"(previous={previous}, current={current}): {error}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Input volume forced to 100 ({context}) "
+                f"(previous={previous}, current={current})",
+                flush=True,
+            )
 
     def _ensure_audio_stream_healthy(self, reason):
         snapshot = self._audio_health_snapshot()
@@ -1550,6 +1682,7 @@ class VoiceTranscribeApp(rumps.App):
     def _start_recording(self):
         if self.is_recording or self.is_processing:
             return
+        self._force_input_volume_before_recording()
         self._ensure_audio_stream_healthy("recording-start")
         self.audio_buffer = []
         self._recording_started_monotonic = time.monotonic()

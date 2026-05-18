@@ -76,6 +76,11 @@ KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300
 # Skip on-demand warm if model was used within this many seconds (already hot).
 ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
 
+# Load Cohere proactively instead of waiting for the first release after a fresh
+# app/worker start. This hides the 10-15s model load behind app startup or Fn
+# hold time and prevents the first short dictation from feeling broken.
+PRELOAD_COHERE_ON_WORKER_START = _env_bool("VOICE_TRANSCRIBE_PRELOAD_COHERE", True)
+
 
 def _sanitize_screen_context(screen_context):
     if not screen_context:
@@ -498,8 +503,45 @@ def run(request_pipe, result_pipe):
 
     # Lock serializes keep-warm with real transcriptions so they never race on MPS.
     inference_lock = threading.Lock()
+    cohere_load_lock = threading.Lock()
     last_real_inference_at = [time.time()]  # last real (non-warm) transcription
     last_any_inference_at = [time.time()]   # last any inference (real OR warm)
+
+    def _ensure_cohere_loaded(reason="on-demand"):
+        """Load + prewarm Cohere exactly once, safe across warm/real requests."""
+        nonlocal cohere_processor, cohere_model
+
+        if cohere_model is not None:
+            return True
+
+        with cohere_load_lock:
+            if cohere_model is not None:
+                return True
+
+            load_t0 = time.time()
+            print(
+                f"Transcription worker: loading Cohere Transcribe ({reason})...",
+                flush=True,
+            )
+            import torch
+            from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
+            cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
+            cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
+                COHERE_MODEL_ID, torch_dtype=torch.float32,
+            ).to("mps")
+            print(
+                f"Transcription worker: Cohere loaded on {cohere_model.device} "
+                f"({time.time() - load_t0:.1f}s, reason={reason})",
+                flush=True,
+            )
+
+            # Pre-warm so the first real inference does not pay MPS compile.
+            if warm_wav_path is not None:
+                with inference_lock:
+                    _prewarm_cohere(cohere_processor, cohere_model, warm_wav_path)
+                    last_any_inference_at[0] = time.time()
+            return True
 
     def _do_warm(reason):
         """Run a silent dummy inference. Returns True if it actually ran."""
@@ -553,6 +595,13 @@ def run(request_pipe, result_pipe):
 
     threading.Thread(target=_keep_warm_loop, daemon=True).start()
 
+    if PRELOAD_COHERE_ON_WORKER_START:
+        threading.Thread(
+            target=_ensure_cohere_loaded,
+            args=("startup-preload",),
+            daemon=True,
+        ).start()
+
     while True:
         try:
             request = request_pipe.recv()
@@ -581,7 +630,14 @@ def run(request_pipe, result_pipe):
                 continue
             if warm_model_mode != "cohere":
                 continue
-            if cohere_model is None or warm_wav_path is None:
+            if cohere_model is None:
+                threading.Thread(
+                    target=_ensure_cohere_loaded,
+                    args=("fn-warm-preload",),
+                    daemon=True,
+                ).start()
+                continue
+            if warm_wav_path is None:
                 continue
             now = time.time()
             if now - last_any_inference_at[0] < ON_DEMAND_WARM_SKIP_THRESHOLD:
@@ -627,25 +683,7 @@ def run(request_pipe, result_pipe):
                         screen_context=screen_context,
                     )
             elif model_mode == "cohere":
-                # Lazy-load Cohere model on first use
-                if cohere_model is None:
-                    load_t0 = time.time()
-                    print("Transcription worker: loading Cohere Transcribe...", flush=True)
-                    import torch
-                    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
-                    cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
-                    cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
-                        COHERE_MODEL_ID, torch_dtype=torch.float32,
-                    ).to("mps")
-                    print(
-                        f"Transcription worker: Cohere loaded on {cohere_model.device} "
-                        f"({time.time() - load_t0:.1f}s)",
-                        flush=True,
-                    )
-                    # Pre-warm so the first real inference isn't 8s+ of MPS compile
-                    if warm_wav_path is not None:
-                        _prewarm_cohere(cohere_processor, cohere_model, warm_wav_path)
-                        last_any_inference_at[0] = time.time()
+                _ensure_cohere_loaded("real-request")
 
                 with inference_lock:
                     text = _transcribe_cohere(
