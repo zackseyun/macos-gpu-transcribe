@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -58,6 +59,45 @@ class SilenceGateTest(unittest.TestCase):
         )
         self.assertEqual(parsed["source"], "Battery Power")
         self.assertEqual(parsed["percent"], 42)
+
+    def test_audio_device_prefers_system_default_input(self):
+        devices = [
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1},
+            {"name": "External USB Mic", "max_input_channels": 1},
+            {"name": "Display Speakers", "max_input_channels": 0},
+        ]
+        with mock.patch.dict("os.environ", {"VOICE_TRANSCRIBE_AUDIO_DEVICE": ""}):
+            self.assertEqual(
+                transcribe._choose_input_device_index(devices, default_device=[1, 2]),
+                1,
+            )
+
+    def test_audio_device_falls_back_to_macbook_input(self):
+        devices = [
+            {"name": "Display Speakers", "max_input_channels": 0},
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1},
+            {"name": "Jump Desktop Microphone", "max_input_channels": 8},
+        ]
+        with mock.patch.dict("os.environ", {"VOICE_TRANSCRIBE_AUDIO_DEVICE": ""}):
+            self.assertEqual(
+                transcribe._choose_input_device_index(devices, default_device=[None, 0]),
+                1,
+            )
+
+    def test_audio_device_can_be_pinned_by_name(self):
+        devices = [
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1},
+            {"name": "Studio Mic", "max_input_channels": 1},
+        ]
+        with mock.patch.dict("os.environ", {"VOICE_TRANSCRIBE_AUDIO_DEVICE": ""}):
+            self.assertEqual(
+                transcribe._choose_input_device_index(
+                    devices,
+                    default_device=[0, 0],
+                    preferred_name="studio",
+                ),
+                1,
+            )
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
 2. **Transcription Worker** — Holds the ML models in GPU memory permanently. Isolates model-loading crashes, compile warm-up, and Metal buffer leaks from the UI process. Auto-restarts after 50 transcriptions or 4 GB active memory to cap leak accumulation.
-3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. If the mic callback goes stale or a long hold captures flat audio, the app now opens a replacement input stream and retires the old object until process exit.
+3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. If the mic callback goes stale or a long hold captures flat audio, the app opens a replacement input stream and retires the old object until process exit. If too many retired streams pile up, it now relaunches itself so CoreAudio gets the same clean reset you were forcing manually in Sound Settings.
 
 **Hold-to-talk, not toggle.** The key monitor uses a low-level Quartz event tap for press/release fidelity — not a global hotkey. macOS disables event taps after sleep/wake; the monitor auto-recovers, and a heartbeat watchdog restarts it if it dies completely.
 
@@ -189,6 +189,9 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO` | `0.16` | Sparse active-audio ratio below this keeps low-content Granite output from falling back to Cohere |
 | `VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS` | `2.5` | If no active audio callback has fired this recently, open a replacement mic stream |
 | `VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS` | `4` | Minimum gap between automatic mic stream refreshes |
+| `VOICE_TRANSCRIBE_AUDIO_RECORDING_FLAT_REFRESH_SECONDS` | `1.6` | While Fn is held, refresh the mic mid-recording if the stream stays flat this long |
+| `VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP` | `true` | Relaunch the app when the retired-stream cap is hit, giving CoreAudio a clean reset |
+| `VOICE_TRANSCRIBE_AUDIO_DEVICE` | unset | Optional input override by numeric CoreAudio index or case-insensitive device-name fragment |
 | `VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS` | `0.90` | Minimum held recording length before flat audio is considered a possible wedged mic |
 | `VOICE_TRANSCRIBE_TIMEOUT_SECONDS` | `900` | Max wait for a transcription; long enough for first Granite model download |
 | `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
@@ -228,7 +231,7 @@ macos-gpu-transcribe/
 | Problem | Fix |
 |---------|-----|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
-| No audio recording | Grant Microphone permission when prompted. If the stream wedges after sleep/device changes, the app logs `Refreshing audio input stream...` and opens a replacement mic stream automatically |
+| No audio recording | Grant Microphone permission when prompted. If the stream wedges after sleep/device changes, the app logs `Refreshing audio input stream...` and opens a replacement mic stream automatically. If CoreAudio refuses repeated soft refreshes, the app logs a clean relaunch and starts itself again |
 | "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF and start the local CrispASR server. Later runs should reuse the resident server; if they still look cold, check `/tmp/voice-transcribe.log` for worker restarts or server fallback |
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
 | Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |

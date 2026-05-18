@@ -1,13 +1,16 @@
 #!/bin/bash
-# Wrapper for launchd — uses Python.app (which has Accessibility permission)
-# but with venv site-packages available
-PYTHON_APP="/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
-VENV_SITE="/Users/harrymapodile/Desktop/voice-transcribe/.venv/lib/python3.13/site-packages"
-SCRIPT="/Users/harrymapodile/Desktop/voice-transcribe/transcribe.py"
+set -euo pipefail
 
-# Kill any existing voice-transcribe processes (prevents orphan buildup)
-pkill -f "voice-transcribe/transcribe.py" 2>/dev/null
-sleep 0.5
+# Wrapper for launchd/manual restarts. Keep paths relative to this checkout so
+# the app does not accidentally relaunch an old Desktop copy.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${VOICE_TRANSCRIBE_PYTHON:-${REPO_DIR}/.venv/bin/python3}"
+SCRIPT="${REPO_DIR}/transcribe.py"
 
-export PYTHONPATH="${VENV_SITE}:/Users/harrymapodile/Desktop/voice-transcribe:${PYTHONPATH}"
-exec "$PYTHON_APP" "$SCRIPT"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+cd "${REPO_DIR}"
+export PYTHONUNBUFFERED=1
+exec "${PYTHON_BIN}" "${SCRIPT}"

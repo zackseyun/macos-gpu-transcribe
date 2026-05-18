@@ -27,8 +27,10 @@ import os
 import queue
 import re
 import shutil
+import shlex
 import threading
 import subprocess
+import sys
 import tempfile
 import time
 import wave
@@ -104,6 +106,14 @@ AUDIO_CALLBACK_STALE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_CALLBACK_
 AUDIO_HEALTH_CHECK_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_HEALTH_CHECK_SECONDS", "5"))
 AUDIO_REFRESH_COOLDOWN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS", "4"))
 AUDIO_MAX_RETIRED_STREAMS = int(os.getenv("VOICE_TRANSCRIBE_AUDIO_MAX_RETIRED_STREAMS", "3"))
+AUDIO_RELAUNCH_ON_REFRESH_CAP = os.getenv(
+    "VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
+AUDIO_RECORDING_WATCHDOG_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_WATCHDOG_SECONDS", "0.35"))
+AUDIO_RECORDING_FLAT_REFRESH_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_FLAT_REFRESH_SECONDS", "1.6"))
+AUDIO_RECORDING_MIN_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_MIN_ACTIVE_SECONDS", "0.15"))
+AUDIO_RELAUNCH_DELAY_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RELAUNCH_DELAY_SECONDS", "0.8"))
+AUDIO_RELAUNCH_LOG_FILE = Path(os.getenv("VOICE_TRANSCRIBE_AUDIO_RELAUNCH_LOG_FILE", "/tmp/voice-transcribe.log"))
 AUDIO_DEAD_INPUT_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS", "0.90"))
 AUDIO_DEAD_INPUT_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MAX_RMS", "0.008"))
 AUDIO_DEAD_INPUT_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_ACTIVE_SECONDS", "0.12"))
@@ -380,6 +390,74 @@ def _parse_pmset_battery_output(output):
     return {"source": source, "percent": percent}
 
 
+def _device_name_matches(device, preferred):
+    if not preferred:
+        return False
+    try:
+        return preferred.lower() in str(device.get("name", "")).lower()
+    except Exception:
+        return False
+
+
+def _is_input_device(device):
+    try:
+        return int(device.get("max_input_channels", 0)) > 0
+    except Exception:
+        return False
+
+
+def _choose_input_device_index(devices, default_device=None, preferred_name=None):
+    """Choose a CoreAudio input device in the same order macOS users expect.
+
+    Prefer an explicit env setting, then the system default input from Sound
+    Settings, then a built-in MacBook mic, then the first available input.
+    This avoids pinning the app to a stale numeric CoreAudio index.
+    """
+    devices = list(devices or [])
+
+    def valid_index(idx):
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= idx < len(devices) and _is_input_device(devices[idx]):
+            return idx
+        return None
+
+    explicit = os.getenv("VOICE_TRANSCRIBE_AUDIO_DEVICE")
+    if explicit:
+        explicit_idx = valid_index(explicit)
+        if explicit_idx is not None:
+            return explicit_idx
+        for i, dev in enumerate(devices):
+            if _is_input_device(dev) and _device_name_matches(dev, explicit):
+                return i
+
+    if preferred_name:
+        for i, dev in enumerate(devices):
+            if _is_input_device(dev) and _device_name_matches(dev, preferred_name):
+                return i
+
+    default_input = None
+    if isinstance(default_device, (list, tuple)) and default_device:
+        default_input = default_device[0]
+    else:
+        default_input = default_device
+    default_idx = valid_index(default_input)
+    if default_idx is not None:
+        return default_idx
+
+    for i, dev in enumerate(devices):
+        if _is_input_device(dev) and _device_name_matches(dev, "MacBook"):
+            return i
+
+    for i, dev in enumerate(devices):
+        if _is_input_device(dev):
+            return i
+
+    return None
+
+
 class VoiceTranscribeApp(rumps.App):
     def __init__(self, key_pipe):
         super().__init__(ICON_IDLE, quit_button=None)
@@ -451,6 +529,13 @@ class VoiceTranscribeApp(rumps.App):
         self._last_audio_refresh_at = 0.0
         self._audio_stream_device_idx = None
         self._audio_stream_device_name = "unknown"
+        self._recording_started_monotonic = None
+        self._recording_frames_seen = 0
+        self._recording_active_frames = 0
+        self._recording_max_callback_rms = 0.0
+        self._recording_last_active_at = 0.0
+        self._recording_auto_refresh_requested = False
+        self._relaunch_requested = False
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -466,6 +551,7 @@ class VoiceTranscribeApp(rumps.App):
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
         threading.Thread(target=self._audio_health_watchdog_loop, daemon=True).start()
+        threading.Thread(target=self._recording_audio_watchdog_loop, daemon=True).start()
         threading.Thread(target=self._screen_context_prefetch_loop, daemon=True).start()
         threading.Thread(target=self._screen_context_ocr_loop, daemon=True).start()
 
@@ -1184,23 +1270,21 @@ class VoiceTranscribeApp(rumps.App):
 
     def _select_input_device(self):
         device_idx = None
+        devices = []
         try:
-            for i, dev in enumerate(sd.query_devices()):
-                if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
-                    device_idx = i
-                    break
-            if device_idx is None:
-                for i, dev in enumerate(sd.query_devices()):
-                    if dev['max_input_channels'] > 0:
-                        device_idx = i
-                        break
-        except Exception:
-            pass
+            devices = sd.query_devices()
+            device_idx = _choose_input_device_index(
+                devices,
+                default_device=sd.default.device,
+                preferred_name=self.settings.get("audio_input_device_name"),
+            )
+        except Exception as exc:
+            print(f"Audio device query failed; using PortAudio default input: {exc}", flush=True)
 
         try:
-            dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
+            dev_name = devices[device_idx]["name"] if device_idx is not None else "default"
         except Exception:
-            dev_name = 'default'
+            dev_name = "default"
         return device_idx, dev_name
 
     def _open_audio_stream(self, reason="startup"):
@@ -1234,6 +1318,11 @@ class VoiceTranscribeApp(rumps.App):
                 rms = 0.0
             if self.is_recording:
                 self.audio_buffer.append(indata.copy())
+                self._recording_frames_seen += int(frames or len(indata))
+                self._recording_max_callback_rms = max(self._recording_max_callback_rms, rms)
+                if rms >= SILENCE_ACTIVE_RMS_THRESHOLD:
+                    self._recording_active_frames += int(frames or len(indata))
+                    self._recording_last_active_at = now
                 # Feed HUD waveform — one level per callback is enough for 30fps draw.
                 try:
                     # Noise gate below the mic noise floor (~0.004-0.006 RMS on
@@ -1303,6 +1392,51 @@ class VoiceTranscribeApp(rumps.App):
             daemon=True,
         ).start()
 
+    def _schedule_self_relaunch(self, reason):
+        """Relaunch the app when CoreAudio needs a full process-level reset."""
+        if self._relaunch_requested:
+            return
+        self._relaunch_requested = True
+        print(
+            "Audio recovery needs a clean app relaunch "
+            f"({reason}). Restarting Voice Transcribe now...",
+            flush=True,
+        )
+
+        repo_dir = Path(__file__).resolve().parent
+        python_exe = Path(sys.executable).resolve()
+        script = Path(__file__).resolve()
+        log_path = AUDIO_RELAUNCH_LOG_FILE
+        relaunch_script = (
+            f"sleep {max(0.1, AUDIO_RELAUNCH_DELAY_SECONDS):.2f}; "
+            f"cd {shlex.quote(str(repo_dir))}; "
+            f"exec {shlex.quote(str(python_exe))} {shlex.quote(str(script))} "
+            f">> {shlex.quote(str(log_path))} 2>&1"
+        )
+
+        try:
+            subprocess.Popen(
+                ["/bin/bash", "-lc", relaunch_script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except Exception as exc:
+            self._relaunch_requested = False
+            print(f"Audio recovery relaunch failed to schedule: {exc}", flush=True)
+            return
+
+        for proc in multiprocessing.active_children():
+            try:
+                proc.kill()
+                proc.join(timeout=1)
+            except Exception:
+                pass
+        os._exit(75)
+
     def _refresh_audio_stream(self, reason, force=False):
         """Soft-refresh input without stopping the old CoreAudio stream."""
         if not self._audio_refresh_lock.acquire(blocking=False):
@@ -1318,9 +1452,13 @@ class VoiceTranscribeApp(rumps.App):
             if len(self._retired_audio_streams) >= AUDIO_MAX_RETIRED_STREAMS:
                 print(
                     "Audio stream refresh skipped: retired-stream safety cap reached; "
-                    "restart the app if the mic still feels wedged.",
+                    "a full app relaunch is needed to reset CoreAudio cleanly.",
                     flush=True,
                 )
+                if AUDIO_RELAUNCH_ON_REFRESH_CAP:
+                    self._schedule_self_relaunch(
+                        f"retired stream cap reached during {reason}"
+                    )
                 return False
 
             snapshot = self._audio_health_snapshot()
@@ -1364,6 +1502,48 @@ class VoiceTranscribeApp(rumps.App):
             except Exception as exc:
                 print(f"Audio health watchdog failed: {exc}", flush=True)
 
+    def _recording_audio_watchdog_loop(self):
+        """Refresh during a hold if the user is talking but CoreAudio is flat.
+
+        The older recovery only happened after release, which meant one bad hold
+        still failed. This nudges the input stream while Fn is still down so the
+        same dictation can often recover before the user lets go.
+        """
+        while True:
+            time.sleep(AUDIO_RECORDING_WATCHDOG_SECONDS)
+            try:
+                if not self.is_recording or self.is_processing:
+                    continue
+                if self._recording_auto_refresh_requested:
+                    continue
+                started = self._recording_started_monotonic
+                if not started:
+                    continue
+
+                held = time.monotonic() - started
+                if held < AUDIO_RECORDING_FLAT_REFRESH_SECONDS:
+                    continue
+
+                active_seconds = self._recording_active_frames / float(SAMPLE_RATE)
+                max_rms = self._recording_max_callback_rms
+                if (
+                    active_seconds < AUDIO_RECORDING_MIN_ACTIVE_SECONDS
+                    and max_rms < AUDIO_DEAD_INPUT_MAX_RMS
+                ):
+                    self._recording_auto_refresh_requested = True
+                    print(
+                        "Mic input is flat while recording; refreshing input stream "
+                        f"mid-hold (held={held:.1f}s, active={active_seconds:.2f}s, "
+                        f"max_rms={max_rms:.4f}).",
+                        flush=True,
+                    )
+                    self._refresh_audio_stream_async(
+                        "recording-live flat input",
+                        force=False,
+                    )
+            except Exception as exc:
+                print(f"Recording audio watchdog failed: {exc}", flush=True)
+
     # ── Recording ──
     # Start/stop are just flag toggles — no CoreAudio calls, no mutex, no deadlock.
 
@@ -1372,6 +1552,12 @@ class VoiceTranscribeApp(rumps.App):
             return
         self._ensure_audio_stream_healthy("recording-start")
         self.audio_buffer = []
+        self._recording_started_monotonic = time.monotonic()
+        self._recording_frames_seen = 0
+        self._recording_active_frames = 0
+        self._recording_max_callback_rms = 0.0
+        self._recording_last_active_at = 0.0
+        self._recording_auto_refresh_requested = False
         self.is_recording = True
         self._recording_start_time = time.time()
         self._run_on_main_thread(self._hud.show)
@@ -1390,6 +1576,7 @@ class VoiceTranscribeApp(rumps.App):
         if not self.is_recording:
             return
         self.is_recording = False
+        self._recording_started_monotonic = None
         self._recording_start_time = None
         # Set is_processing synchronously here (not inside the worker thread) so
         # there's no race window where both is_recording and is_processing are
