@@ -151,17 +151,20 @@ fi
 step "Configuring run.sh"
 cat > "$REPO_DIR/run.sh" << EOF
 #!/bin/bash
-# Launcher — uses Python.app (which has Accessibility + Input Monitoring permission)
-PYTHON_APP="${PYTHON_APP}"
+# Launcher — uses Python.app (which has Accessibility + Input Monitoring permission).
+# Do not pkill an existing instance here: transcribe.py has a lock, and killing
+# the warm resident worker is exactly what makes the first Cohere dictation slow.
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR}"
+PYTHON_BIN="\${VOICE_TRANSCRIBE_PYTHON:-${PYTHON_APP}}"
 VENV_SITE="${VENV_SITE}"
-SCRIPT="${REPO_DIR}/transcribe.py"
+SCRIPT="\${REPO_DIR}/transcribe.py"
 
-# Kill any existing voice-transcribe processes
-pkill -f "voice-transcribe/transcribe.py" 2>/dev/null
-sleep 0.5
-
-export PYTHONPATH="\${VENV_SITE}:${REPO_DIR}:\${PYTHONPATH}"
-exec "\$PYTHON_APP" "\$SCRIPT"
+cd "\${REPO_DIR}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="\${VENV_SITE}:\${REPO_DIR}:\${PYTHONPATH:-}"
+exec "\${PYTHON_BIN}" "\${SCRIPT}"
 EOF
 chmod +x "$REPO_DIR/run.sh"
 ok "run.sh configured for this machine"

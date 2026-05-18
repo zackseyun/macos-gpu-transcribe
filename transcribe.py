@@ -108,6 +108,9 @@ AUDIO_MAX_RETIRED_STREAMS = int(os.getenv("VOICE_TRANSCRIBE_AUDIO_MAX_RETIRED_ST
 AUDIO_RELAUNCH_ON_REFRESH_CAP = os.getenv(
     "VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP", "true"
 ).strip().lower() not in {"0", "false", "off", "no"}
+AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK = os.getenv(
+    "VOICE_TRANSCRIBE_AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK", "false"
+).strip().lower() not in {"0", "false", "off", "no"}
 AUDIO_RECORDING_WATCHDOG_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_WATCHDOG_SECONDS", "0.35"))
 AUDIO_RECORDING_FLAT_REFRESH_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_FLAT_REFRESH_SECONDS", "1.6"))
 AUDIO_RECORDING_MIN_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_AUDIO_RECORDING_MIN_ACTIVE_SECONDS", "0.15"))
@@ -121,6 +124,12 @@ INPUT_VOLUME_FORCE_ON_RECORDING = os.getenv(
 ).strip().lower() not in {"0", "false", "off", "no"}
 INPUT_VOLUME_OSASCRIPT_TIMEOUT_SECONDS = float(
     os.getenv("VOICE_TRANSCRIBE_INPUT_VOLUME_TIMEOUT_SECONDS", "1.5")
+)
+INPUT_VOLUME_FORCE_BLOCKING_ON_RECORDING = os.getenv(
+    "VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME_BLOCKING", "false"
+).strip().lower() not in {"0", "false", "off", "no"}
+INPUT_VOLUME_FORCE_MIN_INTERVAL_SECONDS = float(
+    os.getenv("VOICE_TRANSCRIBE_INPUT_VOLUME_MIN_INTERVAL_SECONDS", "300")
 )
 
 BACKGROUND_WARM_INTERVAL_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_WARM_PING_SECONDS", "240"))
@@ -644,6 +653,8 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_last_active_at = 0.0
         self._recording_auto_refresh_requested = False
         self._relaunch_requested = False
+        self._input_volume_lock = threading.Lock()
+        self._last_input_volume_check_at = 0.0
 
         # Make the system input gain safe before the worker starts its heavy
         # model preload. We still repeat this on each Fn recording, but doing it
@@ -1588,28 +1599,49 @@ class VoiceTranscribeApp(rumps.App):
         finally:
             self._audio_refresh_lock.release()
 
-    def _force_input_volume_before_recording(self, context="before recording"):
+    def _force_input_volume_before_recording(self, context="before recording", blocking=True):
         if not INPUT_VOLUME_FORCE_ON_RECORDING:
             return
-        result = _force_macos_input_volume_to_max()
-        previous = result.get("previous")
-        current = result.get("current")
-        error = result.get("error")
-        if not _input_volume_should_log(previous, current, error=error):
+        now = time.monotonic()
+        if (
+            context != "startup"
+            and INPUT_VOLUME_FORCE_MIN_INTERVAL_SECONDS > 0
+            and self._last_input_volume_check_at
+            and now - self._last_input_volume_check_at < INPUT_VOLUME_FORCE_MIN_INTERVAL_SECONDS
+        ):
             return
 
-        if error:
-            print(
-                f"Input volume max check failed ({context}) "
-                f"(previous={previous}, current={current}): {error}",
-                flush=True,
-            )
+        def _run_check():
+            if not self._input_volume_lock.acquire(blocking=False):
+                return
+            try:
+                result = _force_macos_input_volume_to_max()
+                self._last_input_volume_check_at = time.monotonic()
+                previous = result.get("previous")
+                current = result.get("current")
+                error = result.get("error")
+                if not _input_volume_should_log(previous, current, error=error):
+                    return
+
+                if error:
+                    print(
+                        f"Input volume max check failed ({context}) "
+                        f"(previous={previous}, current={current}): {error}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Input volume forced to 100 ({context}) "
+                        f"(previous={previous}, current={current})",
+                        flush=True,
+                    )
+            finally:
+                self._input_volume_lock.release()
+
+        if blocking:
+            _run_check()
         else:
-            print(
-                f"Input volume forced to 100 ({context}) "
-                f"(previous={previous}, current={current})",
-                flush=True,
-            )
+            threading.Thread(target=_run_check, daemon=True).start()
 
     def _ensure_audio_stream_healthy(self, reason):
         snapshot = self._audio_health_snapshot()
@@ -1617,6 +1649,8 @@ class VoiceTranscribeApp(rumps.App):
         if self._audio_stream is None:
             return self._refresh_audio_stream(reason=f"{reason}: no stream", force=True)
         if callback_age is None or callback_age > AUDIO_CALLBACK_STALE_SECONDS:
+            if not AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK:
+                return False
             age_text = "never" if callback_age is None else f"{callback_age:.1f}s"
             return self._refresh_audio_stream(
                 reason=f"{reason}: callback stale ({age_text})",
@@ -1630,7 +1664,15 @@ class VoiceTranscribeApp(rumps.App):
             try:
                 if self.is_recording or self.is_processing:
                     continue
-                self._ensure_audio_stream_healthy("watchdog")
+                # Idle callback staleness is not reliable enough to justify a
+                # refresh/relaunch. On this Mac it was repeatedly cycling:
+                # stale callback → replacement streams → retired-stream cap →
+                # app relaunch → cold Cohere reload. Real recording recovery is
+                # handled by the recording watchdog and empty-audio path.
+                if self._audio_stream is None:
+                    self._ensure_audio_stream_healthy("watchdog")
+                elif AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK:
+                    self._ensure_audio_stream_healthy("watchdog")
             except Exception as exc:
                 print(f"Audio health watchdog failed: {exc}", flush=True)
 
@@ -1682,7 +1724,6 @@ class VoiceTranscribeApp(rumps.App):
     def _start_recording(self):
         if self.is_recording or self.is_processing:
             return
-        self._force_input_volume_before_recording()
         self._ensure_audio_stream_healthy("recording-start")
         self.audio_buffer = []
         self._recording_started_monotonic = time.monotonic()
@@ -1694,6 +1735,9 @@ class VoiceTranscribeApp(rumps.App):
         self.is_recording = True
         self._recording_start_time = time.time()
         self._run_on_main_thread(self._hud.show)
+        self._force_input_volume_before_recording(
+            blocking=INPUT_VOLUME_FORCE_BLOCKING_ON_RECORDING
+        )
         if self.screen_context_enabled:
             now = time.time()
             if now - self._last_recording_refresh >= SCREEN_CONTEXT_RECORDING_REFRESH_INTERVAL:
