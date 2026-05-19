@@ -39,7 +39,7 @@ _TECH_COMPOUNDS = frozenset({
     "hotkey", "hotkeys", "webhook", "webhooks", "subprocess", "subprocesses",
     "screenshot", "screenshots", "livestream", "livestreams",
     "changelog", "changelogs", "fallback", "fallbacks", "callback", "callbacks",
-    "eslint", "openai", "anthropic", "claude",
+    "eslint", "openai", "anthropic", "claude", "cartha", "kartha",
 })
 
 
@@ -150,9 +150,9 @@ def _split_merged_words(text):
 
     def check_and_split(match):
         raw = match.group(0)
-        lower = raw.lower()
-        if not _looks_like_merged_word(lower):
+        if not _looks_like_merged_word(raw):
             return raw
+        lower = raw.lower()
         pieces = wordninja.split(lower)
         if len(pieces) < 2:
             return raw
@@ -314,17 +314,22 @@ def _capitalize_first(text):
 # Domain separator: punctuation, whitespace, or the literal word "dot"
 # (Cohere often spells the period out loud as "Dot" in URL dictation).
 _DOM_SEP = r"(?:[\s,.]+(?:dot[\s,.]+)?)+"
+_CARTHA = r"(?:c|k)artha"
 
 _BRAND_REPLACEMENTS = [
     # Homophones — case-normalize "cloud code" / "claude code" → "Claude Code"
     (re.compile(r"\b(?:cloud|claude)\s+code\b", re.IGNORECASE), "Claude Code"),
-    # Cartha domain forms — tolerates "dot" word, dropped trailing "e"
-    # ("Mobil"), and incorrect plural "websites".
-    (re.compile(rf"\bcartha{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
-    (re.compile(rf"\bcartha{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
-    (re.compile(rf"\bcartha{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
+    # Cartha domain forms — tolerates Cohere's hard-C misspelling ("Kartha"),
+    # the spoken "dot" word, dropped trailing "e" ("Mobil"), and incorrect
+    # plural "websites".
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
     # Camel-case service names
-    (re.compile(r"\bcartha[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
+    (re.compile(rf"\b{_CARTHA}[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
+    # Standalone brand: Cohere often chooses "Kartha" for the company/app name.
+    # Keep this after the domain/service forms so longer canonical names win.
+    (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
     # Common Anthropic/AI brand mishearings
     (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
 ]
