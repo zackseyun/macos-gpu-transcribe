@@ -330,6 +330,8 @@ _BRAND_REPLACEMENTS = [
     # Standalone brand: Cohere often chooses "Kartha" for the company/app name.
     # Keep this after the domain/service forms so longer canonical names win.
     (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
+    # User name: Cohere tends to choose the more common spelling.
+    (re.compile(r"\bzach\b", re.IGNORECASE), "Zack"),
     # Common Anthropic/AI brand mishearings
     (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
 ]

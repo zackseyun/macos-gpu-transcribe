@@ -28,6 +28,18 @@ class BrandReplacementTest(unittest.TestCase):
             "Karthik can review it later.",
         )
 
+    def test_corrects_zach_to_zack(self):
+        self.assertEqual(
+            format_transcription("zach should review the app."),
+            "Zack should review the app.",
+        )
+
+    def test_does_not_touch_longer_zach_names(self):
+        self.assertEqual(
+            format_transcription("Zachary can review it later."),
+            "Zachary can review it later.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
