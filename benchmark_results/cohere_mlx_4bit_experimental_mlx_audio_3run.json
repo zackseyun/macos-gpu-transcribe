@@ -1,0 +1,23 @@
+{
+  "audio": "/Users/zackseyun/voice-transcribe/last_recording.wav",
+  "audio_seconds": 32.25075,
+  "runs_per_variant": 3,
+  "variants": [
+    {
+      "variant": "cohere-mlx-4bit-experimental",
+      "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+      "model_dir": "/Users/zackseyun/.cache/huggingface/hub/models--beshkenadze--cohere-transcribe-03-2026-mlx-4bit/snapshots/104bc4391b5b1a12b040859793d7148525e1a08c",
+      "runtime": "mlx_audio",
+      "load_seconds": 3.887369917007163,
+      "runs": [
+        0.9621970000152942,
+        0.9207065409864299,
+        0.9227631670073606
+      ],
+      "median_seconds": 0.9227631670073606,
+      "min_seconds": 0.9207065409864299,
+      "max_seconds": 0.9621970000152942,
+      "text": "\ud639 est product term\u6697sel importantmos graph mustgelwiadiego\u5fb4\u0399 product gel\ub828\u8ca0 \uc2e4\uc81c\u9aa8etsgru 1.phone horse mustgel\u554a Themaar\u00e1\u6708 Themaetto\u03c4\u03bf\u03b9 product aprob\u9078 aprob pare aprob pareches\u3068\u3053 aprob gentetto\u03c4\u03bf\u03b9 s\u00e9\u96f6 klar regionalog\uac04\u30b7\u30e7 called growth horse annual Conse stra minor\u0648\u0641cle growth annual Conse straulta Os strongerulta Os maior Andiu\u3057\u3066\u3044\u307e\u3059\u3057\u3066\u3044\u307e\u3059\u3057\u3066\u3044\u307e\u3059 gliessen\u3063\u3066 danger\u03c4\u03b9\u03baessen propos danger \uc54c\uc544 page Conse stra minor niconprochen th\u00eciu fact veelgelezen meant democ danger\u03c4\u03b9\u03ba deste quite danger \uc54c\uc544 page Conse strakl\u03c4\u03b9\u03ba\u03ce\u03bd \u03b5\u03c0\u03b9\u03ba zone\u91ce aprob \u00e9c\u90e8 cre interested ye qui prod \uc2e4\uc81c\u81f4 tiny Os Ora\u533aif\u0648\u0641 willing our\u00fc\u533aifar\u00e1 precis Every \u03b8\u03ad\u03c3\u03b7\u03bc\u03cc basically vess decid States Conse straicken noiseienne\u0119p objectaloicken noise machtem\u00e1s\u54e5 destewasued math\ub5bboth\ub2a6 Wort \uc2e4\uc81c\u9aa8 conquem\u00e1s\u54e5 destewas Every Amazon celebrem\u00e1s\u54e5 destewasued math show\u677f renem\u00e1s\u65e5\u672c expressed\ucd95 \u03b4\u03cdi\ud61c decidssen size\u03c3\u03b5\u03b9 Wi\u0119c\ub4e0\uc9c0ently\uc2a4\u5e0c longer placedicken quando buildings effect eating \u03c3\u03c5\u03bd\u03b5 BenienneW Amazizo \ud53cem\u00e1s\uad81 show\u00fc\ub7fd vi\u00ean fiveructmar\u6298 democ danger \uc54c\uc544em\u00e1sem\u00e1s\u54e5 ye t\u1edbiem\u00e1s\ube4cienne revolutionended outro\ube4c\u03ae\u5104 8.\u03bb\u03bfem\u00e1s ela break\u03bb\u03bfem\u00e1s\uad81 showess"
+    }
+  ]
+}

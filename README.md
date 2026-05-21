@@ -16,7 +16,7 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is the fastest day-to-day Fn dictation path. Cohere Transcribe 2B remains available from the menu bar when you want the older steadier path, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
+Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is the fastest day-to-day Fn dictation path. Cohere Transcribe MLX 8-bit remains available from the menu bar when you want the older steadier path, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
@@ -29,9 +29,9 @@ Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is 
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | Default selected in menu: Qwen3-ASR 0.6B fast path by default; [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 0.6B / 2B | Qwen via MLX (Metal); Cohere via PyTorch (MPS); Granite via CrispASR/GGUF (Metal) | Qwen is the lowest-latency path; Cohere ~3–4× real-time; Granite varies by warm/server state |
+| **Hold Fn** | Default selected in menu: Qwen3-ASR 0.6B fast path by default; [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 0.6B / 2B | Qwen via MLX (Metal); Cohere 8-bit via MLX (Metal); legacy Cohere PyTorch remains available; Granite via CrispASR/GGUF (Metal) | Qwen is the lowest-latency path; Cohere ~3–4× real-time; Granite varies by warm/server state |
 
-Qwen3-ASR is the default for Fn dictation now. Cohere stays one click away in the menu for comparison or when you prefer its wording. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
+Qwen3-ASR is the default for Fn dictation now. Cohere stays one click away in the menu for comparison or when you prefer its wording. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere MLX is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -208,7 +208,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_QWEN_KEEP_WARM` | `true` | Keep Qwen warm during active use instead of clearing the MLX cache after each dictation |
 | `VOICE_TRANSCRIBE_QWEN_LANGUAGE` | `English` | Spoken-language hint passed to Qwen3-ASR |
 | `VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | unset | Optional cap for Qwen generation if you want to tune speed/length |
-| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `false` | Load + prewarm Cohere on worker start. Default is off now so the Qwen fast path gets memory/GPU priority |
+| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `false` | Load + prewarm legacy PyTorch Cohere on worker start. Default is off so Qwen/Cohere MLX get memory/GPU priority |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
@@ -266,3 +266,16 @@ tail -f /tmp/voice-transcribe.log
 ## License
 
 MIT. See [`LICENSE`](LICENSE) if present; otherwise do whatever you want with it — just don't blame the author if it sets your GPU on fire.
+
+## Cohere MLX experiment
+
+The default `cohere` menu option now uses `mlx-community/cohere-transcribe-03-2026-mlx-8bit` through `mlx-speech`/MLX instead of the older PyTorch/MPS path. The old full 2B PyTorch path is still available as `cohere-pytorch` in the menu, so we can revert behavior without reverting the repo.
+
+Local benchmark on `last_recording.wav` (~32.25s audio):
+
+| Variant | Runtime | Median | Speed | Quality |
+| --- | --- | ---: | ---: | --- |
+| Cohere MLX 8-bit | `mlx-speech` | ~0.68s | ~47x real-time | Correct transcript |
+| Cohere MLX 4-bit | `mlx-audio` experimental | ~0.92s | ~35x real-time | Unusable multilingual gibberish in current Python runtime |
+
+Checkpoint before this experiment: `checkpoint/pre-cohere-mlx-swift-20260521-113301`.

@@ -1,0 +1,25 @@
+{
+  "audio": "/Users/zackseyun/voice-transcribe/last_recording.wav",
+  "audio_seconds": 32.25075,
+  "runs_per_variant": 5,
+  "variants": [
+    {
+      "variant": "cohere-mlx-8bit",
+      "repo_id": "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
+      "model_dir": "/Users/zackseyun/.cache/huggingface/hub/models--mlx-community--cohere-transcribe-03-2026-mlx-8bit/snapshots/a0acb7f93cd32d82c4fbf801b6d8fb39d20c509f/mlx-int8",
+      "runtime": "mlx_speech",
+      "load_seconds": 0.6662610830098856,
+      "runs": [
+        0.7368472499947529,
+        0.6840008750150446,
+        0.696013541019056,
+        0.6742204999900423,
+        0.6781732910021674
+      ],
+      "median_seconds": 0.6840008750150446,
+      "min_seconds": 0.6742204999900423,
+      "max_seconds": 0.7368472499947529,
+      "text": "As both of them seem well, much smaller than the original 2 billion ASR model. So, yeah, let's benchmark both of them and migrate over to Swift instead of Python. And then let's fully test whether this is an improvement. But make sure that we can revert back to this GitHub path at any time. So, remember this checkpoint and then go experiment and see if this works."
+    }
+  ]
+}

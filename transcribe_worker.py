@@ -4,7 +4,8 @@ Supports three model modes:
   - "granite": Granite Speech 4.1 NAR via CrispASR/GGUF (Metal if available)
   - "fast": Qwen3-ASR 0.6B via MLX (Metal)
   - "accurate": Qwen3-ASR 1.7B via MLX (Metal)
-  - "cohere": Cohere Transcribe 2B via PyTorch (MPS)
+  - "cohere": Cohere Transcribe 8-bit via MLX (Metal)
+  - "cohere-pytorch": Cohere Transcribe 2B via PyTorch (MPS, legacy fallback)
 
 Cold-start mitigation:
   MPS (Metal) evicts compiled shader state after ~30-60s of GPU idle, which
@@ -56,6 +57,11 @@ QWEN3_MODEL_IDS = {
 }
 
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+COHERE_MLX_MODEL_ID = os.getenv(
+    "VOICE_TRANSCRIBE_COHERE_MLX_MODEL",
+    "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
+)
+COHERE_MLX_SUBDIR = os.getenv("VOICE_TRANSCRIBE_COHERE_MLX_SUBDIR", "mlx-int8")
 GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
 GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
 GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
@@ -221,6 +227,53 @@ def _prewarm_cohere(processor, model, warm_wav_path):
         print(f"Transcription worker: Cohere pre-warm failed: {exc}", flush=True)
         return
     print(f"Transcription worker: Cohere pre-warm done ({time.time() - t0:.1f}s)", flush=True)
+
+
+def _cohere_mlx_audio_from_input(audio_input):
+    if isinstance(audio_input, (tuple, list)) and len(audio_input) == 2:
+        audio, sample_rate = audio_input
+        if int(sample_rate) != 16000:
+            raise ValueError(f"Expected 16 kHz audio, got {sample_rate} Hz")
+        return np.asarray(audio, dtype=np.float32)
+    return audio_input
+
+
+def _resolve_cohere_mlx_model_dir():
+    from huggingface_hub import snapshot_download
+
+    root = Path(snapshot_download(
+        repo_id=COHERE_MLX_MODEL_ID,
+        allow_patterns=[
+            "*.json",
+            "*.safetensors",
+            "*.model",
+            "*.txt",
+            "*.md",
+            f"{COHERE_MLX_SUBDIR}/*",
+        ],
+    ))
+    if COHERE_MLX_SUBDIR and COHERE_MLX_SUBDIR not in {".", ""}:
+        return root / COHERE_MLX_SUBDIR
+    return root
+
+
+def _transcribe_cohere_mlx(audio_input, model):
+    audio = _cohere_mlx_audio_from_input(audio_input)
+    if isinstance(audio, (str, os.PathLike)):
+        result = model.transcribe(audio, language="en")
+    else:
+        result = model.transcribe(audio, sample_rate=16000, language="en")
+    return str(getattr(result, "text", result)).strip()
+
+
+def _prewarm_cohere_mlx(model):
+    t0 = time.time()
+    try:
+        _transcribe_cohere_mlx(_silent_audio_tuple(), model)
+    except Exception as exc:
+        print(f"Transcription worker: Cohere MLX pre-warm failed: {exc}", flush=True)
+        return
+    print(f"Transcription worker: Cohere MLX pre-warm done ({time.time() - t0:.1f}s)", flush=True)
 
 
 def _find_crispasr_bin():
@@ -550,6 +603,7 @@ def run(request_pipe, result_pipe):
     cohere_processor = None
     cohere_model = None
     cohere_prompt_cache = {}
+    cohere_mlx_model = None
     granite_server = GraniteCrispasrServer() if GRANITE_USE_SERVER else None
 
     # Persistent silent WAV for pre-warm + keep-warm (written once, reused forever)
@@ -615,7 +669,7 @@ def run(request_pipe, result_pipe):
             inference_lock.release()
 
     def _ensure_cohere_loaded(reason="on-demand"):
-        """Load + prewarm Cohere exactly once, safe across warm/real requests."""
+        """Load + prewarm legacy PyTorch Cohere exactly once."""
         nonlocal cohere_processor, cohere_model
 
         if cohere_model is not None:
@@ -650,6 +704,38 @@ def run(request_pipe, result_pipe):
                     last_any_inference_at[0] = time.time()
             return True
 
+    def _ensure_cohere_mlx_loaded(reason="on-demand"):
+        """Load + prewarm the MLX Cohere 8-bit path exactly once."""
+        nonlocal cohere_mlx_model
+
+        if cohere_mlx_model is not None:
+            return True
+
+        with cohere_load_lock:
+            if cohere_mlx_model is not None:
+                return True
+
+            load_t0 = time.time()
+            print(
+                f"Transcription worker: loading Cohere MLX ({reason}, model={COHERE_MLX_MODEL_ID})...",
+                flush=True,
+            )
+            from mlx_speech.generation import CohereAsrModel
+
+            model_dir = _resolve_cohere_mlx_model_dir()
+            cohere_mlx_model = CohereAsrModel.from_path(model_dir)
+            print(
+                f"Transcription worker: Cohere MLX loaded from {model_dir} "
+                f"({time.time() - load_t0:.1f}s, reason={reason})",
+                flush=True,
+            )
+
+            with inference_lock:
+                _prewarm_cohere_mlx(cohere_mlx_model)
+                last_any_inference_at[0] = time.time()
+            return True
+
+
     def _do_warm(reason):
         """Run a silent dummy inference. Returns True if it actually ran."""
         if cohere_model is None or warm_wav_path is None:
@@ -680,6 +766,26 @@ def run(request_pipe, result_pipe):
         finally:
             inference_lock.release()
 
+    def _do_warm_cohere_mlx(reason):
+        if cohere_mlx_model is None:
+            return False
+        if not inference_lock.acquire(blocking=False):
+            return False
+        try:
+            t0 = time.time()
+            _transcribe_cohere_mlx(_silent_audio_tuple(), cohere_mlx_model)
+            last_any_inference_at[0] = time.time()
+            dt = time.time() - t0
+            if dt > 1.5:
+                print(f"Transcription worker: Cohere MLX {reason}-warm took {dt:.1f}s", flush=True)
+            return True
+        except Exception as exc:
+            print(f"Transcription worker: Cohere MLX {reason}-warm failed: {exc}", flush=True)
+            return False
+        finally:
+            inference_lock.release()
+
+
     def _keep_warm_loop():
         """Background thread: tight keep-warm loop that bounds itself to active sessions.
 
@@ -691,7 +797,7 @@ def run(request_pipe, result_pipe):
         while True:
             try:
                 time.sleep(KEEP_WARM_CHECK_INTERVAL)
-                if cohere_model is None and not qwen3_loaded_models:
+                if cohere_model is None and cohere_mlx_model is None and not qwen3_loaded_models:
                     continue
                 now = time.time()
                 # Stop keep-warming if no real activity recently — let GPU sleep.
@@ -700,7 +806,9 @@ def run(request_pipe, result_pipe):
                 # Don't warm if we just warmed/transcribed.
                 if now - last_any_inference_at[0] < KEEP_WARM_INTERVAL:
                     continue
-                if cohere_model is not None:
+                if cohere_mlx_model is not None:
+                    _do_warm_cohere_mlx("keep")
+                elif cohere_model is not None:
                     _do_warm("keep")
                 elif qwen3_loaded_models:
                     _warm_qwen3("keep")
@@ -752,20 +860,18 @@ def run(request_pipe, result_pipe):
                         target=_warm_qwen3, args=("on-demand", warm_model_mode), daemon=True
                     ).start()
                 continue
-            if cohere_model is None:
+            if cohere_mlx_model is None:
                 threading.Thread(
-                    target=_ensure_cohere_loaded,
+                    target=_ensure_cohere_mlx_loaded,
                     args=("fn-warm-preload",),
                     daemon=True,
                 ).start()
-                continue
-            if warm_wav_path is None:
                 continue
             now = time.time()
             if now - last_any_inference_at[0] < ON_DEMAND_WARM_SKIP_THRESHOLD:
                 continue  # already hot, skip
             threading.Thread(
-                target=_do_warm, args=("on-demand",), daemon=True
+                target=_do_warm_cohere_mlx, args=("on-demand",), daemon=True
             ).start()
             continue
 
@@ -807,6 +913,22 @@ def run(request_pipe, result_pipe):
                         screen_context=screen_context,
                     )
             elif model_mode == "cohere":
+                _ensure_cohere_mlx_loaded("real-request")
+
+                if screen_context:
+                    print(
+                        "Transcription worker: Cohere MLX does not accept decoder context yet; ignoring context.",
+                        flush=True,
+                    )
+                with inference_lock:
+                    text = _transcribe_cohere_mlx(
+                        audio_input if audio_input is not None else wav_path,
+                        cohere_mlx_model,
+                    )
+                    now = time.time()
+                    last_real_inference_at[0] = now
+                    last_any_inference_at[0] = now
+            elif model_mode == "cohere-pytorch":
                 _ensure_cohere_loaded("real-request")
 
                 with inference_lock:

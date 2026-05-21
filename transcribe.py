@@ -155,11 +155,12 @@ STATIC_VOCABULARY_DEFAULT = ""
 DEFAULT_MODEL_MODE = "fast"
 MODEL_LABELS = {
     "granite": "Granite Speech 4.1 NAR",
-    "cohere": "Cohere Transcribe 2B",
+    "cohere": "Cohere Transcribe MLX 8-bit",
+    "cohere-pytorch": "Cohere Transcribe 2B PyTorch",
     "fast": "Qwen3-ASR 0.6B 4-bit",
     "accurate": "Qwen3-ASR 1.7B",
 }
-MENU_MODEL_MODES = ("fast", "cohere", "granite")
+MENU_MODEL_MODES = ("fast", "cohere", "cohere-pytorch", "granite")
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -1963,9 +1964,9 @@ class VoiceTranscribeApp(rumps.App):
                 finally:
                     latency["context"] = time.perf_counter() - context_t0
 
-            # Cohere-only: prepend the static vocabulary to whatever screen
-            # context was assembled. Qwen3 modes get the screen context as-is.
-            if model_mode == "cohere" and self.vocabulary:
+            # Legacy PyTorch Cohere-only: prepend static vocabulary to the decoder prompt.
+            # The MLX Cohere runtime does not support decoder context prompts yet.
+            if model_mode == "cohere-pytorch" and self.vocabulary:
                 screen_context = (
                     f"{self.vocabulary} {screen_context}".strip()
                     if screen_context

@@ -29,10 +29,18 @@ class LatencyHelperTest(unittest.TestCase):
         out = transcribe_worker._cohere_audio_from_input((audio, 16000))
         self.assertIs(out, audio)
 
+    def test_worker_accepts_raw_16khz_audio_tuple_for_cohere_mlx(self):
+        audio = np.zeros(160, dtype=np.float32)
+        out = transcribe_worker._cohere_mlx_audio_from_input((audio, 16000))
+        self.assertEqual(out.dtype, np.float32)
+        self.assertEqual(out.shape, audio.shape)
+
     def test_worker_rejects_wrong_sample_rate_for_raw_audio(self):
         audio = np.zeros(160, dtype=np.float32)
         with self.assertRaises(ValueError):
             transcribe_worker._cohere_audio_from_input((audio, 8000))
+        with self.assertRaises(ValueError):
+            transcribe_worker._cohere_mlx_audio_from_input((audio, 8000))
 
     def test_worker_has_qwen_silent_warm_audio_tuple(self):
         audio, sample_rate = transcribe_worker._silent_audio_tuple(seconds=0.01)
