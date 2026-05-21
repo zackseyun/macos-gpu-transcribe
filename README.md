@@ -273,6 +273,14 @@ MIT. See [`LICENSE`](LICENSE) if present; otherwise do whatever you want with it
 
 The default `cohere` menu option now uses `mlx-community/cohere-transcribe-03-2026-mlx-8bit` through `mlx-speech`/MLX instead of the older PyTorch/MPS path. The old full 2B PyTorch path is still available as `cohere-pytorch` in the menu, so we can revert behavior without reverting the repo. The experimental `cohere-swift-4bit` menu option uses the newer Swift runtime because the Python 4-bit path was the source of the earlier multilingual gibberish.
 
+Current local recommendation for Zack's Fn dictation is `cohere-swift-4bit`: the resident Swift MLX server has been the fastest Cohere path in repeated local tests, while the 8-bit Python MLX path remains the safer quality/compatibility fallback. The live machine setting is stored in ignored `settings.json`, so choose **Cohere Transcribe Swift 4-bit** from the menu, or set:
+
+```json
+{
+  "default_model_mode": "cohere-swift-4bit"
+}
+```
+
 Local benchmark on `last_recording.wav` (~32.25s audio):
 
 | Variant | Runtime | Median | Speed | Quality |
