@@ -6,7 +6,7 @@ A push-to-talk dictation app for Apple Silicon Macs. **Hold Fn** to record, **re
 
 ## Why this exists
 
-Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost downsides. Apple Silicon is fast enough to run 2B-parameter ASR models in real time entirely on-device. This app wires that into a hold-to-talk hotkey with native Mac UI — menu bar icon, Dock icon, a cursor-tracking HUD, and a main settings window.
+Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost downsides. Apple Silicon is fast enough to run 2B-parameter ASR models in real time entirely on-device. This app wires that into a hold-to-talk hotkey with native Mac UI — a quiet menu bar icon, a cursor-tracking HUD only while active, and an optional settings window.
 
 ## How it works
 
@@ -22,7 +22,7 @@ Everything runs on the GPU. The current default is Cohere Transcribe 2B because 
 
 - **Floating HUD** — borderless, click-through, follows the cursor. Live waveform while recording; text label while transcribing or loading. Appears only during active use.
 - **Menu bar icon** — classic rumps-style status indicator (`🎙` idle / `🔴 2s` recording / `⏳` processing). Clicking it gives you a history list (last 20, click to copy), toggles for sound effects / screen context, and a default-model selector.
-- **Main window** — regular Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. Opens automatically at launch; reopens when you click the Dock icon.
+- **Main window** — optional Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. It stays hidden at launch; open it intentionally from the menu bar's **Open Settings Window** item.
 - **Keep-warm** — wake-from-sleep hook + App Nap opt-out + 15-min background ping means the GPU kernels stay hot, so the first press after opening your laptop is instant instead of a 7-second cold start.
 
 ## Model & key binding
@@ -209,6 +209,8 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_GRANITE_USE_SERVER` | `1` | Keep Granite loaded in a persistent local CrispASR server after first use. Set to `0` to force the older one-shot CLI path |
 | `VOICE_TRANSCRIBE_GRANITE_SERVER_PORT` | `8765` | Localhost port for the lazy Granite server |
 | `VOICE_TRANSCRIBE_SCREEN_CONTEXT` | unset | Start with screen context enabled |
+| `VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH` | unset | Set to `1` to show the settings window at launch, or run `transcribe.py --show-window` |
+| `VOICE_TRANSCRIBE_SHOW_DOCK_ICON` | unset | Set to `1` to launch as a regular Dock/⌘-Tab app, or run `transcribe.py --show-dock` |
 | `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
 
 ## Files

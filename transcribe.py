@@ -217,6 +217,30 @@ def _env_flag(name, default=False):
     return _env_flag_value(os.getenv(name), default=default)
 
 
+def _argv_has_flag(flag, argv=None):
+    if argv is None:
+        argv = sys.argv
+    return flag in list(argv or [])
+
+
+def _should_show_main_window_on_launch(argv=None, environ=None):
+    """Default to a quiet menu-bar launch; show the window only on request."""
+    if environ is None:
+        environ = os.environ
+    return _env_flag_value(
+        environ.get("VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH"), default=False
+    ) or _argv_has_flag("--show-window", argv)
+
+
+def _should_show_dock_icon(argv=None, environ=None):
+    """Keep the app out of the Dock/⌘-Tab unless explicitly requested."""
+    if environ is None:
+        environ = os.environ
+    return _env_flag_value(
+        environ.get("VOICE_TRANSCRIBE_SHOW_DOCK_ICON"), default=False
+    ) or _argv_has_flag("--show-dock", argv)
+
+
 def _parse_input_volume_osascript_output(output):
     """Parse osascript output as (previous_volume, current_volume).
 
@@ -622,9 +646,11 @@ class VoiceTranscribeApp(rumps.App):
         self._hud = get_hud_controller()
         self._main_window = get_main_window_controller()
         self._main_window.attachApp_(self)
+        self._main_window.setReopenOnActivation_(_should_show_dock_icon())
         self._hud_level_peak = 0.0
         self._sound_cache = {}
         self._main_window_shown_once = False
+        self._show_main_window_on_launch = _should_show_main_window_on_launch()
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
         self._model_warmed = self._new_model_warm_state()
@@ -999,8 +1025,9 @@ class VoiceTranscribeApp(rumps.App):
             elapsed = time.time() - self._recording_start_time
             self.title = f"🔴 {elapsed:.0f}s"
 
-        # Open main window once the runloop is live (can't call before .run()).
-        if not self._main_window_shown_once:
+        # Quiet by default: keep this as a menu-bar utility unless explicitly
+        # launched with --show-window or VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH=1.
+        if self._show_main_window_on_launch and not self._main_window_shown_once:
             self._main_window_shown_once = True
             try:
                 self._main_window.showWindow()
@@ -2263,7 +2290,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.clear()
 
-        self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
+        self.menu.add(rumps.MenuItem("Open Settings Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem(
             f"Fn = {self._model_display_name(self.default_model_mode)}",
@@ -2405,9 +2432,20 @@ if __name__ == "__main__":
     lock_handle.write(str(os.getpid()))
     lock_handle.flush()
 
-    # Regular app: shows in Dock, appears in ⌘-Tab. Also keeps the menu bar icon.
-    from AppKit import NSApplication, NSApplicationActivationPolicyRegular
-    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    # Default to a subtle menu-bar utility: no Dock icon, no ⌘-Tab entry, and no
+    # launch window. Use --show-dock or VOICE_TRANSCRIBE_SHOW_DOCK_ICON=1 for an
+    # explicit regular-app/debug launch.
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSApplicationActivationPolicyRegular,
+    )
+    activation_policy = (
+        NSApplicationActivationPolicyRegular
+        if _should_show_dock_icon()
+        else NSApplicationActivationPolicyAccessory
+    )
+    NSApplication.sharedApplication().setActivationPolicy_(activation_policy)
 
     parent_conn, child_conn = multiprocessing.Pipe()
     monitor = multiprocessing.Process(target=key_monitor.run, args=(child_conn,), daemon=True)
