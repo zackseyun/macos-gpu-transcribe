@@ -127,6 +127,26 @@ class SilenceGateTest(unittest.TestCase):
             self.assertNotIn("sys.executable", script)
             self.assertIn("sleep 0.80", script)
 
+    def test_audio_refresh_failure_triggers_clean_relaunch(self):
+        self.assertTrue(
+            transcribe._should_relaunch_after_audio_refresh_failure(
+                "empty-recording",
+                "Error opening InputStream: Internal PortAudio error [PaErrorCode -9986]",
+            )
+        )
+        self.assertTrue(
+            transcribe._should_relaunch_after_audio_refresh_failure(
+                "recording-live flat input",
+                "Audio Unit: Invalid Property Value",
+            )
+        )
+        self.assertFalse(
+            transcribe._should_relaunch_after_audio_refresh_failure(
+                "watchdog",
+                "temporary query timeout",
+            )
+        )
+
     def test_pmset_battery_parser(self):
         parsed = transcribe._parse_pmset_battery_output(
             "Now drawing from 'Battery Power'\\n -InternalBattery-0 (id=1234567)\\t42%; discharging;"

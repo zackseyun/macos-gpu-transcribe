@@ -192,6 +192,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS` | `4` | Minimum gap between automatic mic stream refreshes |
 | `VOICE_TRANSCRIBE_AUDIO_RECORDING_FLAT_REFRESH_SECONDS` | `1.6` | While Fn is held, refresh the mic mid-recording if the stream stays flat this long |
 | `VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP` | `true` | Relaunch the app when the retired-stream cap is hit, giving CoreAudio a clean reset |
+| `VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_FAILURE` | `true` | Relaunch the app when a real recording tries to recover the mic but PortAudio/CoreAudio refuses to open a replacement input stream |
 | `VOICE_TRANSCRIBE_AUDIO_DEVICE` | unset | Optional input override by numeric CoreAudio index or case-insensitive device-name fragment |
 | `VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS` | `0.90` | Minimum held recording length before flat audio is considered a possible wedged mic |
 | `VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME` | `true` | Best-effort macOS input-volume bump to 100 via `osascript`; set to `0`/`false`/`off`/`no` to disable |
@@ -241,7 +242,7 @@ macos-gpu-transcribe/
 | Problem | Fix |
 |---------|-----|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
-| No audio recording | Grant Microphone permission when prompted. If a real Fn hold stays flat, the recording watchdog logs `Mic input is flat while recording...` and opens a replacement stream. Idle callback gaps are intentionally ignored by default to avoid cold-model relaunch loops |
+| No audio recording | Grant Microphone permission when prompted. If a real Fn hold stays flat, the recording watchdog logs `Mic input is flat while recording...` and opens a replacement stream. If CoreAudio/PortAudio refuses that replacement stream, the app relaunches itself for a clean input reset. Idle callback gaps are intentionally ignored by default to avoid cold-model relaunch loops |
 | "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF and start the local CrispASR server. Later runs should reuse the resident server; if they still look cold, check `/tmp/voice-transcribe.log` for worker restarts or server fallback |
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
 | Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |

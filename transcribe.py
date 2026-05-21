@@ -113,6 +113,9 @@ AUDIO_MAX_RETIRED_STREAMS = int(os.getenv("VOICE_TRANSCRIBE_AUDIO_MAX_RETIRED_ST
 AUDIO_RELAUNCH_ON_REFRESH_CAP = os.getenv(
     "VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP", "true"
 ).strip().lower() not in {"0", "false", "off", "no"}
+AUDIO_RELAUNCH_ON_REFRESH_FAILURE = os.getenv(
+    "VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_FAILURE", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
 AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK = os.getenv(
     "VOICE_TRANSCRIBE_AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK", "false"
 ).strip().lower() not in {"0", "false", "off", "no"}
@@ -442,6 +445,31 @@ def _dead_input_refresh_reason(stats):
             f"(active={active_seconds:.2f}s, full_rms={full_rms:.4f})"
         )
     return None
+
+
+def _should_relaunch_after_audio_refresh_failure(reason, error_text):
+    """Treat PortAudio/CoreAudio refresh failures as requiring a clean restart."""
+    if not AUDIO_RELAUNCH_ON_REFRESH_FAILURE:
+        return False
+    text = f"{reason or ''} {error_text or ''}".lower()
+    if any(
+        marker in text
+        for marker in (
+            "internal portaudio error",
+            "paerrorcode -9986",
+            "audio unit",
+            "invalid property value",
+        )
+    ):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "empty-recording",
+            "recording-live flat input",
+            "dead-input after no-volume",
+        )
+    )
 
 
 def _parse_pmset_battery_output(output):
@@ -1645,6 +1673,8 @@ class VoiceTranscribeApp(rumps.App):
             return True
         except Exception as exc:
             print(f"Audio stream refresh failed ({reason}): {exc}", flush=True)
+            if _should_relaunch_after_audio_refresh_failure(reason, str(exc)):
+                self._schedule_self_relaunch(f"refresh failure during {reason}: {exc}")
             return False
         finally:
             self._audio_refresh_lock.release()
