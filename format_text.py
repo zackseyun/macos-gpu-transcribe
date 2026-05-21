@@ -39,7 +39,17 @@ _TECH_COMPOUNDS = frozenset({
     "hotkey", "hotkeys", "webhook", "webhooks", "subprocess", "subprocesses",
     "screenshot", "screenshots", "livestream", "livestreams",
     "changelog", "changelogs", "fallback", "fallbacks", "callback", "callbacks",
-    "eslint", "openai", "anthropic", "claude",
+    "eslint", "openai", "anthropic", "claude", "cartha", "kartha",
+})
+
+
+# Common 1-2 char English words that appear as split pieces but aren't in
+# wordninja's frequency list. Allows "havea"→"have a", "totear"→"to tear",
+# "upso"→"up so", etc.
+_SHORT_VALID_PIECES = frozenset({
+    "a", "i",
+    "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it",
+    "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
 })
 
 
@@ -81,14 +91,46 @@ def _fix_punctuation_spacing(text):
     return re.sub(r'([.,!?;:])([A-Za-z])', r'\1 \2', text)
 
 
+def _collapse_duplicate_punctuation(text):
+    """Collapse ASR punctuation stutter.
+
+    Granite Speech already emits punctuation, and sometimes produces paired
+    marks such as ",,", ",.", "?.", or "..". The rest of the formatter assumes
+    punctuation is single-mark, so normalize those pairs before number/brand
+    post-processing.
+    """
+    # Exact repeats: ",," → ",", "??" → "?", ".." / "..." → "."
+    text = re.sub(r"([,;:!?])\1+", r"\1", text)
+    text = re.sub(r"\.{2,}", ".", text)
+
+    # A comma immediately followed by a sentence terminator is really a
+    # sentence terminator: "Okay,." → "Okay.", "top,?" → "top?"
+    text = re.sub(r",\s*([.!?])", r"\1", text)
+
+    # If a sentence terminator is immediately followed by more punctuation,
+    # keep the terminator: "what?." → "what?", "top.," → "top."
+    text = re.sub(r"([.!?])\s*[,;:.!?]+", r"\1", text)
+
+    # Mixed clause punctuation stutter: ",;" / ";," etc. Keep the first mark.
+    text = re.sub(r"([,;:])\s*[,;:]+", r"\1", text)
+    return text
+
+
+def _is_valid_piece(p):
+    """Is this a valid word fragment when validating a split?"""
+    if p in _SHORT_VALID_PIECES:
+        return True
+    return len(p) >= 3 and _is_known_word(p)
+
+
 def _looks_like_merged_word(word):
     """Heuristic: should we try to split this token?
 
-    Only lowercase alphabetic tokens ≥ 7 chars that aren't a recognized word
+    Only lowercase alphabetic tokens ≥ 4 chars that aren't a recognized word
     in any of our dictionaries. We'd rather leave an oddity than shred a
     legitimate word.
     """
-    if len(word) < 7:
+    if len(word) < 4:
         return False
     if not word.isalpha():
         return False
@@ -108,18 +150,17 @@ def _split_merged_words(text):
 
     def check_and_split(match):
         raw = match.group(0)
-        lower = raw.lower()
-        if not _looks_like_merged_word(lower):
+        if not _looks_like_merged_word(raw):
             return raw
+        lower = raw.lower()
         pieces = wordninja.split(lower)
         if len(pieces) < 2:
             return raw
-        # Every piece must be ≥ 3 chars and a known word. The 3-char minimum
-        # blocks noise like "sidsleeping" → "sid sleeping" (since "sid" isn't
-        # a common English word) while still allowing "lotof" → "lot of"
-        # if we wanted (we don't — "lot" is 3 chars and known, "of" is 2).
-        # Net: both pieces must be 3+ chars AND known.
-        all_valid = all(len(p) >= 3 and _is_known_word(p) for p in pieces)
+        # Every piece must be a known word. Short function words (a, to, up,
+        # so, in, …) are validated via _SHORT_VALID_PIECES since wordninja's
+        # frequency list doesn't cover them. Longer pieces need ≥ 3 chars AND
+        # a dictionary hit to prevent noise splits.
+        all_valid = all(_is_valid_piece(p) for p in pieces)
         if not all_valid:
             return raw
         return " ".join(pieces)
@@ -265,6 +306,43 @@ def _capitalize_first(text):
     return text
 
 
+# Brand/product name corrections — Cohere Transcribe mishears these even with
+# decoder prompt biasing because the homophones ("cloud" vs "Claude") have
+# strong acoustic priors. Deterministic regex post-pass overrides the model.
+# Order matters: domain forms must be collapsed before any standalone
+# "Cartha" rule would re-touch the surrounding text.
+# Domain separator: punctuation, whitespace, or the literal word "dot"
+# (Cohere often spells the period out loud as "Dot" in URL dictation).
+_DOM_SEP = r"(?:[\s,.]+(?:dot[\s,.]+)?)+"
+_CARTHA = r"(?:c|k)artha"
+
+_BRAND_REPLACEMENTS = [
+    # Homophones — case-normalize "cloud code" / "claude code" → "Claude Code"
+    (re.compile(r"\b(?:cloud|claude)\s+code\b", re.IGNORECASE), "Claude Code"),
+    # Cartha domain forms — tolerates Cohere's hard-C misspelling ("Kartha"),
+    # the spoken "dot" word, dropped trailing "e" ("Mobil"), and incorrect
+    # plural "websites".
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
+    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
+    # Camel-case service names
+    (re.compile(rf"\b{_CARTHA}[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
+    # Standalone brand: Cohere often chooses "Kartha" for the company/app name.
+    # Keep this after the domain/service forms so longer canonical names win.
+    (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
+    # User name: Cohere tends to choose the more common spelling.
+    (re.compile(r"\bzach\b", re.IGNORECASE), "Zack"),
+    # Common Anthropic/AI brand mishearings
+    (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
+]
+
+
+def _apply_brand_replacements(text):
+    for pattern, replacement in _BRAND_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _strip_repetition_loop(text, min_phrase_words=3, max_phrase_words=30, min_repeats=3):
     """Detect and truncate autoregressive loop degeneration in ASR output.
 
@@ -335,6 +413,7 @@ def format_transcription(text):
     # Spacing repairs run BEFORE number conversion, because number spans are
     # detected by splitting on whitespace — "3thousand" needs to become
     # "3 thousand" first.
+    text = _collapse_duplicate_punctuation(text)  # "Okay,." → "Okay.", "top.." → "top."
     text = _fix_punctuation_spacing(text)      # "shift.should" → "shift. should"
     text = _split_merged_words(text)           # "carcause" → "car cause"
 
@@ -342,6 +421,7 @@ def format_transcription(text):
     text = _convert_number_spans(text)        # "twenty five" → "25"
     text = _normalize_percentages(text)
     text = _normalize_dollars(text)
+    text = _apply_brand_replacements(text)    # "cloud code" → "Claude Code", etc.
     text = _capitalize_first(text)
 
     return text

@@ -6,3 +6,7 @@ models/
 history.json
 screen_glossary_memory.json
 settings.json
+.keep_warm_silent.wav
+.crispasr/
+last_recording.wav
+failed_recordings/

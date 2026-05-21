@@ -35,6 +35,7 @@ BAR_WIDTH = 2.0
 BAR_GAP = 2.0
 CURSOR_OFFSET_X = 22.0
 CURSOR_OFFSET_Y = -HUD_HEIGHT - 8.0  # below the cursor
+SCREEN_EDGE_PADDING = 4.0
 # Visual smoothing — each new level is blended with the existing rolling peak
 # so bars rise fast but decay smoothly instead of flickering frame-to-frame.
 LEVEL_ATTACK = 0.85   # how quickly a rising level is accepted (higher = snappier)
@@ -83,6 +84,13 @@ class WaveformView(NSView):
         with self._lock:
             if self._levels:
                 self._levels[-1] = max(0.0, self._levels[-1] * (1.0 - LEVEL_RELEASE * 0.5))
+
+    def resetLevels(self):  # noqa: N802
+        """Clear the waveform so a newly shown HUD starts visually empty."""
+        with self._lock:
+            self._levels = [0.0] * BAR_COUNT
+            self._pulse_phase = 0.0
+            self._last_push_time = 0.0
 
     def setState_(self, state):  # noqa: N802
         with self._lock:
@@ -210,8 +218,10 @@ class HUDController(NSObject):
     def show(self):
         self._ensure_window()
         if self._view is not None:
+            self._view.resetLevels()
             self._view.setState_("recording")
             self._view.setLabel_("")
+            self._view.setNeedsDisplay_(True)
         self._visible = True
         self._positionNearCursor()
         self._window.orderFrontRegardless()
@@ -264,15 +274,8 @@ class HUDController(NSObject):
         if self._window is None:
             return
         loc = NSEvent.mouseLocation()
-        x = loc.x + CURSOR_OFFSET_X
-        y = loc.y + CURSOR_OFFSET_Y
-        # Keep inside the main screen bounds. AppKit uses lower-left origin.
         frame = self._window.frame()
-        screen = self._window.screen() or _main_screen()
-        if screen is not None:
-            vis = screen.visibleFrame()
-            x = max(vis.origin.x + 4, min(x, vis.origin.x + vis.size.width - frame.size.width - 4))
-            y = max(vis.origin.y + 4, min(y, vis.origin.y + vis.size.height - frame.size.height - 4))
+        x, y = _window_origin_near_cursor(loc, frame.size)
         self._window.setFrameOrigin_((x, y))
 
     def _followTick_(self, _timer):  # noqa: N802
@@ -288,9 +291,126 @@ class HUDController(NSObject):
             self._view.setNeedsDisplay_(True)
 
 
-def _main_screen():
+def _window_origin_near_cursor(
+    cursor_point,
+    window_size,
+    screens=None,
+    offset_x=CURSOR_OFFSET_X,
+    offset_y=CURSOR_OFFSET_Y,
+    edge_padding=SCREEN_EDGE_PADDING,
+):
+    """Return a HUD window origin near the cursor in global display coordinates.
+
+    The important detail is that the clamping screen is chosen from the cursor
+    location, not from the HUD window's current screen. Otherwise the HUD gets
+    pinned to the old display edge when the mouse crosses to a monitor above,
+    below, left, or right of the current one.
+    """
+    x = _point_x(cursor_point) + offset_x
+    y = _point_y(cursor_point) + offset_y
+
+    screen = _screen_containing_point(cursor_point, screens=screens)
+    if screen is None:
+        return x, y
+
+    visible_frame = _screen_visible_frame(screen)
+    return _clamp_origin_to_rect(x, y, window_size, visible_frame, edge_padding)
+
+
+def _screen_containing_point(point, screens=None):
+    if screens is None:
+        screens = _all_screens()
+    screens = list(screens or [])
+    if not screens:
+        return None
+
+    for screen in screens:
+        if _rect_contains_point(_screen_frame(screen), point):
+            return screen
+
+    # Very rare, but possible around coordinate seams. Pick the nearest display
+    # instead of falling back to the old/current window screen.
+    px = _point_x(point)
+    py = _point_y(point)
+    return min(
+        screens,
+        key=lambda screen: _distance_to_rect(px, py, _screen_frame(screen)),
+    )
+
+
+def _clamp_origin_to_rect(x, y, window_size, rect, edge_padding=SCREEN_EDGE_PADDING):
+    left = rect.origin.x + edge_padding
+    right = rect.origin.x + rect.size.width - _size_width(window_size) - edge_padding
+    bottom = rect.origin.y + edge_padding
+    top = rect.origin.y + rect.size.height - _size_height(window_size) - edge_padding
+
+    if right < left:
+        x = left
+    else:
+        x = max(left, min(x, right))
+
+    if top < bottom:
+        y = bottom
+    else:
+        y = max(bottom, min(y, top))
+
+    return x, y
+
+
+def _rect_contains_point(rect, point):
+    px = _point_x(point)
+    py = _point_y(point)
+    return (
+        rect.origin.x <= px <= rect.origin.x + rect.size.width
+        and rect.origin.y <= py <= rect.origin.y + rect.size.height
+    )
+
+
+def _distance_to_rect(px, py, rect):
+    dx = max(rect.origin.x - px, 0, px - (rect.origin.x + rect.size.width))
+    dy = max(rect.origin.y - py, 0, py - (rect.origin.y + rect.size.height))
+    return dx * dx + dy * dy
+
+
+def _screen_frame(screen):
+    frame_attr = getattr(screen, "frame")
+    return frame_attr() if callable(frame_attr) else frame_attr
+
+
+def _screen_visible_frame(screen):
+    visible_attr = getattr(screen, "visibleFrame", None)
+    if visible_attr is None:
+        return _screen_frame(screen)
+    return visible_attr() if callable(visible_attr) else visible_attr
+
+
+def _point_x(point):
+    if hasattr(point, "x"):
+        return point.x
+    return point[0]
+
+
+def _point_y(point):
+    if hasattr(point, "y"):
+        return point.y
+    return point[1]
+
+
+def _size_width(size):
+    if hasattr(size, "width"):
+        return size.width
+    return size[0]
+
+
+def _size_height(size):
+    if hasattr(size, "height"):
+        return size.height
+    return size[1]
+
+
+def _all_screens():
     from AppKit import NSScreen
-    return NSScreen.mainScreen()
+    return NSScreen.screens()
 
 
 _controller = None

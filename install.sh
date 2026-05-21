@@ -1,6 +1,6 @@
 #!/bin/bash
 # Voice Transcribe — Install Wizard
-# Qwen3-ASR 0.6B default. Supports Python 3.13 and 3.14 on Apple Silicon Macs.
+# Supports Python 3.13 and 3.14 on Apple Silicon Macs.
 
 set -e
 
@@ -82,9 +82,10 @@ step "Installing dependencies"
 "$PIP" install --quiet -r "$REPO_DIR/requirements.txt"
 ok "Base dependencies installed"
 
-"$PIP" install --quiet huggingface-hub
-ok "Qwen/MLX dependencies installed"
+"$PIP" install --quiet transformers torch librosa accelerate
+ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
 
+# ── 5. Qwen fast-path assets ────────────────────────────────────────────────
 step "Building local 4-bit Qwen fast model"
 if [[ -f "$REPO_DIR/models/qwen3-asr-0.6b-4bit/model.safetensors" ]]; then
   ok "Local 4-bit Qwen model already exists"
@@ -93,12 +94,42 @@ else
   ok "Built local 4-bit Qwen model"
 fi
 
-step "Installing macOS app wrapper"
-"$REPO_DIR/scripts/install_app_bundle.sh"
-ok "Installed Qwen Dictate.app"
+step "Installing Qwen Dictate app wrapper"
+PYTHON_APP_PATH="${PYTHON_APP%/Contents/MacOS/Python}" "$REPO_DIR/scripts/install_app_bundle.sh"
 APP_PYTHON="/Applications/Qwen Dictate.app/Contents/MacOS/Python"
+ok "Installed Qwen Dictate.app"
 
-# ── 5. Disable Right Option key (system-wide HID remap) ─────────────────────
+# ── 6. CrispASR runtime for Granite Speech ─────────────────────────────────
+step "Installing CrispASR runtime for Granite Speech"
+CRISP_DIR="$REPO_DIR/.crispasr"
+CRISP_BIN="$CRISP_DIR/build/bin/crispasr"
+if [[ -x "$CRISP_BIN" ]]; then
+  ok "CrispASR already built at $CRISP_BIN"
+else
+  if ! command -v cmake >/dev/null 2>&1; then
+    warn "CMake not found; installing with Homebrew..."
+    brew install cmake
+  fi
+
+  if [[ ! -d "$CRISP_DIR/.git" ]]; then
+    git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git "$CRISP_DIR" || {
+      warn "Could not clone CrispASR. Granite Speech will not work until CrispASR is installed."
+    }
+  else
+    git -C "$CRISP_DIR" pull --ff-only || warn "Could not update existing CrispASR checkout; using local copy."
+  fi
+
+  if [[ -d "$CRISP_DIR/.git" ]]; then
+    if cmake -S "$CRISP_DIR" -B "$CRISP_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+      && cmake --build "$CRISP_DIR/build" -j"$(sysctl -n hw.ncpu)" --target crispasr-cli; then
+      ok "CrispASR built at $CRISP_BIN"
+    else
+      warn "CrispASR build failed. Switch the menu default back to Cohere until it is fixed."
+    fi
+  fi
+fi
+
+# ── 7. Disable Right Option key (system-wide HID remap) ─────────────────────
 step "Disabling Right Option key (HID-level remap)"
 # Right Option used to be a second hotkey, but it kept leaking stray special
 # characters (®, ¥, etc.) into focused fields when held. Disabling it system-wide
@@ -109,33 +140,50 @@ launchctl unload "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 launchctl load -w "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 ok "Right Option disabled (LaunchAgent loaded)"
 
-# ── 6. Model note ───────────────────────────────────────────────────────────
-step "Model"
-echo "Default ASR model: Qwen/Qwen3-ASR-0.6B"
-echo "Fast path: local 4-bit MLX checkpoint at models/qwen3-asr-0.6b-4bit"
-echo "No HuggingFace token is required for the default Qwen model."
-ok "Qwen default configured"
+# ── 8. HuggingFace login (Cohere model is gated) ────────────────────────────
+step "HuggingFace authentication (required for Cohere Transcribe model)"
+echo "The Cohere Transcribe model is gated."
+echo "You need a HuggingFace account with access granted at:"
+echo "  https://huggingface.co/CohereLabs/cohere-transcribe-03-2026"
+echo ""
 
-# ── 7. Update run.sh with correct paths ─────────────────────────────────────
+# Check if already logged in
+if "$VENV_PYTHON" -c "from huggingface_hub import HfApi; HfApi().whoami()" 2>/dev/null; then
+  ok "Already logged in to HuggingFace"
+else
+  read -rp "  Paste your HuggingFace token (hf_...): " HF_TOKEN
+  if [[ -z "$HF_TOKEN" ]]; then
+    warn "No token provided — skipping. Cohere model won't work until you log in."
+    warn "Run: $VENV_PYTHON -c \"from huggingface_hub import login; login()\""
+  else
+    "$VENV_PYTHON" -c "from huggingface_hub import login; login(token='$HF_TOKEN')"
+    ok "Logged in to HuggingFace"
+  fi
+fi
+
+# ── 9. Update run.sh with correct paths ─────────────────────────────────────
 step "Configuring run.sh"
 cat > "$REPO_DIR/run.sh" << EOF
 #!/bin/bash
-# Launcher — uses Python.app (which has Accessibility + Input Monitoring permission)
-PYTHON_APP="${APP_PYTHON}"
+# Launcher — uses Qwen Dictate.app (which has Accessibility + Input Monitoring permission).
+# Do not pkill an existing instance here: transcribe.py has a lock, and killing
+# the warm resident worker is exactly what makes the first Cohere dictation slow.
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR}"
+PYTHON_BIN="\${VOICE_TRANSCRIBE_PYTHON:-${APP_PYTHON}}"
 VENV_SITE="${VENV_SITE}"
-SCRIPT="${REPO_DIR}/transcribe.py"
+SCRIPT="\${REPO_DIR}/transcribe.py"
 
-# Kill any existing voice-transcribe processes from this checkout
-pkill -f "\${SCRIPT}" 2>/dev/null
-sleep 0.5
-
-export PYTHONPATH="\${VENV_SITE}:${REPO_DIR}:\${PYTHONPATH}"
-exec "\$PYTHON_APP" "\$SCRIPT"
+cd "\${REPO_DIR}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="\${VENV_SITE}:\${REPO_DIR}:\${PYTHONPATH:-}"
+exec "\${PYTHON_BIN}" "\${SCRIPT}"
 EOF
 chmod +x "$REPO_DIR/run.sh"
 ok "run.sh configured for this machine"
 
-# ── 8. macOS permissions reminder ───────────────────────────────────────────
+# ── 10. macOS permissions reminder ──────────────────────────────────────────
 step "macOS permissions required (one-time)"
 echo ""
 echo -e "${BOLD}You must grant these permissions manually:${NC}"
@@ -152,7 +200,7 @@ echo "     → Click + and add the same Qwen Dictate.app"
 echo ""
 read -rp "Press Enter once you've granted those permissions..."
 
-# ── 9. Done ─────────────────────────────────────────────────────────────────
+# ── 11. Done ────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}✓ Installation complete!${NC}"
 echo ""

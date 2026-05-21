@@ -5,7 +5,7 @@ set -euo pipefail
 
 APP_NAME="Qwen Dictate"
 BUNDLE_ID="com.zackseyun.qwen-dictate"
-PYTHON_APP="/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app"
+PYTHON_APP="${PYTHON_APP_PATH:-/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app}"
 TARGET_APP="/Applications/${APP_NAME}.app"
 ICON_SOURCE="/System/Library/PrivateFrameworks/SpeechObjects.framework/Versions/A/SpeechDataInstallerd.app/Contents/Resources/Dictation.icns"
 ICON_NAME="VoiceTranscribe.icns"

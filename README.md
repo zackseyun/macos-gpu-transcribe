@@ -16,12 +16,12 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max with Cohere 2B.
+Everything runs on the GPU. The current default is Cohere Transcribe 2B because it is the steadier day-to-day Fn dictation path right now. Granite Speech 4.1 NAR remains available from the menu bar for side-by-side comparisons; when selected, it resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
 - **Floating HUD** — borderless, click-through, follows the cursor. Live waveform while recording; text label while transcribing or loading. Appears only during active use.
-- **Menu bar icon** — classic rumps-style status indicator (`🎙` idle / `🔴 2s` recording / `⏳` processing). Clicking it gives you a history list (last 20, click to copy) and toggles for sound effects / screen context.
+- **Menu bar icon** — classic rumps-style status indicator (`🎙` idle / `🔴 2s` recording / `⏳` processing). Clicking it gives you a history list (last 20, click to copy), toggles for sound effects / screen context, and a default-model selector.
 - **Main window** — regular Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. Opens automatically at launch; reopens when you click the Dock icon.
 - **Keep-warm** — wake-from-sleep hook + App Nap opt-out + 15-min background ping means the GPU kernels stay hot, so the first press after opening your laptop is instant instead of a 7-second cold start.
 
@@ -29,15 +29,15 @@ Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max w
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | PyTorch (MPS) | ~3–4× real-time |
+| **Hold Fn** | Default selected in menu: [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) by default, or [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 2B | Cohere via PyTorch (MPS); Granite via CrispASR/GGUF (Metal) | Cohere ~3–4× real-time; Granite varies by warm/server state |
 
-Cohere Transcribe handles homophones, technical terms, and sentence boundaries reliably at this size — the right tradeoff for dictation where the output should rarely need manual corrections.
+Cohere Transcribe 2B is the default for Fn dictation again. Granite stays one click away in the menu for experiments and comparisons. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
 ### Throughput explained
 
-Throughput = audio-duration ÷ wall-clock-transcribe-time. At 4× real-time, a 30-second clip transcribes in ~7.5s. The silence-RMS gate drops audio below the mic noise floor before ASR runs, which prevents the Whisper-family "Thank you." hallucination on near-silent clips.
+Throughput = audio-duration ÷ wall-clock-transcribe-time. At 4× real-time, a 30-second clip transcribes in ~7.5s. The silence gate checks both peak 200ms RMS and sustained active audio, so key clicks / mic pops do not send empty clips into ASR and the app can immediately return to idle.
 
 ### Post-processing
 
@@ -57,7 +57,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 ```
 ┌─────────────────────┐      multiprocessing.Pipe       ┌──────────────────┐
-│   Key Monitor       │ ─── "down:cohere" / "up" ─────▶ │   Main App       │
+│   Key Monitor       │ ─── "down:default" / "up" ────▶ │   Main App       │
 │   (subprocess)      │                                  │   (rumps menu    │
 │                     │                                  │    bar app)      │
 │  Quartz CGEvent tap │                                  │                  │
@@ -74,7 +74,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
                                                          │  Worker          │
                                                          │  (subprocess)    │
                                                          │                  │
-                                                         │  Cohere 2B (MPS) │
+                                                         │  Granite/Cohere  │
                                                          │                  │
                                                          │  Model stays     │
                                                          │  resident in GPU │
@@ -86,18 +86,18 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
 2. **Transcription Worker** — Holds the ML models in GPU memory permanently. Isolates model-loading crashes, compile warm-up, and Metal buffer leaks from the UI process. Auto-restarts after 50 transcriptions or 4 GB active memory to cap leak accumulation.
-3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens once at startup and is never stopped — CoreAudio's `HALB_Mutex` deadlocks if you call `Pa_StopStream` while the callback is active. Recording is controlled by a boolean flag checked inside the callback.
+3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. A flat mic during an active Fn hold can still open a replacement stream, but idle callback gaps are ignored by default so the app does not relaunch itself and make Cohere cold again.
 
 **Hold-to-talk, not toggle.** The key monitor uses a low-level Quartz event tap for press/release fidelity — not a global hotkey. macOS disables event taps after sleep/wake; the monitor auto-recovers, and a heartbeat watchdog restarts it if it dies completely.
 
-**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on a 15-minute periodic ping. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during idle stretches.
+**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on an adaptive background ping. On AC / healthy thermal state it pings more often; on low battery, Low Power Mode, or serious thermal pressure it backs off and logs that the slow path is energy-related. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during active stretches.
 
 ## Tech stack
 
 | Component | Technology |
 |-----------|-----------|
 | Language | Python 3.13+ (Homebrew) |
-| ASR | Cohere Transcribe 2B via PyTorch (MPS) |
+| ASR | Granite Speech 4.1 NAR via CrispASR/GGUF; Cohere Transcribe 2B via PyTorch (MPS) |
 | Menu bar | `rumps` |
 | HUD + main window | AppKit via PyObjC (NSWindow, NSBezierPath, NSTimer) |
 | Audio capture | `sounddevice` (16 kHz mono float32 PCM) |
@@ -109,7 +109,8 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 - **macOS** on Apple Silicon (M1/M2/M3/M4)
 - **Python 3.13 or 3.14** (Homebrew)
-- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
+- **CMake + Xcode command line tools** for the Granite/CrispASR runtime
+- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) for the default Cohere model
 
 ## Setup
 
@@ -126,9 +127,10 @@ The installer will:
 1. Detect or install Python 3.13/3.14 via Homebrew.
 2. Create a `.venv` with all dependencies.
 3. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
-4. Prompt for your HuggingFace token (Cohere model is gated).
-5. Auto-configure `run.sh` for your machine.
-6. Walk you through the required macOS permissions.
+4. Build CrispASR locally for the Granite Speech runtime.
+5. Prompt for your HuggingFace token (Cohere model is gated).
+6. Auto-configure `run.sh` for your machine.
+7. Walk you through the required macOS permissions.
 
 ### Manual
 
@@ -141,15 +143,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 pip install transformers torch librosa accelerate
 
-# 3. Disable Right Option key system-wide (deploys LaunchAgent)
+# 3. Build CrispASR for Granite Speech
+git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git .crispasr
+cmake -S .crispasr -B .crispasr/build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
+cmake --build .crispasr/build -j"$(sysctl -n hw.ncpu)" --target crispasr-cli
+
+# 4. Disable Right Option key system-wide (deploys LaunchAgent)
 mkdir -p ~/Library/LaunchAgents
 cp com.local.DisableRightOption.plist ~/Library/LaunchAgents/
 launchctl load -w ~/Library/LaunchAgents/com.local.DisableRightOption.plist
 
-# 4. Authenticate HuggingFace
+# 5. Authenticate HuggingFace
 python -c "from huggingface_hub import login; login()"
 
-# 5. Update run.sh paths for your machine (see run.sh comments)
+# 6. Update run.sh paths for your machine (see run.sh comments)
 ```
 
 ### macOS permissions (one-time)
@@ -175,7 +182,32 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.008` | Silence gate threshold (raise if you get false transcriptions of ambient noise) |
-| `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `900` | How often to ping the worker to keep the model warm |
+| `VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS` | `0.012` | Per-frame RMS level counted as active audio for smoother no-volume detection |
+| `VOICE_TRANSCRIBE_SILENCE_MIN_ACTIVE_SECONDS` | `0.28` | Minimum sustained active audio before a quiet recording is treated as a real clip |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS` | `0.010` | Overall RMS below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_MAX_RMS` | `0.040` | Max-window RMS below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO` | `0.16` | Sparse active-audio ratio below this keeps low-content Granite output from falling back to Cohere |
+| `VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS` | `2.5` | Stale-callback threshold used only when idle stale refresh is explicitly enabled |
+| `VOICE_TRANSCRIBE_AUDIO_REFRESH_ON_IDLE_STALE_CALLBACK` | `false` | Refresh idle stale mic callbacks. Keep off for lowest latency; active-recording flat-audio recovery still runs |
+| `VOICE_TRANSCRIBE_AUDIO_REFRESH_COOLDOWN_SECONDS` | `4` | Minimum gap between automatic mic stream refreshes |
+| `VOICE_TRANSCRIBE_AUDIO_RECORDING_FLAT_REFRESH_SECONDS` | `1.6` | While Fn is held, refresh the mic mid-recording if the stream stays flat this long |
+| `VOICE_TRANSCRIBE_AUDIO_RELAUNCH_ON_REFRESH_CAP` | `true` | Relaunch the app when the retired-stream cap is hit, giving CoreAudio a clean reset |
+| `VOICE_TRANSCRIBE_AUDIO_DEVICE` | unset | Optional input override by numeric CoreAudio index or case-insensitive device-name fragment |
+| `VOICE_TRANSCRIBE_AUDIO_DEAD_INPUT_MIN_SECONDS` | `0.90` | Minimum held recording length before flat audio is considered a possible wedged mic |
+| `VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME` | `true` | Best-effort macOS input-volume bump to 100 via `osascript`; set to `0`/`false`/`off`/`no` to disable |
+| `VOICE_TRANSCRIBE_FORCE_INPUT_VOLUME_BLOCKING` | `false` | Block Fn-down recording on the input-volume check. Default is off so recording starts immediately |
+| `VOICE_TRANSCRIBE_INPUT_VOLUME_MIN_INTERVAL_SECONDS` | `300` | Minimum gap between input-volume checks after startup |
+| `VOICE_TRANSCRIBE_INPUT_VOLUME_TIMEOUT_SECONDS` | `1.5` | Max time the background input-volume safety check may spend in `osascript` |
+| `VOICE_TRANSCRIBE_TIMEOUT_SECONDS` | `900` | Max wait for a transcription; long enough for first Granite model download |
+| `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
+| `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
+| `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
+| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `true` | Load + prewarm Cohere as soon as the worker starts, so a post-relaunch first dictation does not pay the 10–15s model load |
+| `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
+| `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
+| `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
+| `VOICE_TRANSCRIBE_GRANITE_USE_SERVER` | `1` | Keep Granite loaded in a persistent local CrispASR server after first use. Set to `0` to force the older one-shot CLI path |
+| `VOICE_TRANSCRIBE_GRANITE_SERVER_PORT` | `8765` | Localhost port for the lazy Granite server |
 | `VOICE_TRANSCRIBE_SCREEN_CONTEXT` | unset | Start with screen context enabled |
 | `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
 
@@ -193,6 +225,7 @@ macos-gpu-transcribe/
 ├── install.sh             # Install wizard
 ├── run.sh                 # Launcher
 ├── requirements.txt       # pip dependencies
+├── .crispasr/             # Local CrispASR checkout/build (ignored)
 ├── com.local.DisableRightOption.plist  # User LaunchAgent — disables Right Option via hidutil
 ├── settings.json          # Per-user toggles (auto-managed)
 ├── history.json           # Transcription log (last 100)
@@ -204,9 +237,11 @@ macos-gpu-transcribe/
 | Problem | Fix |
 |---------|-----|
 | Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
-| No audio recording | Grant Microphone permission when prompted |
-| "Loading model…" takes a while on first run | Downloading weights — ~2 GB for Cohere, ~1.2 GB for Qwen3. One-time |
-| First press after opening laptop is slow | Should be rare with the wake-hook; if it persists, check for "System woke from sleep → warming ASR model" in the log |
+| No audio recording | Grant Microphone permission when prompted. If a real Fn hold stays flat, the recording watchdog logs `Mic input is flat while recording...` and opens a replacement stream. Idle callback gaps are intentionally ignored by default to avoid cold-model relaunch loops |
+| "Loading model…" takes a while on first Granite run | First use may download/load the Granite GGUF and start the local CrispASR server. Later runs should reuse the resident server; if they still look cold, check `/tmp/voice-transcribe.log` for worker restarts or server fallback |
+| Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
+| Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
+| First press after opening laptop is slow | Check `/tmp/voice-transcribe.log` for `SLOW (...)`: it now includes thermal, battery, and Low Power Mode context. If energy state is healthy, the likely cause is cold GPU/model state; the adaptive warm ping should reduce that |
 | Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
 | Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |
 | Broken pipe error on quit | Expected — subprocesses shutting down |

@@ -1,6 +1,7 @@
 """Transcription worker subprocess — loads model once, transcribes on demand.
 
 Supports three model modes:
+  - "granite": Granite Speech 4.1 NAR via CrispASR/GGUF (Metal if available)
   - "fast": Qwen3-ASR 0.6B via MLX (Metal)
   - "accurate": Qwen3-ASR 1.7B via MLX (Metal)
   - "cohere": Cohere Transcribe 2B via PyTorch (MPS)
@@ -12,12 +13,19 @@ Cold-start mitigation:
   silent keep-warm inference every KEEP_WARM_INTERVAL seconds from a background
   thread. The keep-warm holds a lock so it never races with real transcriptions.
 """
+import json
 import os
 import signal
+import shutil
+import socket
+import subprocess
 import threading
 import time
+import uuid
 import wave
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import numpy as np
 
@@ -48,6 +56,28 @@ QWEN3_MODEL_IDS = {
 }
 
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
+GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
+GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+# CrispASR server mode keeps Granite resident instead of reloading the 3GB GGUF
+# for every dictation. Leave an env opt-out because the one-shot CLI path is a
+# useful fallback while CrispASR's server support continues to evolve.
+GRANITE_USE_SERVER = _env_bool("VOICE_TRANSCRIBE_GRANITE_USE_SERVER", True)
+GRANITE_SERVER_HOST = os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_HOST", "127.0.0.1")
+GRANITE_SERVER_PORT = int(os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_PORT", "8765"))
+GRANITE_SERVER_STARTUP_TIMEOUT = float(
+    os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_STARTUP_TIMEOUT_SECONDS", "900")
+)
+GRANITE_SERVER_LOG = os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_LOG", "/tmp/voice-transcribe-crispasr.log")
 MAX_SCREEN_CONTEXT_CHARS = 320
 
 # Keep-warm cadence — must be SHORTER than MPS eviction window.
@@ -65,18 +95,8 @@ KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300
 # Skip on-demand warm if model was used within this many seconds (already hot).
 ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
 QWEN3_LANGUAGE = (os.getenv("VOICE_TRANSCRIBE_QWEN_LANGUAGE", "English").strip() or None)
-QWEN3_PRELOAD = os.getenv("VOICE_TRANSCRIBE_QWEN_PRELOAD", "1").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
-QWEN3_KEEP_WARM = os.getenv("VOICE_TRANSCRIBE_QWEN_KEEP_WARM", "1").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
+QWEN3_PRELOAD = _env_bool("VOICE_TRANSCRIBE_QWEN_PRELOAD", True)
+QWEN3_KEEP_WARM = _env_bool("VOICE_TRANSCRIBE_QWEN_KEEP_WARM", True)
 
 
 def _optional_int_env(name):
@@ -91,6 +111,11 @@ def _optional_int_env(name):
 
 
 QWEN3_MAX_NEW_TOKENS = _optional_int_env("VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS")
+
+# Load Cohere proactively instead of waiting for the first release after a fresh
+# app/worker start. This hides the 10-15s model load behind app startup or Fn
+# hold time and prevents the first short dictation from feeling broken.
+PRELOAD_COHERE_ON_WORKER_START = _env_bool("VOICE_TRANSCRIBE_PRELOAD_COHERE", False)
 
 
 def _sanitize_screen_context(screen_context):
@@ -179,6 +204,314 @@ def _prewarm_cohere(processor, model, warm_wav_path):
     print(f"Transcription worker: Cohere pre-warm done ({time.time() - t0:.1f}s)", flush=True)
 
 
+def _find_crispasr_bin():
+    configured = os.getenv("VOICE_TRANSCRIBE_CRISPASR_BIN")
+    candidates = [
+        configured,
+        str(Path(__file__).resolve().parent / ".crispasr" / "build" / "bin" / "crispasr"),
+        shutil.which("crispasr"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _extract_crispasr_text(stdout):
+    """Parse CrispASR JSON output; fall back to cleaned stdout if needed."""
+    raw = (stdout or "").strip()
+    if not raw:
+        return ""
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            payload = json.loads(raw[start : end + 1])
+            segments = payload.get("transcription")
+            if isinstance(segments, list):
+                return " ".join(
+                    str(segment.get("text", "")).strip()
+                    for segment in segments
+                    if isinstance(segment, dict) and segment.get("text")
+                ).strip()
+            for key in ("text", "transcript", "result"):
+                if payload.get(key):
+                    return str(payload[key]).strip()
+        except Exception:
+            pass
+
+    lines = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith(("[", "{", "}"))
+    ]
+    return " ".join(lines).strip()
+
+
+def _has_meaningful_text(text):
+    return any(ch.isalnum() for ch in text or "")
+
+
+def _transcribe_granite_crispasr(wav_path, screen_context=""):
+    """One-shot Granite transcription through CrispASR's Metal-capable GGUF runtime."""
+    crispasr_bin = _find_crispasr_bin()
+    if crispasr_bin is None:
+        raise RuntimeError(
+            "Granite Speech is selected, but CrispASR is not installed. "
+            "Run ./install.sh or build CrispASR at .crispasr/build/bin/crispasr. "
+            "The Hugging Face PyTorch path for Granite NAR requires CUDA + flash_attention_2, "
+            "so the Mac app uses CrispASR/GGUF for local Granite inference."
+        )
+
+    if screen_context:
+        print(
+            "Transcription worker: Granite/CrispASR does not accept screen-context prompts yet; ignoring context.",
+            flush=True,
+        )
+
+    cmd = [
+        crispasr_bin,
+        "--backend",
+        GRANITE_CRISPASR_BACKEND,
+        "-m",
+        GRANITE_CRISPASR_MODEL,
+        "-f",
+        wav_path,
+        "-l",
+        GRANITE_CRISPASR_LANGUAGE,
+        "--auto-download",
+        "-np",
+        "-oj",
+    ]
+    gpu_backend = os.getenv("VOICE_TRANSCRIBE_CRISPASR_GPU_BACKEND")
+    if gpu_backend:
+        cmd[1:1] = ["--gpu-backend", gpu_backend]
+
+    env = os.environ.copy()
+    timeout = float(os.getenv("VOICE_TRANSCRIBE_CRISPASR_TIMEOUT_SECONDS", "900"))
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+    )
+    text = _extract_crispasr_text(proc.stdout)
+    if proc.returncode != 0 and text:
+        print(
+            "Transcription worker: CrispASR Granite exited non-zero after producing "
+            f"text ({proc.returncode}); using transcript anyway.",
+            flush=True,
+        )
+        return text
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if len(detail) > 1200:
+            detail = detail[-1200:]
+        raise RuntimeError(f"CrispASR Granite failed ({proc.returncode}): {detail}")
+
+    if not text:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"CrispASR Granite returned no transcript. Output: {detail[:1200]}")
+    return text
+
+
+def _http_get_json(url, timeout=1.0):
+    with urlrequest.urlopen(url, timeout=timeout) as response:
+        body = response.read().decode("utf-8", "replace")
+    return json.loads(body) if body else {}
+
+
+def _post_multipart_file(url, wav_path, fields=None, timeout=900):
+    fields = fields or {}
+    boundary = f"voice-transcribe-{uuid.uuid4().hex}"
+    parts = []
+
+    for name, value in fields.items():
+        parts.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            str(value).encode(),
+            b"\r\n",
+        ])
+
+    filename = os.path.basename(wav_path)
+    with open(wav_path, "rb") as fh:
+        audio_bytes = fh.read()
+    parts.extend([
+        f"--{boundary}\r\n".encode(),
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode(),
+        audio_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+
+    body = b"".join(parts)
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+class GraniteCrispasrServer:
+    """Lazy, persistent Granite runtime.
+
+    Nothing is downloaded or loaded at app startup. The first Granite request
+    starts CrispASR server mode; that process resolves the model, loads it once,
+    and keeps it resident in memory for later dictations.
+    """
+
+    def __init__(self):
+        self.proc = None
+        self.url_base = f"http://{GRANITE_SERVER_HOST}:{GRANITE_SERVER_PORT}"
+        self._start_lock = threading.Lock()
+
+    def _health(self):
+        try:
+            payload = _http_get_json(f"{self.url_base}/health", timeout=1.0)
+            return payload.get("status") == "ok"
+        except Exception:
+            return False
+
+    def _port_occupied(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.3)
+            return sock.connect_ex((GRANITE_SERVER_HOST, GRANITE_SERVER_PORT)) == 0
+
+    def ensure_started(self):
+        with self._start_lock:
+            if self._health():
+                return
+
+            if self.proc is not None and self.proc.poll() is None:
+                # Existing child is still starting/loading.
+                pass
+            else:
+                crispasr_bin = _find_crispasr_bin()
+                if crispasr_bin is None:
+                    raise RuntimeError(
+                        "Granite Speech is selected, but CrispASR is not installed. "
+                        "Run ./install.sh or build CrispASR at .crispasr/build/bin/crispasr."
+                    )
+                if self._port_occupied():
+                    raise RuntimeError(
+                        f"Port {GRANITE_SERVER_PORT} is already in use, but it is not a ready CrispASR server. "
+                        "Set VOICE_TRANSCRIBE_GRANITE_SERVER_PORT to another port and restart the app."
+                    )
+
+                cmd = [
+                    crispasr_bin,
+                    "--server",
+                    "--backend",
+                    GRANITE_CRISPASR_BACKEND,
+                    "-m",
+                    GRANITE_CRISPASR_MODEL,
+                    "-l",
+                    GRANITE_CRISPASR_LANGUAGE,
+                    "--auto-download",
+                    "--host",
+                    GRANITE_SERVER_HOST,
+                    "--port",
+                    str(GRANITE_SERVER_PORT),
+                ]
+                gpu_backend = os.getenv("VOICE_TRANSCRIBE_CRISPASR_GPU_BACKEND")
+                if gpu_backend:
+                    cmd[1:1] = ["--gpu-backend", gpu_backend]
+
+                env = os.environ.copy()
+                log_path = Path(GRANITE_SERVER_LOG)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(log_path, "ab", buffering=0)
+                print(
+                    "Transcription worker: starting lazy Granite server "
+                    f"on {self.url_base} (first use may download/load the model)",
+                    flush=True,
+                )
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+
+            deadline = time.time() + GRANITE_SERVER_STARTUP_TIMEOUT
+            while time.time() < deadline:
+                if self._health():
+                    print("Transcription worker: Granite server ready", flush=True)
+                    return
+                if self.proc is not None and self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"Granite server exited early ({self.proc.returncode}). "
+                        f"See {GRANITE_SERVER_LOG}"
+                    )
+                time.sleep(1.0)
+
+            raise RuntimeError(
+                f"Granite server was not ready after {GRANITE_SERVER_STARTUP_TIMEOUT:.0f}s. "
+                f"See {GRANITE_SERVER_LOG}"
+            )
+
+    def transcribe(self, wav_path, screen_context=""):
+        if screen_context:
+            print(
+                "Transcription worker: Granite/CrispASR server accepts prompt fields, "
+                "but Granite NAR may ignore screen context.",
+                flush=True,
+            )
+        self.ensure_started()
+        try:
+            response = _post_multipart_file(
+                f"{self.url_base}/v1/audio/transcriptions",
+                wav_path,
+                fields={
+                    "response_format": "json",
+                    "language": GRANITE_CRISPASR_LANGUAGE,
+                    "prompt": screen_context or "",
+                },
+                timeout=float(os.getenv("VOICE_TRANSCRIBE_CRISPASR_TIMEOUT_SECONDS", "900")),
+            )
+        except urlerror.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"Granite server transcription failed ({exc.code}): {detail}") from exc
+
+        try:
+            payload = json.loads(response)
+            text = str(payload.get("text", "")).strip()
+        except Exception:
+            text = response.strip()
+        if not text:
+            raise RuntimeError(f"Granite server returned no transcript. Output: {response[:1200]}")
+        if not _has_meaningful_text(text):
+            raise RuntimeError(
+                f"Granite server returned punctuation-only transcript {text!r}; "
+                "falling back to one-shot CLI."
+            )
+        return text
+
+    def stop(self):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
 def run(request_pipe, result_pipe):
     """Receive requests via request_pipe, send results via result_pipe."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -197,6 +530,7 @@ def run(request_pipe, result_pipe):
     qwen3_loaded_models = set()
     cohere_processor = None
     cohere_model = None
+    granite_server = GraniteCrispasrServer() if GRANITE_USE_SERVER else None
 
     # Persistent silent WAV for pre-warm + keep-warm (written once, reused forever)
     warm_wav_path = os.path.join(
@@ -210,6 +544,7 @@ def run(request_pipe, result_pipe):
 
     # Lock serializes keep-warm with real transcriptions so they never race on MPS.
     inference_lock = threading.Lock()
+    cohere_load_lock = threading.Lock()
     last_real_inference_at = [time.time()]  # last real (non-warm) transcription
     last_any_inference_at = [time.time()]   # last any inference (real OR warm)
 
@@ -258,6 +593,42 @@ def run(request_pipe, result_pipe):
             return False
         finally:
             inference_lock.release()
+
+    def _ensure_cohere_loaded(reason="on-demand"):
+        """Load + prewarm Cohere exactly once, safe across warm/real requests."""
+        nonlocal cohere_processor, cohere_model
+
+        if cohere_model is not None:
+            return True
+
+        with cohere_load_lock:
+            if cohere_model is not None:
+                return True
+
+            load_t0 = time.time()
+            print(
+                f"Transcription worker: loading Cohere Transcribe ({reason})...",
+                flush=True,
+            )
+            import torch
+            from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
+            cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
+            cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
+                COHERE_MODEL_ID, torch_dtype=torch.float32,
+            ).to("mps")
+            print(
+                f"Transcription worker: Cohere loaded on {cohere_model.device} "
+                f"({time.time() - load_t0:.1f}s, reason={reason})",
+                flush=True,
+            )
+
+            # Pre-warm so the first real inference does not pay MPS compile.
+            if warm_wav_path is not None:
+                with inference_lock:
+                    _prewarm_cohere(cohere_processor, cohere_model, warm_wav_path)
+                    last_any_inference_at[0] = time.time()
+            return True
 
     def _do_warm(reason):
         """Run a silent dummy inference. Returns True if it actually ran."""
@@ -313,8 +684,16 @@ def run(request_pipe, result_pipe):
                 print(f"Transcription worker: keep-warm loop error: {exc}", flush=True)
 
     threading.Thread(target=_keep_warm_loop, daemon=True).start()
+
     if QWEN3_PRELOAD:
         threading.Thread(target=_warm_qwen3, args=("preload", "fast"), daemon=True).start()
+
+    if PRELOAD_COHERE_ON_WORKER_START:
+        threading.Thread(
+            target=_ensure_cohere_loaded,
+            args=("startup-preload",),
+            daemon=True,
+        ).start()
 
     while True:
         try:
@@ -323,6 +702,8 @@ def run(request_pipe, result_pipe):
             break
 
         if request == "__quit__":
+            if granite_server is not None:
+                granite_server.stop()
             break
 
         # On-demand warm signal: main app sends this when user presses the Fn key
@@ -330,15 +711,31 @@ def run(request_pipe, result_pipe):
         # Run in a thread so the request loop returns to recv() immediately for
         # the upcoming real transcription request.
         if isinstance(request, dict) and request.get("__warm__"):
-            warm_mode = request.get("model_mode", "fast")
-            if warm_mode != "cohere":
+            warm_model_mode = request.get("model_mode", "cohere")
+            if warm_model_mode == "granite" and granite_server is not None:
+                def _warm_granite():
+                    try:
+                        granite_server.ensure_started()
+                    except Exception as exc:
+                        print(f"Transcription worker: Granite warm failed: {exc}", flush=True)
+
+                threading.Thread(target=_warm_granite, daemon=True).start()
+                continue
+            if warm_model_mode != "cohere":
                 now = time.time()
                 if now - last_any_inference_at[0] >= ON_DEMAND_WARM_SKIP_THRESHOLD:
                     threading.Thread(
-                        target=_warm_qwen3, args=("on-demand", warm_mode), daemon=True
+                        target=_warm_qwen3, args=("on-demand", warm_model_mode), daemon=True
                     ).start()
                 continue
-            if cohere_model is None or warm_wav_path is None:
+            if cohere_model is None:
+                threading.Thread(
+                    target=_ensure_cohere_loaded,
+                    args=("fn-warm-preload",),
+                    daemon=True,
+                ).start()
+                continue
+            if warm_wav_path is None:
                 continue
             now = time.time()
             if now - last_any_inference_at[0] < ON_DEMAND_WARM_SKIP_THRESHOLD:
@@ -363,26 +760,30 @@ def run(request_pipe, result_pipe):
         try:
             t0 = time.time()
 
-            if model_mode == "cohere":
-                # Lazy-load Cohere model on first use
-                if cohere_model is None:
-                    load_t0 = time.time()
-                    print("Transcription worker: loading Cohere Transcribe...", flush=True)
-                    import torch
-                    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
-                    cohere_processor = AutoProcessor.from_pretrained(COHERE_MODEL_ID)
-                    cohere_model = CohereAsrForConditionalGeneration.from_pretrained(
-                        COHERE_MODEL_ID, torch_dtype=torch.float32,
-                    ).to("mps")
-                    print(
-                        f"Transcription worker: Cohere loaded on {cohere_model.device} "
-                        f"({time.time() - load_t0:.1f}s)",
-                        flush=True,
+            if model_mode == "granite":
+                if granite_server is not None:
+                    try:
+                        text = granite_server.transcribe(
+                            wav_path,
+                            screen_context=screen_context,
+                        )
+                    except Exception as exc:
+                        print(
+                            "Transcription worker: Granite server path failed; "
+                            f"falling back to one-shot CLI: {exc}",
+                            flush=True,
+                        )
+                        text = _transcribe_granite_crispasr(
+                            wav_path,
+                            screen_context=screen_context,
+                        )
+                else:
+                    text = _transcribe_granite_crispasr(
+                        wav_path,
+                        screen_context=screen_context,
                     )
-                    # Pre-warm so the first real inference isn't 8s+ of MPS compile
-                    if warm_wav_path is not None:
-                        _prewarm_cohere(cohere_processor, cohere_model, warm_wav_path)
-                        last_any_inference_at[0] = time.time()
+            elif model_mode == "cohere":
+                _ensure_cohere_loaded("real-request")
 
                 with inference_lock:
                     text = _transcribe_cohere(

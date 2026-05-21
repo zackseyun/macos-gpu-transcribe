@@ -1,13 +1,17 @@
 #!/bin/bash
-# Launcher — uses Python.app for macOS permissions, with the repo venv on PYTHONPATH.
-PYTHON_APP="/Applications/Qwen Dictate.app/Contents/MacOS/Python"
-REPO_DIR="/Users/zackseyun/Documents/Codex/2026-05-20/do-you-have-acccess-to-github/macos-gpu-transcribe"
-VENV_SITE="${REPO_DIR}/.venv/lib/python3.13/site-packages"
+set -euo pipefail
+
+# Wrapper for launchd/manual restarts. Keep paths relative to this checkout so
+# the app does not accidentally relaunch an old Desktop copy.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${VOICE_TRANSCRIBE_PYTHON:-/Applications/Qwen Dictate.app/Contents/MacOS/Python}"
 SCRIPT="${REPO_DIR}/transcribe.py"
 
-# Kill any existing voice-transcribe processes from this checkout.
-pkill -f "${SCRIPT}" 2>/dev/null
-sleep 0.5
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
 
-export PYTHONPATH="${VENV_SITE}:${REPO_DIR}:${PYTHONPATH}"
-exec "${PYTHON_APP}" "${SCRIPT}"
+cd "${REPO_DIR}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_DIR}/.venv/lib/python3.13/site-packages:${REPO_DIR}:${PYTHONPATH:-}"
+exec "${PYTHON_BIN}" "${SCRIPT}"
