@@ -220,7 +220,10 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH` | unset | Set to `1` to show the settings window at launch, or run `transcribe.py --show-window` |
 | `VOICE_TRANSCRIBE_SHOW_DOCK_ICON` | unset | Set to `1` to launch as a regular Dock/⌘-Tab app, or run `transcribe.py --show-dock` |
 | `VOICE_TRANSCRIBE_IN_MEMORY_AUDIO_MAX_SECONDS` | `90` | Send Cohere/Qwen recordings up to this length directly to the worker, skipping temp WAV write/read overhead |
-| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC` | `true` | Restore the previous clipboard in the background after ⌘V, trimming the completion path by roughly the restore delay |
+| `VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY` | `0.05` | Small safety delay after writing the transcription pasteboard and before sending ⌘V |
+| `VOICE_TRANSCRIBE_PASTEBOARD_SET_TIMEOUT` | `0.20` | Max wait for AppKit to report that the pasteboard contains the new transcription before ⌘V |
+| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY` | `0.35` | How long to keep the transcription on the pasteboard before restoring the user's previous clipboard |
+| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC` | `true` | Restore the previous clipboard in the background after ⌘V; restores are generation-guarded so an old restore cannot clobber a newer paste |
 | `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
 
 ## Files

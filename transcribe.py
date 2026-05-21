@@ -81,8 +81,9 @@ THERMAL_ICON_SUFFIX = {
     3: "🛑",    # Critical — show stop on menu bar icon
 }
 TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
-PASTEBOARD_PRE_PASTE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY", "0.03"))
-PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "0.10"))
+PASTEBOARD_PRE_PASTE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY", "0.05"))
+PASTEBOARD_SET_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_SET_TIMEOUT", "0.20"))
+PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "0.35"))
 PASTEBOARD_RESTORE_ASYNC = os.getenv(
     "VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC", "true"
 ).strip().lower() not in {"0", "false", "off", "no"}
@@ -666,6 +667,8 @@ class VoiceTranscribeApp(rumps.App):
         self._last_heartbeat = time.time()
         self._main_thread_actions = queue.SimpleQueue()
         self._last_release_handled_at = 0.0
+        self._paste_lock = threading.Lock()
+        self._paste_generation = 0
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
         self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
@@ -2171,12 +2174,32 @@ class VoiceTranscribeApp(rumps.App):
 
         pb = NSPasteboard.generalPasteboard()
 
-        # Save current clipboard contents
-        old_contents = pb.stringForType_(NSPasteboardTypeString)
+        with self._paste_lock:
+            self._paste_generation += 1
+            paste_generation = self._paste_generation
 
-        # Set clipboard to transcription and paste
-        pb.clearContents()
-        pb.setString_forType_(text, NSPasteboardTypeString)
+            # Save current clipboard contents. A delayed restore from an older
+            # dictation is generation-guarded below so it cannot overwrite this
+            # newer pasteboard write right before Cmd+V.
+            old_contents = pb.stringForType_(NSPasteboardTypeString)
+
+            # Set clipboard to transcription and wait until AppKit reports the
+            # expected string. Without this, Cmd+V can race the pasteboard server
+            # and the focused app may paste the previous clipboard entry.
+            pb.clearContents()
+            ok = pb.setString_forType_(text, NSPasteboardTypeString)
+            deadline = time.perf_counter() + max(0.0, PASTEBOARD_SET_TIMEOUT)
+            while time.perf_counter() < deadline:
+                if pb.stringForType_(NSPasteboardTypeString) == text:
+                    break
+                time.sleep(0.005)
+            else:
+                current = pb.stringForType_(NSPasteboardTypeString)
+                print(
+                    "Pasteboard did not confirm transcription before paste "
+                    f"(set_ok={ok}, current_len={len(current or '')}, expected_len={len(text)})",
+                    flush=True,
+                )
 
         time.sleep(PASTEBOARD_PRE_PASTE_DELAY)
 
@@ -2193,6 +2216,9 @@ class VoiceTranscribeApp(rumps.App):
             # default this runs after _paste_text returns, shaving ~100ms off
             # the dictation completion path without changing clipboard safety.
             time.sleep(PASTEBOARD_RESTORE_DELAY)
+            with self._paste_lock:
+                if paste_generation != self._paste_generation:
+                    return
             if old_contents is not None:
                 restore_pb = NSPasteboard.generalPasteboard()
                 restore_pb.clearContents()
