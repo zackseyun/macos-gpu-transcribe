@@ -1,13 +1,13 @@
 #!/bin/bash
-# Wrapper for launchd — uses Python.app (which has Accessibility permission)
-# but with venv site-packages available
-PYTHON_APP="/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
-VENV_SITE="/Users/harrymapodile/Desktop/voice-transcribe/.venv/lib/python3.13/site-packages"
-SCRIPT="/Users/harrymapodile/Desktop/voice-transcribe/transcribe.py"
+# Launcher — uses Python.app for macOS permissions, with the repo venv on PYTHONPATH.
+PYTHON_APP="/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+REPO_DIR="/Users/zackseyun/Documents/Codex/2026-05-20/do-you-have-acccess-to-github/macos-gpu-transcribe"
+VENV_SITE="${REPO_DIR}/.venv/lib/python3.13/site-packages"
+SCRIPT="${REPO_DIR}/transcribe.py"
 
-# Kill any existing voice-transcribe processes (prevents orphan buildup)
-pkill -f "voice-transcribe/transcribe.py" 2>/dev/null
+# Kill any existing voice-transcribe processes from this checkout.
+pkill -f "${SCRIPT}" 2>/dev/null
 sleep 0.5
 
-export PYTHONPATH="${VENV_SITE}:/Users/harrymapodile/Desktop/voice-transcribe:${PYTHONPATH}"
-exec "$PYTHON_APP" "$SCRIPT"
+export PYTHONPATH="${VENV_SITE}:${REPO_DIR}:${PYTHONPATH}"
+exec "${PYTHON_APP}" "${SCRIPT}"

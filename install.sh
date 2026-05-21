@@ -1,6 +1,6 @@
 #!/bin/bash
 # Voice Transcribe — Install Wizard
-# Supports Python 3.13 and 3.14 on Apple Silicon Macs.
+# Qwen3-ASR 0.6B default. Supports Python 3.13 and 3.14 on Apple Silicon Macs.
 
 set -e
 
@@ -82,8 +82,16 @@ step "Installing dependencies"
 "$PIP" install --quiet -r "$REPO_DIR/requirements.txt"
 ok "Base dependencies installed"
 
-"$PIP" install --quiet transformers torch librosa accelerate
-ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
+"$PIP" install --quiet huggingface-hub
+ok "Qwen/MLX dependencies installed"
+
+step "Building local 4-bit Qwen fast model"
+if [[ -f "$REPO_DIR/models/qwen3-asr-0.6b-4bit/model.safetensors" ]]; then
+  ok "Local 4-bit Qwen model already exists"
+else
+  "$VENV_PYTHON" "$REPO_DIR/scripts/quantize_qwen3_asr.py"
+  ok "Built local 4-bit Qwen model"
+fi
 
 # ── 5. Disable Right Option key (system-wide HID remap) ─────────────────────
 step "Disabling Right Option key (HID-level remap)"
@@ -96,26 +104,12 @@ launchctl unload "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 launchctl load -w "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 ok "Right Option disabled (LaunchAgent loaded)"
 
-# ── 6. HuggingFace login (Cohere model is gated) ────────────────────────────
-step "HuggingFace authentication (required for Cohere Transcribe model)"
-echo "The Cohere Transcribe model is gated."
-echo "You need a HuggingFace account with access granted at:"
-echo "  https://huggingface.co/CohereLabs/cohere-transcribe-03-2026"
-echo ""
-
-# Check if already logged in
-if "$VENV_PYTHON" -c "from huggingface_hub import HfApi; HfApi().whoami()" 2>/dev/null; then
-  ok "Already logged in to HuggingFace"
-else
-  read -rp "  Paste your HuggingFace token (hf_...): " HF_TOKEN
-  if [[ -z "$HF_TOKEN" ]]; then
-    warn "No token provided — skipping. Cohere model won't work until you log in."
-    warn "Run: $VENV_PYTHON -c \"from huggingface_hub import login; login()\""
-  else
-    "$VENV_PYTHON" -c "from huggingface_hub import login; login(token='$HF_TOKEN')"
-    ok "Logged in to HuggingFace"
-  fi
-fi
+# ── 6. Model note ───────────────────────────────────────────────────────────
+step "Model"
+echo "Default ASR model: Qwen/Qwen3-ASR-0.6B"
+echo "Fast path: local 4-bit MLX checkpoint at models/qwen3-asr-0.6b-4bit"
+echo "No HuggingFace token is required for the default Qwen model."
+ok "Qwen default configured"
 
 # ── 7. Update run.sh with correct paths ─────────────────────────────────────
 step "Configuring run.sh"

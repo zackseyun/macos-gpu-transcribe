@@ -147,11 +147,11 @@ class MainWindowController(NSObject):
         # ── Hotkeys ──
         stack.addArrangedSubview_(_label("Hotkeys", size=13, bold=True))
         stack.addArrangedSubview_(
-            _label("Hold Fn  →  record (Cohere 2B)", size=12, color=NSColor.secondaryLabelColor())
+            _label("Hold Fn  ->  record (Qwen3-ASR 0.6B 4-bit)", size=12, color=NSColor.secondaryLabelColor())
         )
         stack.addArrangedSubview_(
             _label(
-                "Hold Right ⌥  →  record (Qwen 1.7B)",
+                "Fast model: local 4-bit Qwen/Qwen3-ASR-0.6B",
                 size=12,
                 color=NSColor.secondaryLabelColor(),
             )
