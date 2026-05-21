@@ -28,6 +28,7 @@ import queue
 import re
 import shutil
 import shlex
+import sys
 import threading
 import subprocess
 import tempfile

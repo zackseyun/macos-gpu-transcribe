@@ -10,6 +10,8 @@ class AppVisibilityDefaultsTest(unittest.TestCase):
 
         self.assertFalse(transcribe._should_show_main_window_on_launch(argv=argv, environ=env))
         self.assertFalse(transcribe._should_show_dock_icon(argv=argv, environ=env))
+        self.assertFalse(transcribe._should_show_main_window_on_launch())
+        self.assertFalse(transcribe._should_show_dock_icon())
 
     def test_window_can_be_requested_explicitly(self):
         self.assertTrue(
