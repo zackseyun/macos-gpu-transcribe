@@ -1,0 +1,46 @@
+{
+  "audio": "/tmp/qwen-cohere-sample-stable.wav",
+  "audio_seconds": 8.716625,
+  "runs_per_variant": 3,
+  "variants": [
+    {
+      "variant": "cohere-mlx-8bit",
+      "repo_id": "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
+      "model_dir": "/Users/zackseyun/.cache/huggingface/hub/models--mlx-community--cohere-transcribe-03-2026-mlx-8bit/snapshots/a0acb7f93cd32d82c4fbf801b6d8fb39d20c509f/mlx-int8",
+      "runtime": "mlx_speech",
+      "load_seconds": 0.29738395899767056,
+      "runs": [
+        0.476634832972195,
+        0.2875704590114765,
+        0.2851790829736274
+      ],
+      "median_seconds": 0.2875704590114765,
+      "min_seconds": 0.2851790829736274,
+      "max_seconds": 0.476634832972195,
+      "text": "Quen is being transcribed as Quen or Quan, but it should always become Quen. The Cohere model and the Quen MLX model are both running locally on Apple Metal."
+    },
+    {
+      "variant": "cohere-mlx-4bit-swift",
+      "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+      "model_dir": "mlx-audio-swift cache",
+      "runtime": "mlx_audio_swift",
+      "swift_stt_bin": "/Users/zackseyun/voice-transcribe/.swift-runtime/Release/mlx-audio-swift-stt",
+      "runs": [
+        2.780914708011551,
+        0.493964875000529,
+        0.46542108300491236
+      ],
+      "model_total_times": [
+        2.2107900381088257,
+        0.2239919900894165,
+        0.18875396251678467
+      ],
+      "median_seconds": 0.493964875000529,
+      "min_seconds": 0.46542108300491236,
+      "max_seconds": 2.780914708011551,
+      "median_model_total_seconds": 0.2239919900894165,
+      "peak_memory_gb": 1.85933835,
+      "text": "Quen is being transcribed as Quen or Quan, but it should always become Quen. The Cohere model and the Quen MLX model are both running locally on Apple Metal."
+    }
+  ]
+}

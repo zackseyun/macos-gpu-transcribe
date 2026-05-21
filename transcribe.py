@@ -156,11 +156,12 @@ DEFAULT_MODEL_MODE = "fast"
 MODEL_LABELS = {
     "granite": "Granite Speech 4.1 NAR",
     "cohere": "Cohere Transcribe MLX 8-bit",
+    "cohere-swift-4bit": "Cohere Transcribe Swift 4-bit",
     "cohere-pytorch": "Cohere Transcribe 2B PyTorch",
     "fast": "Qwen3-ASR 0.6B 4-bit",
     "accurate": "Qwen3-ASR 1.7B",
 }
-MENU_MODEL_MODES = ("fast", "cohere", "cohere-pytorch", "granite")
+MENU_MODEL_MODES = ("fast", "cohere", "cohere-swift-4bit", "cohere-pytorch", "granite")
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -494,7 +495,7 @@ def _parse_pmset_battery_output(output):
 
 def _should_send_audio_in_memory(model_mode, duration_seconds):
     """Avoid temp WAV write/read loops for ASR paths that accept raw audio."""
-    if model_mode == "granite":
+    if model_mode in {"granite", "cohere-swift-4bit"}:
         return False
     return float(duration_seconds or 0.0) <= IN_MEMORY_AUDIO_MAX_SECONDS
 

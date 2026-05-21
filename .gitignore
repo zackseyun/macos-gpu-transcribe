@@ -9,3 +9,5 @@ last_recording.wav
 failed_recordings/
 dist/
 models/
+.swift-runtime/
+default.profraw

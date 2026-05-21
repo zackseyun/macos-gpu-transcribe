@@ -5,6 +5,7 @@ Supports three model modes:
   - "fast": Qwen3-ASR 0.6B via MLX (Metal)
   - "accurate": Qwen3-ASR 1.7B via MLX (Metal)
   - "cohere": Cohere Transcribe 8-bit via MLX (Metal)
+  - "cohere-swift-4bit": Cohere Transcribe 4-bit via mlx-audio-swift (Metal)
   - "cohere-pytorch": Cohere Transcribe 2B via PyTorch (MPS, legacy fallback)
 
 Cold-start mitigation:
@@ -62,6 +63,11 @@ COHERE_MLX_MODEL_ID = os.getenv(
     "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
 )
 COHERE_MLX_SUBDIR = os.getenv("VOICE_TRANSCRIBE_COHERE_MLX_SUBDIR", "mlx-int8")
+COHERE_SWIFT_4BIT_MODEL_ID = os.getenv(
+    "VOICE_TRANSCRIBE_COHERE_SWIFT_4BIT_MODEL",
+    "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+)
+COHERE_SWIFT_STT_BIN = os.getenv("VOICE_TRANSCRIBE_SWIFT_STT_BIN", "")
 GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
 GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
 GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
@@ -84,6 +90,7 @@ GRANITE_SERVER_STARTUP_TIMEOUT = float(
     os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_STARTUP_TIMEOUT_SECONDS", "900")
 )
 GRANITE_SERVER_LOG = os.getenv("VOICE_TRANSCRIBE_GRANITE_SERVER_LOG", "/tmp/voice-transcribe-crispasr.log")
+TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
 MAX_SCREEN_CONTEXT_CHARS = 320
 
 # Keep-warm cadence — must be SHORTER than MPS eviction window.
@@ -274,6 +281,70 @@ def _prewarm_cohere_mlx(model):
         print(f"Transcription worker: Cohere MLX pre-warm failed: {exc}", flush=True)
         return
     print(f"Transcription worker: Cohere MLX pre-warm done ({time.time() - t0:.1f}s)", flush=True)
+
+
+def _find_swift_stt_bin():
+    candidates = [
+        COHERE_SWIFT_STT_BIN,
+        str(REPO_DIR / ".swift-runtime" / "Release" / "mlx-audio-swift-stt"),
+        shutil.which("mlx-audio-swift-stt"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _transcribe_cohere_swift_4bit(wav_path, screen_context=""):
+    """Transcribe with the newer Swift MLX runtime needed by the 4-bit Cohere checkpoint."""
+    swift_stt_bin = _find_swift_stt_bin()
+    if swift_stt_bin is None:
+        raise RuntimeError(
+            "Cohere Swift 4-bit is selected, but mlx-audio-swift-stt is not installed. "
+            "Run scripts/install_mlx_audio_swift.sh or set VOICE_TRANSCRIBE_SWIFT_STT_BIN."
+        )
+    if not wav_path:
+        raise ValueError("Cohere Swift 4-bit requires a WAV file path")
+    if screen_context:
+        print(
+            "Transcription worker: Cohere Swift 4-bit does not accept decoder context yet; ignoring context.",
+            flush=True,
+        )
+
+    output_stem = Path("/tmp") / f"voice-transcribe-cohere4-{uuid.uuid4().hex}"
+    cmd = [
+        swift_stt_bin,
+        "--model",
+        COHERE_SWIFT_4BIT_MODEL_ID,
+        "--audio",
+        str(wav_path),
+        "--output-path",
+        str(output_stem),
+        "--format",
+        "json",
+        "--language",
+        "English",
+    ]
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=TRANSCRIBE_TIMEOUT,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        raise RuntimeError(stderr or stdout or f"mlx-audio-swift-stt exited {completed.returncode}")
+
+    output_json = output_stem.with_suffix(".json")
+    try:
+        payload = json.loads(output_json.read_text())
+    finally:
+        try:
+            output_json.unlink()
+        except OSError:
+            pass
+    return str(payload.get("text", "")).strip()
 
 
 def _find_crispasr_bin():
@@ -844,6 +915,14 @@ def run(request_pipe, result_pipe):
         # the upcoming real transcription request.
         if isinstance(request, dict) and request.get("__warm__"):
             warm_model_mode = request.get("model_mode", "cohere")
+            if warm_model_mode == "cohere-swift-4bit":
+                if _find_swift_stt_bin() is None:
+                    print(
+                        "Transcription worker: Cohere Swift 4-bit warm skipped; "
+                        "mlx-audio-swift-stt is not installed.",
+                        flush=True,
+                    )
+                continue
             if warm_model_mode == "granite" and granite_server is not None:
                 def _warm_granite():
                     try:
@@ -924,6 +1003,15 @@ def run(request_pipe, result_pipe):
                     text = _transcribe_cohere_mlx(
                         audio_input if audio_input is not None else wav_path,
                         cohere_mlx_model,
+                    )
+                    now = time.time()
+                    last_real_inference_at[0] = now
+                    last_any_inference_at[0] = now
+            elif model_mode == "cohere-swift-4bit":
+                with inference_lock:
+                    text = _transcribe_cohere_swift_4bit(
+                        wav_path,
+                        screen_context=screen_context,
                     )
                     now = time.time()
                     last_real_inference_at[0] = now

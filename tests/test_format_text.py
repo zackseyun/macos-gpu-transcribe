@@ -50,6 +50,10 @@ class BrandReplacementTest(unittest.TestCase):
             "The Qwen branch feels faster.",
         )
         self.assertEqual(
+            format_transcription("the quen branch feels faster."),
+            "The Qwen branch feels faster.",
+        )
+        self.assertEqual(
             format_transcription("this QIN model seems strong."),
             "This Qwen model seems strong.",
         )

@@ -9,7 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import statistics
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -31,13 +34,18 @@ VARIANTS = {
         "runtime": "mlx_speech",
     },
     # beshkenadze 4-bit is smaller, but it uses the newer mlx-audio/Swift-style
-    # checkpoint layout. It loads with mlx-audio only with strict=False in the
-    # current Python runtime, and local tests produced unusable multilingual
-    # gibberish. Keep it benchmarkable so we can retest after runtime updates.
-    "cohere-mlx-4bit-experimental": {
+    # checkpoint layout. The Swift runtime is the reliable path in local tests.
+    "cohere-mlx-4bit-swift": {
         "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
         "subdir": ".",
-        "runtime": "mlx_audio",
+        "runtime": "mlx_audio_swift",
+    },
+    # Kept only to prove the earlier failure mode: current Python mlx-audio can
+    # load this checkpoint with strict=False, but that path produced gibberish.
+    "cohere-mlx-4bit-python-experimental": {
+        "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+        "subdir": ".",
+        "runtime": "mlx_audio_python",
     },
 }
 
@@ -69,7 +77,94 @@ def resolve_model_dir(variant: str) -> Path:
     return Path(path) / meta["subdir"]
 
 
-def run_variant(variant: str, audio: np.ndarray, sample_rate: int, runs: int) -> dict:
+def find_swift_stt_bin(configured: str | None = None) -> str | None:
+    candidates = [
+        configured,
+        os.getenv("VOICE_TRANSCRIBE_SWIFT_STT_BIN"),
+        str(REPO_DIR / ".swift-runtime" / "Release" / "mlx-audio-swift-stt"),
+        shutil.which("mlx-audio-swift-stt"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def run_swift_variant(
+    variant: str,
+    audio_path: Path,
+    runs: int,
+    swift_stt_bin: str | None,
+) -> dict:
+    meta = VARIANTS[variant]
+    swift_bin = find_swift_stt_bin(swift_stt_bin)
+    if not swift_bin:
+        raise RuntimeError(
+            "mlx-audio-swift-stt not found. Run scripts/install_mlx_audio_swift.sh "
+            "or pass --swift-stt-bin."
+        )
+
+    timings: list[float] = []
+    model_times: list[float] = []
+    texts: list[str] = []
+    peak_memory_gb: list[float] = []
+    for idx in range(runs):
+        output_stem = Path(tempfile.mktemp(prefix="cohere4-swift-", dir="/tmp"))
+        cmd = [
+            swift_bin,
+            "--model",
+            meta["repo_id"],
+            "--audio",
+            str(audio_path),
+            "--output-path",
+            str(output_stem),
+            "--format",
+            "json",
+            "--language",
+            "English",
+        ]
+        start = time.perf_counter()
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        elapsed = time.perf_counter() - start
+        output_json = output_stem.with_suffix(".json")
+        payload = json.loads(output_json.read_text())
+        output_json.unlink(missing_ok=True)
+        text = str(payload.get("text", "")).strip()
+        timings.append(elapsed)
+        model_times.append(float(payload.get("total_time", 0) or 0))
+        texts.append(text)
+        if payload.get("peak_memory_usage") is not None:
+            peak_memory_gb.append(float(payload["peak_memory_usage"]))
+        print(f"{variant} run {idx + 1}/{runs}: {elapsed:.3f}s wall :: {text[:160]}", flush=True)
+
+    return {
+        "variant": variant,
+        "repo_id": meta["repo_id"],
+        "model_dir": "mlx-audio-swift cache",
+        "runtime": meta["runtime"],
+        "swift_stt_bin": swift_bin,
+        "runs": timings,
+        "model_total_times": model_times,
+        "median_seconds": statistics.median(timings),
+        "min_seconds": min(timings),
+        "max_seconds": max(timings),
+        "median_model_total_seconds": statistics.median(model_times) if model_times else None,
+        "peak_memory_gb": max(peak_memory_gb) if peak_memory_gb else None,
+        "text": texts[-1] if texts else "",
+    }
+
+
+def run_variant(
+    variant: str,
+    audio_path: Path,
+    audio: np.ndarray,
+    sample_rate: int,
+    runs: int,
+    swift_stt_bin: str | None = None,
+) -> dict:
+    if VARIANTS[variant]["runtime"] == "mlx_audio_swift":
+        return run_swift_variant(variant, audio_path, runs, swift_stt_bin)
+
     import mlx.core as mx
 
     model_dir = resolve_model_dir(variant)
@@ -80,7 +175,7 @@ def run_variant(variant: str, audio: np.ndarray, sample_rate: int, runs: int) ->
 
         model = CohereAsrModel.from_path(model_dir)
         transcribe = lambda: model.transcribe(audio, sample_rate=sample_rate, language="en")
-    elif runtime == "mlx_audio":
+    elif runtime == "mlx_audio_python":
         from mlx_audio.stt import utils as mlx_stt_utils
 
         model = mlx_stt_utils.load(str(model_dir), strict=False)
@@ -119,12 +214,29 @@ def run_variant(variant: str, audio: np.ndarray, sample_rate: int, runs: int) ->
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, default=DEFAULT_AUDIO)
-    parser.add_argument("--variant", action="append", choices=sorted(VARIANTS), help="Variant(s) to run. Defaults to both.")
+    parser.add_argument(
+        "--variant",
+        action="append",
+        choices=sorted(VARIANTS),
+        help="Variant(s) to run. Defaults to 8-bit plus Swift 4-bit when the Swift CLI is installed.",
+    )
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--swift-stt-bin", help="Path to mlx-audio-swift-stt for the 4-bit Swift variant.")
     args = parser.parse_args()
 
-    variants = args.variant or sorted(VARIANTS)
+    if args.variant:
+        variants = args.variant
+    else:
+        variants = ["cohere-mlx-8bit"]
+        if find_swift_stt_bin(args.swift_stt_bin):
+            variants.append("cohere-mlx-4bit-swift")
+        else:
+            print(
+                "Swift 4-bit runtime not found; default benchmark will run 8-bit only. "
+                "Run scripts/install_mlx_audio_swift.sh or pass --swift-stt-bin to include 4-bit.",
+                flush=True,
+            )
     audio, sample_rate, audio_seconds = load_audio_16k(args.audio)
     print(f"Audio: {args.audio} ({audio_seconds:.2f}s @ {sample_rate} Hz)", flush=True)
 
@@ -135,7 +247,16 @@ def main() -> int:
         "variants": [],
     }
     for variant in variants:
-        results["variants"].append(run_variant(variant, audio, sample_rate, args.runs))
+        results["variants"].append(
+            run_variant(
+                variant,
+                args.audio,
+                audio,
+                sample_rate,
+                args.runs,
+                swift_stt_bin=args.swift_stt_bin,
+            )
+        )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(results, indent=2) + "\n")
