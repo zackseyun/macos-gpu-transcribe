@@ -332,10 +332,10 @@ _BRAND_REPLACEMENTS = [
     (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
     # User name: Cohere tends to choose the more common spelling.
     (re.compile(r"\bzach\b", re.IGNORECASE), "Zack"),
-    # Model name: ASR often hears "Qwen" as the common name "Quinn".
-    (re.compile(r"\b(?:qin|quinn?|qwen)\s*(?:three|3)[\s-]*asr\b", re.IGNORECASE), "Qwen3-ASR"),
-    (re.compile(r"\b(?:qin|quinn?|qwen)\s*(?:three|3)\b", re.IGNORECASE), "Qwen3"),
-    (re.compile(r"\b(?:qin|quinn?|qwen)\b", re.IGNORECASE), "Qwen"),
+    # Model name: ASR often hears "Qwen" as common names / syllables like "Quinn" or "Quan".
+    (re.compile(r"\b(?:qin|quan|quinn?|qwen)\s*(?:three|3)[\s-]*asr\b", re.IGNORECASE), "Qwen3-ASR"),
+    (re.compile(r"\b(?:qin|quan|quinn?|qwen)\s*(?:three|3)\b", re.IGNORECASE), "Qwen3"),
+    (re.compile(r"\b(?:qin|quan|quinn?|qwen)\b", re.IGNORECASE), "Qwen"),
     # Common Anthropic/AI brand mishearings
     (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
 ]

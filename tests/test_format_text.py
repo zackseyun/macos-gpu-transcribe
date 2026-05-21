@@ -54,6 +54,10 @@ class BrandReplacementTest(unittest.TestCase):
             "This Qwen model seems strong.",
         )
         self.assertEqual(
+            format_transcription("this Quan MLX model seems strong."),
+            "This Qwen MLX model seems strong.",
+        )
+        self.assertEqual(
             format_transcription("switch to quinn three asr."),
             "Switch to Qwen3-ASR.",
         )

@@ -44,6 +44,7 @@ This suggests the backend should be reviewed for the same split:
 The formatter now canonicalizes common Qwen mishearings:
 
 - `QIN` -> `Qwen`
+- `Quan` -> `Qwen`
 - `Quin` -> `Qwen`
 - `Quinn` -> `Qwen`
-- `Quinn three ASR` / `QIN three ASR` -> `Qwen3-ASR`
+- `Quinn three ASR` / `Quan three ASR` / `QIN three ASR` -> `Qwen3-ASR`
