@@ -7,3 +7,5 @@ settings.json
 .crispasr/
 last_recording.wav
 failed_recordings/
+dist/
+models/

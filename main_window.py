@@ -261,7 +261,7 @@ class MainWindowController(NSObject):
             self._status_label.setTextColor_(NSColor.secondaryLabelColor())
 
         pending = getattr(self._app, "_pending_model", None)
-        default = getattr(self._app, "default_model_mode", "cohere")
+        default = getattr(self._app, "default_model_mode", "fast")
         mode = pending or default
         label = (
             self._app._model_display_name(mode)

@@ -16,7 +16,7 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. The current default is Cohere Transcribe 2B because it is the steadier day-to-day Fn dictation path right now. Granite Speech 4.1 NAR remains available from the menu bar for side-by-side comparisons; when selected, it resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
+Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is the fastest day-to-day Fn dictation path. Cohere Transcribe 2B remains available from the menu bar when you want the older steadier path, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
@@ -29,9 +29,9 @@ Everything runs on the GPU. The current default is Cohere Transcribe 2B because 
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | Default selected in menu: [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) by default, or [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 2B | Cohere via PyTorch (MPS); Granite via CrispASR/GGUF (Metal) | Cohere ~3–4× real-time; Granite varies by warm/server state |
+| **Hold Fn** | Default selected in menu: Qwen3-ASR 0.6B fast path by default; [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 0.6B / 2B | Qwen via MLX (Metal); Cohere via PyTorch (MPS); Granite via CrispASR/GGUF (Metal) | Qwen is the lowest-latency path; Cohere ~3–4× real-time; Granite varies by warm/server state |
 
-Cohere Transcribe 2B is the default for Fn dictation again. Granite stays one click away in the menu for experiments and comparisons. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
+Qwen3-ASR is the default for Fn dictation now. Cohere stays one click away in the menu for comparison or when you prefer its wording. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -110,7 +110,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 - **macOS** on Apple Silicon (M1/M2/M3/M4)
 - **Python 3.13 or 3.14** (Homebrew)
 - **CMake + Xcode command line tools** for the Granite/CrispASR runtime
-- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) for the default Cohere model
+- **HuggingFace account** with access to Qwen3-ASR and [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) if you want the Cohere fallback/comparison model
 
 ## Setup
 
@@ -203,7 +203,12 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
 | `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
 | `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
-| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `true` | Load + prewarm Cohere as soon as the worker starts, so a post-relaunch first dictation does not pay the 10–15s model load |
+| `VOICE_TRANSCRIBE_QWEN_FAST_MODEL` | local quantized model if present, else `Qwen/Qwen3-ASR-0.6B` | Model used by the fast Fn path |
+| `VOICE_TRANSCRIBE_QWEN_PRELOAD` | `true` | Load/warm Qwen as soon as the worker starts, so the first Fn release is fast |
+| `VOICE_TRANSCRIBE_QWEN_KEEP_WARM` | `true` | Keep Qwen warm during active use instead of clearing the MLX cache after each dictation |
+| `VOICE_TRANSCRIBE_QWEN_LANGUAGE` | `English` | Spoken-language hint passed to Qwen3-ASR |
+| `VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | unset | Optional cap for Qwen generation if you want to tune speed/length |
+| `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `false` | Load + prewarm Cohere on worker start. Default is off now so the Qwen fast path gets memory/GPU priority |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
@@ -228,6 +233,7 @@ macos-gpu-transcribe/
 ├── screen_context.py      # Optional frontmost-window screenshot + OCR
 ├── format_text.py         # Post-processing — numbers, currency, percentages
 ├── install.sh             # Install wizard
+├── scripts/quantize_qwen3_asr.py # Optional local 4-bit Qwen checkpoint builder
 ├── run.sh                 # Launcher
 ├── requirements.txt       # pip dependencies
 ├── .crispasr/             # Local CrispASR checkout/build (ignored)

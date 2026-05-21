@@ -40,6 +40,20 @@ class BrandReplacementTest(unittest.TestCase):
             "Zachary can review it later.",
         )
 
+    def test_corrects_quinn_to_qwen(self):
+        self.assertEqual(
+            format_transcription("the quinn branch feels faster."),
+            "The Qwen branch feels faster.",
+        )
+        self.assertEqual(
+            format_transcription("the quin branch feels faster."),
+            "The Qwen branch feels faster.",
+        )
+        self.assertEqual(
+            format_transcription("switch to quinn three asr."),
+            "Switch to Qwen3-ASR.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

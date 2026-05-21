@@ -5,3 +5,5 @@ pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
 pyobjc-framework-Vision
 wordninja>=2.0
+pyobjc-framework-ApplicationServices
+mlx-qwen3-asr

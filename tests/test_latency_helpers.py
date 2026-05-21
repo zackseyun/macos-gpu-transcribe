@@ -34,6 +34,20 @@ class LatencyHelperTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             transcribe_worker._cohere_audio_from_input((audio, 8000))
 
+    def test_worker_has_qwen_silent_warm_audio_tuple(self):
+        audio, sample_rate = transcribe_worker._silent_audio_tuple(seconds=0.01)
+        self.assertEqual(sample_rate, 16000)
+        self.assertEqual(audio.dtype, np.float32)
+        self.assertGreater(len(audio), 0)
+
+    def test_qwen_fast_model_falls_back_when_quantized_model_missing(self):
+        if transcribe_worker.QWEN3_QUANTIZED_FAST_MODEL.exists():
+            self.skipTest("local quantized model is present")
+        self.assertEqual(
+            transcribe_worker._default_qwen_fast_model(),
+            "Qwen/Qwen3-ASR-0.6B",
+        )
+
     def test_write_wav_file_creates_reusable_debug_audio(self):
         audio = np.zeros(160, dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmp:

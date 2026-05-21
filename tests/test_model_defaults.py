@@ -4,9 +4,11 @@ import transcribe
 
 
 class ModelDefaultsTest(unittest.TestCase):
-    def test_fn_default_model_is_cohere(self):
-        self.assertEqual(transcribe.DEFAULT_MODEL_MODE, "cohere")
-        self.assertEqual(transcribe.MENU_MODEL_MODES[0], "cohere")
+    def test_fn_default_model_is_qwen_fast(self):
+        self.assertEqual(transcribe.DEFAULT_MODEL_MODE, "fast")
+        self.assertEqual(transcribe.MENU_MODEL_MODES[0], "fast")
+        self.assertEqual(transcribe.MODEL_LABELS["fast"], "Qwen3-ASR 0.6B 4-bit")
+        self.assertIn("cohere", transcribe.MENU_MODEL_MODES)
 
 
 if __name__ == "__main__":

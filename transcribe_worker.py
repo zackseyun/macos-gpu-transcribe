@@ -27,13 +27,32 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import numpy as np
+
 
 # Metal cache limit — caps GPU buffer cache to 6GB (both models + headroom)
 METAL_CACHE_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
 
+REPO_DIR = Path(__file__).resolve().parent
+QWEN3_QUANTIZED_FAST_MODEL = REPO_DIR / "models" / "qwen3-asr-0.6b-4bit"
+
+
+def _default_qwen_fast_model():
+    """Prefer the local quantized Qwen checkpoint when it exists."""
+    if QWEN3_QUANTIZED_FAST_MODEL.exists():
+        return str(QWEN3_QUANTIZED_FAST_MODEL)
+    print(
+        "Transcription worker: local 4-bit Qwen model is missing; "
+        "falling back to Qwen/Qwen3-ASR-0.6B. Run "
+        "scripts/quantize_qwen3_asr.py to restore the quantized fast path.",
+        flush=True,
+    )
+    return "Qwen/Qwen3-ASR-0.6B"
+
+
 QWEN3_MODEL_IDS = {
-    "fast": "Qwen/Qwen3-ASR-0.6B",
-    "accurate": "Qwen/Qwen3-ASR-1.7B",
+    "fast": os.getenv("VOICE_TRANSCRIBE_QWEN_FAST_MODEL", _default_qwen_fast_model()),
+    "accurate": os.getenv("VOICE_TRANSCRIBE_QWEN_ACCURATE_MODEL", "Qwen/Qwen3-ASR-1.7B"),
 }
 
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
@@ -75,11 +94,28 @@ KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300
 
 # Skip on-demand warm if model was used within this many seconds (already hot).
 ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
+QWEN3_LANGUAGE = (os.getenv("VOICE_TRANSCRIBE_QWEN_LANGUAGE", "English").strip() or None)
+QWEN3_PRELOAD = _env_bool("VOICE_TRANSCRIBE_QWEN_PRELOAD", True)
+QWEN3_KEEP_WARM = _env_bool("VOICE_TRANSCRIBE_QWEN_KEEP_WARM", True)
+
+
+def _optional_int_env(name):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Transcription worker: ignoring invalid {name}={raw!r}", flush=True)
+        return None
+
+
+QWEN3_MAX_NEW_TOKENS = _optional_int_env("VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS")
 
 # Load Cohere proactively instead of waiting for the first release after a fresh
 # app/worker start. This hides the 10-15s model load behind app startup or Fn
 # hold time and prevents the first short dictation from feeling broken.
-PRELOAD_COHERE_ON_WORKER_START = _env_bool("VOICE_TRANSCRIBE_PRELOAD_COHERE", True)
+PRELOAD_COHERE_ON_WORKER_START = _env_bool("VOICE_TRANSCRIBE_PRELOAD_COHERE", False)
 
 
 def _sanitize_screen_context(screen_context):
@@ -170,6 +206,10 @@ def _write_silent_wav(path, seconds=KEEP_WARM_AUDIO_SECONDS, sample_rate=16000):
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(b"\x00\x00" * num_samples)
+
+
+def _silent_audio_tuple(seconds=KEEP_WARM_AUDIO_SECONDS, sample_rate=16000):
+    return (np.zeros(int(seconds * sample_rate), dtype=np.float32), sample_rate)
 
 
 def _prewarm_cohere(processor, model, warm_wav_path):
@@ -506,6 +546,7 @@ def run(request_pipe, result_pipe):
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
 
     qwen3_transcribe_fn = None
+    qwen3_loaded_models = set()
     cohere_processor = None
     cohere_model = None
     cohere_prompt_cache = {}
@@ -526,6 +567,52 @@ def run(request_pipe, result_pipe):
     cohere_load_lock = threading.Lock()
     last_real_inference_at = [time.time()]  # last real (non-warm) transcription
     last_any_inference_at = [time.time()]   # last any inference (real OR warm)
+
+    def _ensure_qwen3_transcribe_fn():
+        nonlocal qwen3_transcribe_fn
+        if qwen3_transcribe_fn is None:
+            print("Transcription worker: loading Qwen3 transcribe function...", flush=True)
+            from mlx_qwen3_asr import transcribe as _transcribe_fn
+            qwen3_transcribe_fn = _transcribe_fn
+            print("Transcription worker: Qwen3 transcribe function ready", flush=True)
+        return qwen3_transcribe_fn
+
+    def _qwen3_transcribe(audio_input, model_id, screen_context="", warm=False):
+        transcribe_fn = _ensure_qwen3_transcribe_fn()
+        kwargs = {
+            "model": model_id,
+            "context": screen_context,
+            "language": QWEN3_LANGUAGE,
+        }
+        if QWEN3_MAX_NEW_TOKENS is not None:
+            kwargs["max_new_tokens"] = QWEN3_MAX_NEW_TOKENS
+        raw = transcribe_fn(audio_input, **kwargs)
+        if warm:
+            qwen3_loaded_models.add(model_id)
+        return raw
+
+    def _warm_qwen3(reason, model_mode="fast"):
+        """Warm/load the Qwen path without touching Cohere."""
+        if not QWEN3_KEEP_WARM and reason != "preload":
+            return False
+        model_id = QWEN3_MODEL_IDS.get(model_mode, QWEN3_MODEL_IDS["fast"])
+        if not inference_lock.acquire(blocking=False):
+            return False
+        try:
+            t0 = time.time()
+            _qwen3_transcribe(_silent_audio_tuple(), model_id, warm=True)
+            last_any_inference_at[0] = time.time()
+            print(
+                f"Transcription worker: Qwen3 {reason}-warm done "
+                f"({time.time() - t0:.1f}s, model={model_id})",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"Transcription worker: Qwen3 {reason}-warm failed: {exc}", flush=True)
+            return False
+        finally:
+            inference_lock.release()
 
     def _ensure_cohere_loaded(reason="on-demand"):
         """Load + prewarm Cohere exactly once, safe across warm/real requests."""
@@ -604,7 +691,7 @@ def run(request_pipe, result_pipe):
         while True:
             try:
                 time.sleep(KEEP_WARM_CHECK_INTERVAL)
-                if cohere_model is None or warm_wav_path is None:
+                if cohere_model is None and not qwen3_loaded_models:
                     continue
                 now = time.time()
                 # Stop keep-warming if no real activity recently — let GPU sleep.
@@ -613,11 +700,17 @@ def run(request_pipe, result_pipe):
                 # Don't warm if we just warmed/transcribed.
                 if now - last_any_inference_at[0] < KEEP_WARM_INTERVAL:
                     continue
-                _do_warm("keep")
+                if cohere_model is not None:
+                    _do_warm("keep")
+                elif qwen3_loaded_models:
+                    _warm_qwen3("keep")
             except Exception as exc:
                 print(f"Transcription worker: keep-warm loop error: {exc}", flush=True)
 
     threading.Thread(target=_keep_warm_loop, daemon=True).start()
+
+    if QWEN3_PRELOAD:
+        threading.Thread(target=_warm_qwen3, args=("preload", "fast"), daemon=True).start()
 
     if PRELOAD_COHERE_ON_WORKER_START:
         threading.Thread(
@@ -653,6 +746,11 @@ def run(request_pipe, result_pipe):
                 threading.Thread(target=_warm_granite, daemon=True).start()
                 continue
             if warm_model_mode != "cohere":
+                now = time.time()
+                if now - last_any_inference_at[0] >= ON_DEMAND_WARM_SKIP_THRESHOLD:
+                    threading.Thread(
+                        target=_warm_qwen3, args=("on-demand", warm_model_mode), daemon=True
+                    ).start()
                 continue
             if cohere_model is None:
                 threading.Thread(
@@ -725,24 +823,17 @@ def run(request_pipe, result_pipe):
             else:
                 # Qwen3 via MLX
                 model_id = QWEN3_MODEL_IDS.get(model_mode, QWEN3_MODEL_IDS["fast"])
-                if qwen3_transcribe_fn is None:
-                    print("Transcription worker: loading Qwen3 transcribe function...", flush=True)
-                    from mlx_qwen3_asr import transcribe as _transcribe_fn
-                    qwen3_transcribe_fn = _transcribe_fn
-                    print("Transcription worker: Qwen3 ready", flush=True)
-
-                raw = qwen3_transcribe_fn(
-                    audio_input if audio_input is not None else wav_path,
-                    model=model_id,
-                    context=screen_context,
-                )
-
-                # Clear MLX Metal cache after each transcription
-                if mx is not None:
-                    try:
-                        mx.clear_cache()
-                    except Exception:
-                        pass
+                qwen_input = audio_input if audio_input is not None else wav_path
+                with inference_lock:
+                    raw = _qwen3_transcribe(
+                        qwen_input,
+                        model_id,
+                        screen_context=screen_context,
+                    )
+                    qwen3_loaded_models.add(model_id)
+                    now = time.time()
+                    last_real_inference_at[0] = now
+                    last_any_inference_at[0] = now
 
                 if isinstance(raw, dict):
                     text = raw.get("text", "").strip()
