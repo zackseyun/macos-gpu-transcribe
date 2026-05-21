@@ -912,6 +912,19 @@ class VoiceTranscribeApp(rumps.App):
         # shows "Loading model…" on the next use.
         if hasattr(self, "_model_warmed"):
             self._model_warmed = self._new_model_warm_state()
+        if hasattr(self, "default_model_mode"):
+            threading.Thread(
+                target=self._warm_default_model_after_worker_spawn,
+                daemon=True,
+            ).start()
+
+    def _warm_default_model_after_worker_spawn(self):
+        """Warm the selected default model after a fresh worker starts."""
+        time.sleep(0.5)
+        try:
+            self._send_warm_signal(self.default_model_mode)
+        except Exception as exc:
+            print(f"Initial default-model warm failed: {exc}", flush=True)
 
     # ── Wake / keep-warm ──
     # macOS tears down Metal GPU state during sleep. The weights stay in the

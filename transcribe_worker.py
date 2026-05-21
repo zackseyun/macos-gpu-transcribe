@@ -244,6 +244,23 @@ def _cohere_mlx_audio_from_input(audio_input):
         if int(sample_rate) != 16000:
             raise ValueError(f"Expected 16 kHz audio, got {sample_rate} Hz")
         return np.asarray(audio, dtype=np.float32)
+    if isinstance(audio_input, (str, os.PathLike)):
+        # mlx-speech's Cohere path is fastest/most reliable with raw float
+        # arrays. Passing a long WAV path can fall into a string-as-audio bug
+        # ("could not convert string to float"). Decode here instead.
+        with wave.open(str(audio_input), "rb") as wf:
+            channels = wf.getnchannels()
+            sample_rate = wf.getframerate()
+            sample_width = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        if sample_rate != 16000:
+            raise ValueError(f"Expected 16 kHz audio, got {sample_rate} Hz")
+        if sample_width != 2:
+            raise ValueError(f"Expected 16-bit PCM WAV, got sample width {sample_width}")
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1).astype(np.float32)
+        return audio
     return audio_input
 
 
@@ -268,10 +285,7 @@ def _resolve_cohere_mlx_model_dir():
 
 def _transcribe_cohere_mlx(audio_input, model):
     audio = _cohere_mlx_audio_from_input(audio_input)
-    if isinstance(audio, (str, os.PathLike)):
-        result = model.transcribe(audio, language="en")
-    else:
-        result = model.transcribe(audio, sample_rate=16000, language="en")
+    result = model.transcribe(audio, sample_rate=16000, language="en")
     return str(getattr(result, "text", result)).strip()
 
 
