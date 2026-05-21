@@ -799,6 +799,9 @@ class CohereSwiftSttServer:
                 raise RuntimeError(response.get("error") or "Cohere Swift 4-bit server transcription failed")
             return str(response.get("text") or "").strip()
 
+    def is_running(self):
+        return self.proc is not None and self.proc.poll() is None
+
     def stop(self):
         if self.proc is None or self.proc.poll() is not None:
             return
@@ -1014,6 +1017,31 @@ def run(request_pipe, result_pipe):
         finally:
             inference_lock.release()
 
+    def _do_warm_cohere_swift(reason):
+        """Run a silent inference through the resident Swift server.
+
+        Starting the Swift server is not quite enough: the first real request
+        after launch/idle can still pay Metal/kernel setup inside the server.
+        A tiny silent request moves that work off the user's release→paste path.
+        """
+        if warm_wav_path is None:
+            return False
+        if not inference_lock.acquire(blocking=False):
+            return False
+        try:
+            t0 = time.time()
+            cohere_swift_server.transcribe(warm_wav_path)
+            last_any_inference_at[0] = time.time()
+            dt = time.time() - t0
+            if dt > 0.75:
+                print(f"Transcription worker: Cohere Swift 4-bit {reason}-warm took {dt:.1f}s", flush=True)
+            return True
+        except Exception as exc:
+            print(f"Transcription worker: Cohere Swift 4-bit {reason}-warm failed: {exc}", flush=True)
+            return False
+        finally:
+            inference_lock.release()
+
 
     def _keep_warm_loop():
         """Background thread: tight keep-warm loop that bounds itself to active sessions.
@@ -1026,7 +1054,12 @@ def run(request_pipe, result_pipe):
         while True:
             try:
                 time.sleep(KEEP_WARM_CHECK_INTERVAL)
-                if cohere_model is None and cohere_mlx_model is None and not qwen3_loaded_models:
+                if (
+                    cohere_model is None
+                    and cohere_mlx_model is None
+                    and not cohere_swift_server.is_running()
+                    and not qwen3_loaded_models
+                ):
                     continue
                 now = time.time()
                 # Stop keep-warming if no real activity recently — let GPU sleep.
@@ -1037,6 +1070,8 @@ def run(request_pipe, result_pipe):
                     continue
                 if cohere_mlx_model is not None:
                     _do_warm_cohere_mlx("keep")
+                elif cohere_swift_server.is_running():
+                    _do_warm_cohere_swift("keep")
                 elif cohere_model is not None:
                     _do_warm("keep")
                 elif qwen3_loaded_models:
@@ -1077,7 +1112,13 @@ def run(request_pipe, result_pipe):
             if warm_model_mode == "cohere-swift-4bit":
                 def _warm_swift_server():
                     try:
-                        cohere_swift_server.ensure_started()
+                        if (
+                            cohere_swift_server.is_running()
+                            and time.time() - last_any_inference_at[0] < ON_DEMAND_WARM_SKIP_THRESHOLD
+                        ):
+                            cohere_swift_server.ensure_started()
+                            return
+                        _do_warm_cohere_swift("on-demand")
                     except Exception as exc:
                         print(f"Transcription worker: Cohere Swift 4-bit warm failed: {exc}", flush=True)
 
