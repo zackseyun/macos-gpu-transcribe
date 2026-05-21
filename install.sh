@@ -93,6 +93,11 @@ else
   ok "Built local 4-bit Qwen model"
 fi
 
+step "Installing macOS app wrapper"
+"$REPO_DIR/scripts/install_app_bundle.sh"
+ok "Installed Qwen Dictate.app"
+APP_PYTHON="/Applications/Qwen Dictate.app/Contents/MacOS/Python"
+
 # ── 5. Disable Right Option key (system-wide HID remap) ─────────────────────
 step "Disabling Right Option key (HID-level remap)"
 # Right Option used to be a second hotkey, but it kept leaking stray special
@@ -116,12 +121,12 @@ step "Configuring run.sh"
 cat > "$REPO_DIR/run.sh" << EOF
 #!/bin/bash
 # Launcher — uses Python.app (which has Accessibility + Input Monitoring permission)
-PYTHON_APP="${PYTHON_APP}"
+PYTHON_APP="${APP_PYTHON}"
 VENV_SITE="${VENV_SITE}"
 SCRIPT="${REPO_DIR}/transcribe.py"
 
-# Kill any existing voice-transcribe processes
-pkill -f "voice-transcribe/transcribe.py" 2>/dev/null
+# Kill any existing voice-transcribe processes from this checkout
+pkill -f "\${SCRIPT}" 2>/dev/null
 sleep 0.5
 
 export PYTHONPATH="\${VENV_SITE}:${REPO_DIR}:\${PYTHONPATH}"
@@ -140,10 +145,10 @@ echo "     → Set \"Press 🌐 key to\" = Do Nothing"
 echo ""
 echo "  2. System Settings → Privacy & Security → Accessibility"
 echo "     → Click + and add:"
-echo "     ${PYTHON_APP}"
+echo "     /Applications/Qwen Dictate.app"
 echo ""
 echo "  3. System Settings → Privacy & Security → Input Monitoring"
-echo "     → Click + and add the same Python.app"
+echo "     → Click + and add the same Qwen Dictate.app"
 echo ""
 read -rp "Press Enter once you've granted those permissions..."
 
