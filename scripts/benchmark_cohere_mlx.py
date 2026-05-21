@@ -301,6 +301,8 @@ def run_variant(
     sample_rate: int,
     runs: int,
     swift_stt_bin: str | None = None,
+    max_new_tokens: int | None = None,
+    punctuation: bool = True,
 ) -> dict:
     if VARIANTS[variant]["runtime"] == "mlx_audio_swift":
         return run_swift_variant(variant, audio_path, runs, swift_stt_bin)
@@ -316,7 +318,10 @@ def run_variant(
         from mlx_speech.generation import CohereAsrModel
 
         model = CohereAsrModel.from_path(model_dir)
-        transcribe = lambda: model.transcribe(audio, sample_rate=sample_rate, language="en")
+        kwargs = {"sample_rate": sample_rate, "language": "en", "punctuation": punctuation}
+        if max_new_tokens is not None:
+            kwargs["max_new_tokens"] = max_new_tokens
+        transcribe = lambda: model.transcribe(audio, **kwargs)
     elif runtime == "mlx_audio_python":
         from mlx_audio.stt import utils as mlx_stt_utils
 
@@ -344,6 +349,8 @@ def run_variant(
         "repo_id": VARIANTS[variant]["repo_id"],
         "model_dir": str(model_dir),
         "runtime": runtime,
+        "max_new_tokens": max_new_tokens,
+        "punctuation": punctuation,
         "load_seconds": load_seconds,
         "runs": timings,
         "median_seconds": statistics.median(timings),
@@ -365,6 +372,8 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--swift-stt-bin", help="Path to mlx-audio-swift-stt for the 4-bit Swift variant.")
+    parser.add_argument("--max-new-tokens", type=int, help="Override Cohere MLX max_new_tokens for benchmark runs.")
+    parser.add_argument("--no-punctuation", action="store_true", help="Benchmark Cohere MLX with punctuation disabled.")
     args = parser.parse_args()
 
     if args.variant:
@@ -397,6 +406,8 @@ def main() -> int:
                 sample_rate,
                 args.runs,
                 swift_stt_bin=args.swift_stt_bin,
+                max_new_tokens=args.max_new_tokens,
+                punctuation=not args.no_punctuation,
             )
         )
 

@@ -110,7 +110,7 @@ KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300
 # Skip on-demand warm if model was used within this many seconds (already hot).
 ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
 QWEN3_LANGUAGE = (os.getenv("VOICE_TRANSCRIBE_QWEN_LANGUAGE", "English").strip() or None)
-QWEN3_PRELOAD = _env_bool("VOICE_TRANSCRIBE_QWEN_PRELOAD", True)
+QWEN3_PRELOAD = _env_bool("VOICE_TRANSCRIBE_QWEN_PRELOAD", False)
 QWEN3_KEEP_WARM = _env_bool("VOICE_TRANSCRIBE_QWEN_KEEP_WARM", True)
 
 
@@ -126,6 +126,7 @@ def _optional_int_env(name):
 
 
 QWEN3_MAX_NEW_TOKENS = _optional_int_env("VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS")
+COHERE_MLX_MAX_NEW_TOKENS = _optional_int_env("VOICE_TRANSCRIBE_COHERE_MLX_MAX_NEW_TOKENS")
 
 # Load Cohere proactively instead of waiting for the first release after a fresh
 # app/worker start. This hides the 10-15s model load behind app startup or Fn
@@ -285,7 +286,10 @@ def _resolve_cohere_mlx_model_dir():
 
 def _transcribe_cohere_mlx(audio_input, model):
     audio = _cohere_mlx_audio_from_input(audio_input)
-    result = model.transcribe(audio, sample_rate=16000, language="en")
+    kwargs = {"sample_rate": 16000, "language": "en"}
+    if COHERE_MLX_MAX_NEW_TOKENS is not None:
+        kwargs["max_new_tokens"] = COHERE_MLX_MAX_NEW_TOKENS
+    result = model.transcribe(audio, **kwargs)
     return str(getattr(result, "text", result)).strip()
 
 

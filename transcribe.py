@@ -1046,13 +1046,6 @@ class VoiceTranscribeApp(rumps.App):
         if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
             result = self._tx_res_parent.recv()
 
-            # Worker may send a restart signal after the result
-            if self._tx_res_parent.poll(timeout=0.1):
-                extra = self._tx_res_parent.recv()
-                if isinstance(extra, dict) and extra.get("__restart__"):
-                    print("Worker requested restart (memory pressure), respawning...", flush=True)
-                    self._spawn_transcribe_worker()
-
             # Handle case where the restart signal came instead of a result
             if isinstance(result, dict) and result.get("__restart__"):
                 print("Worker requested restart (memory pressure), respawning...", flush=True)
@@ -1938,11 +1931,9 @@ class VoiceTranscribeApp(rumps.App):
                 # float32 buffer directly. This skips the temp WAV write,
                 # worker-side WAV decode, and an extra last_recording copy.
                 worker_audio = (audio.astype(np.float32, copy=False), SAMPLE_RATE)
-                self._save_last_recording_audio(audio)
             else:
                 wav_path = tempfile.mktemp(suffix=".wav")
                 _write_wav_file(audio, wav_path)
-                self._save_last_recording(wav_path)
             latency["prep"] = time.perf_counter() - prep_t0
 
             if self.screen_context_enabled:
@@ -2130,6 +2121,7 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
             self._add_to_history(text)
             history_queued = True
+            self._save_last_recording_async(wav_path=wav_path, audio=audio)
             paste_t0 = time.perf_counter()
             self._paste_text(text)
             latency["paste"] = time.perf_counter() - paste_t0
@@ -2224,6 +2216,16 @@ class VoiceTranscribeApp(rumps.App):
             _write_wav_file(audio, LAST_RECORDING_FILE)
         except Exception as exc:
             print(f"Failed to save last recording: {exc}", flush=True)
+
+    def _save_last_recording_async(self, wav_path=None, audio=None):
+        """Save latest recording off the release→ASR critical path."""
+        def _save():
+            if wav_path:
+                self._save_last_recording(wav_path)
+            elif audio is not None:
+                self._save_last_recording_audio(audio)
+
+        threading.Thread(target=_save, daemon=True).start()
 
     def _preserve_current_recording(self, wav_path, audio, reason):
         if wav_path and os.path.exists(wav_path):

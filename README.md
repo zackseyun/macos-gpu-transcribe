@@ -204,7 +204,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
 | `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
 | `VOICE_TRANSCRIBE_QWEN_FAST_MODEL` | local quantized model if present, else `Qwen/Qwen3-ASR-0.6B` | Model used by the fast Fn path |
-| `VOICE_TRANSCRIBE_QWEN_PRELOAD` | `true` | Load/warm Qwen as soon as the worker starts, so the first Fn release is fast |
+| `VOICE_TRANSCRIBE_QWEN_PRELOAD` | `false` | Legacy worker-side Qwen preload. The app now warms the selected default model after worker start instead, so Cohere defaults do not compete with Qwen preload |
 | `VOICE_TRANSCRIBE_QWEN_KEEP_WARM` | `true` | Keep Qwen warm during active use instead of clearing the MLX cache after each dictation |
 | `VOICE_TRANSCRIBE_QWEN_LANGUAGE` | `English` | Spoken-language hint passed to Qwen3-ASR |
 | `VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | unset | Optional cap for Qwen generation if you want to tune speed/length |
