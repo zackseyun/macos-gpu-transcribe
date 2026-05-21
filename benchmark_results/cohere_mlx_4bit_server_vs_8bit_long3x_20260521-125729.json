@@ -1,0 +1,53 @@
+{
+  "audio": "/tmp/voice-transcribe-long-3x.wav",
+  "audio_seconds": 78.848375,
+  "runs_per_variant": 5,
+  "variants": [
+    {
+      "variant": "cohere-mlx-8bit",
+      "repo_id": "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
+      "model_dir": "/Users/zackseyun/.cache/huggingface/hub/models--mlx-community--cohere-transcribe-03-2026-mlx-8bit/snapshots/a0acb7f93cd32d82c4fbf801b6d8fb39d20c509f/mlx-int8",
+      "runtime": "mlx_speech",
+      "load_seconds": 0.31164766699657775,
+      "runs": [
+        1.586916125001153,
+        1.5010047499963548,
+        1.5278063750010915,
+        1.4595808750018477,
+        1.3995698749786243
+      ],
+      "median_seconds": 1.5010047499963548,
+      "min_seconds": 1.3995698749786243,
+      "max_seconds": 1.586916125001153,
+      "text": "And is this customized to every concept? So every concept will be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then can you make sure that this is also applied to the mobile app? And is this customized to every concept? Is this customized to every concept so every concept will be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then, can you make sure that this is also applied to the mobile app? And is this customized to every concept so every concept will. Be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then, can you make sure that this is also applied to the mobile app?"
+    },
+    {
+      "variant": "cohere-mlx-4bit-swift-server",
+      "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+      "model_dir": "mlx-audio-swift cache",
+      "runtime": "mlx_audio_swift_server",
+      "swift_stt_server_bin": "/Users/zackseyun/voice-transcribe/.swift-runtime/Release/mlx-audio-swift-stt-server",
+      "load_seconds": 0.22805474998313002,
+      "runs": [
+        1.1744535409961827,
+        0.9249873340013437,
+        0.9146197499940172,
+        0.9094006250088569,
+        0.9123837919905782
+      ],
+      "model_total_times": [
+        1.1541210412979126,
+        0.9096499681472778,
+        0.900385856628418,
+        0.8955529928207397,
+        0.8984479904174805
+      ],
+      "median_seconds": 0.9146197499940172,
+      "min_seconds": 0.9094006250088569,
+      "max_seconds": 1.1744535409961827,
+      "median_model_total_seconds": 0.900385856628418,
+      "peak_memory_gb": 2.224849293,
+      "text": "And is this customized to every concept? So every concept will be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then, can you make sure that this is also applied to the mobile app?\nAnd is this customized to every concept? So every concept will be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then can you make sure that this is also applied to the mobile app?\nAnd is this customized to every concept? So every concept will be a bit dynamic and show, or is this hard coded? Basically, is what I want to understand. And then, can you make sure that this is also applied to the mobile app?"
+    }
+  ]
+}

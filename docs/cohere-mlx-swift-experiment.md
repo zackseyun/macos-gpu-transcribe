@@ -43,14 +43,16 @@ This was a runtime/checkpoint-layout mismatch, not proof the 4-bit model is bad.
 Model: `beshkenadze/cohere-transcribe-03-2026-mlx-4bit`.
 Runtime: `mlx-audio-swift`, built with Xcode so `default.metallib` is packaged.
 
-Result: coherent and faster than the Python 8-bit path on the synthetic local Qwen/Cohere fixture.
+Initial CLI result: coherent but not clearly faster than 8-bit because every request paid process launch + model setup overhead.
 
-- 3-run wall-clock median: ~0.46s
-- Model-reported median: ~0.20s
-- Peak memory: ~1.86 GB
+Resident server result: faster than the 8-bit Python MLX path after the Swift model stays loaded.
+
+- 11.4s live fixture: 8-bit median ~0.254s; resident 4-bit median ~0.173s.
+- 78.8s repeated long fixture: 8-bit median ~1.50s; resident 4-bit median ~0.91s.
+- Peak resident 4-bit memory in tests: ~1.9-2.2 GB.
 - Transcript quality: coherent; still hears the spoken model name as `Quen`, so deterministic formatting now normalizes `Quen`/`Quinn`/`Quan`/`QIN` to `Qwen`.
 
-Setup note: plain `swift run` failed because SwiftPM command-line builds do not package MLX's Metal shaders. The working path is:
+Setup note: plain `swift run` failed because SwiftPM command-line builds do not package MLX's Metal shaders. The working path builds both one-shot and resident server binaries:
 
 ```bash
 scripts/install_mlx_audio_swift.sh

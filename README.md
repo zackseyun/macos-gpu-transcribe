@@ -210,6 +210,7 @@ nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 | `VOICE_TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | unset | Optional cap for Qwen generation if you want to tune speed/length |
 | `VOICE_TRANSCRIBE_PRELOAD_COHERE` | `false` | Load + prewarm legacy PyTorch Cohere on worker start. Default is off so Qwen/Cohere MLX get memory/GPU priority |
 | `VOICE_TRANSCRIBE_SWIFT_STT_BIN` | `.swift-runtime/Release/mlx-audio-swift-stt` | Override the Swift STT CLI used by the experimental Cohere 4-bit mode |
+| `VOICE_TRANSCRIBE_SWIFT_STT_SERVER_BIN` | `.swift-runtime/Release/mlx-audio-swift-stt-server` | Override the resident Swift STT server used by the optimized Cohere 4-bit mode |
 | `VOICE_TRANSCRIBE_GRANITE_MODEL` | `auto` | CrispASR model argument for Granite; set to a `.gguf` path to avoid auto-download |
 | `VOICE_TRANSCRIBE_GRANITE_LANGUAGE` | `en` | Spoken-language hint for Granite; avoids a separate language-detection model download |
 | `VOICE_TRANSCRIBE_CRISPASR_BIN` | `.crispasr/build/bin/crispasr` | Override CrispASR binary path |
@@ -277,10 +278,10 @@ Local benchmark on `last_recording.wav` (~32.25s audio):
 | Variant | Runtime | Median | Speed | Quality |
 | --- | --- | ---: | ---: | --- |
 | Cohere MLX 8-bit | `mlx-speech` | ~0.68s | ~47x real-time | Correct transcript |
-| Cohere MLX 4-bit | `mlx-audio-swift` | ~0.46s wall on 8.7s synthetic fixture | ~19x real-time wall / ~44x model time | Coherent; deterministic formatter normalizes `Quen`/`Quan`/`QIN`/`Quinn` to `Qwen` |
+| Cohere MLX 4-bit resident | `mlx-audio-swift-stt-server` | ~0.17s on 11.4s fixture; ~0.91s on 78.8s fixture | ~66x to ~86x real-time | Coherent; deterministic formatter normalizes `Quen`/`Quan`/`QIN`/`Quinn` to `Qwen` |
 | Cohere MLX 4-bit | Python `mlx-audio` control | ~0.92s | ~35x real-time | Wrong runtime path; produced multilingual gibberish |
 
-Build the Swift CLI if the 4-bit menu item says it is missing:
+Build the Swift CLI/server if the 4-bit menu item says it is missing:
 
 ```bash
 scripts/install_mlx_audio_swift.sh

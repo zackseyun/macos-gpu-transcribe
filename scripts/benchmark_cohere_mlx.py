@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -39,6 +41,11 @@ VARIANTS = {
         "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
         "subdir": ".",
         "runtime": "mlx_audio_swift",
+    },
+    "cohere-mlx-4bit-swift-server": {
+        "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+        "subdir": ".",
+        "runtime": "mlx_audio_swift_server",
     },
     # Kept only to prove the earlier failure mode: current Python mlx-audio can
     # load this checkpoint with strict=False, but that path produced gibberish.
@@ -90,12 +97,145 @@ def find_swift_stt_bin(configured: str | None = None) -> str | None:
     return None
 
 
+def find_swift_stt_server_bin(configured: str | None = None) -> str | None:
+    candidates = [
+        configured,
+        os.getenv("VOICE_TRANSCRIBE_SWIFT_STT_SERVER_BIN"),
+        str(REPO_DIR / ".swift-runtime" / "Release" / "mlx-audio-swift-stt-server"),
+        shutil.which("mlx-audio-swift-stt-server"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+class SwiftSttServer:
+    def __init__(self, bin_path: str, repo_id: str):
+        self.proc = subprocess.Popen(
+            [bin_path, "--model", repo_id, "--language", "English"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=self._reader, daemon=True).start()
+        deadline = time.perf_counter() + 60
+        while time.perf_counter() < deadline:
+            payload = self._read_json(deadline)
+            if payload.get("event") == "ready":
+                return
+        raise TimeoutError("Swift STT server did not become ready")
+
+    def _reader(self):
+        if not self.proc.stdout:
+            return
+        for line in self.proc.stdout:
+            self.lines.put(line)
+
+    def _read_json(self, deadline: float, expected_id: str | None = None) -> dict:
+        while time.perf_counter() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"Swift STT server exited {self.proc.returncode}")
+            try:
+                line = self.lines.get(timeout=min(0.5, max(0.05, deadline - time.perf_counter())))
+            except queue.Empty:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"swift-server: {line[:160]}", flush=True)
+                continue
+            if expected_id is not None and payload.get("id") not in {expected_id, None}:
+                continue
+            return payload
+        raise TimeoutError("Timed out waiting for Swift STT server response")
+
+    def transcribe(self, audio_path: Path) -> dict:
+        request_id = str(time.time_ns())
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps({"id": request_id, "audio": str(audio_path), "language": "English"}) + "\n")
+        self.proc.stdin.flush()
+        payload = self._read_json(time.perf_counter() + 300, expected_id=request_id)
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "Swift STT server failed")
+        return payload
+
+    def close(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def run_swift_server_variant(
+    variant: str,
+    audio_path: Path,
+    runs: int,
+    swift_stt_bin: str | None,
+) -> dict:
+    meta = VARIANTS[variant]
+    server_bin = find_swift_stt_server_bin(swift_stt_bin)
+    if not server_bin:
+        raise RuntimeError(
+            "mlx-audio-swift-stt-server not found. Run scripts/install_mlx_audio_swift.sh "
+            "or pass --swift-stt-bin."
+        )
+    load_start = time.perf_counter()
+    server = SwiftSttServer(server_bin, meta["repo_id"])
+    load_seconds = time.perf_counter() - load_start
+    timings: list[float] = []
+    model_times: list[float] = []
+    texts: list[str] = []
+    peak_memory_gb: list[float] = []
+    try:
+        for idx in range(runs):
+            start = time.perf_counter()
+            payload = server.transcribe(audio_path)
+            elapsed = time.perf_counter() - start
+            text = str(payload.get("text", "")).strip()
+            timings.append(elapsed)
+            model_times.append(float(payload.get("totalTime", 0) or 0))
+            texts.append(text)
+            if payload.get("peakMemoryUsage") is not None:
+                peak_memory_gb.append(float(payload["peakMemoryUsage"]))
+            print(f"{variant} run {idx + 1}/{runs}: {elapsed:.3f}s resident :: {text[:160]}", flush=True)
+    finally:
+        server.close()
+
+    return {
+        "variant": variant,
+        "repo_id": meta["repo_id"],
+        "model_dir": "mlx-audio-swift cache",
+        "runtime": meta["runtime"],
+        "swift_stt_server_bin": server_bin,
+        "load_seconds": load_seconds,
+        "runs": timings,
+        "model_total_times": model_times,
+        "median_seconds": statistics.median(timings),
+        "min_seconds": min(timings),
+        "max_seconds": max(timings),
+        "median_model_total_seconds": statistics.median(model_times) if model_times else None,
+        "peak_memory_gb": max(peak_memory_gb) if peak_memory_gb else None,
+        "text": texts[-1] if texts else "",
+    }
+
+
 def run_swift_variant(
     variant: str,
     audio_path: Path,
     runs: int,
     swift_stt_bin: str | None,
 ) -> dict:
+    if VARIANTS[variant]["runtime"] == "mlx_audio_swift_server":
+        return run_swift_server_variant(variant, audio_path, runs, swift_stt_bin)
+
     meta = VARIANTS[variant]
     swift_bin = find_swift_stt_bin(swift_stt_bin)
     if not swift_bin:
@@ -164,6 +304,8 @@ def run_variant(
 ) -> dict:
     if VARIANTS[variant]["runtime"] == "mlx_audio_swift":
         return run_swift_variant(variant, audio_path, runs, swift_stt_bin)
+    if VARIANTS[variant]["runtime"] == "mlx_audio_swift_server":
+        return run_swift_server_variant(variant, audio_path, runs, swift_stt_bin)
 
     import mlx.core as mx
 
@@ -229,11 +371,11 @@ def main() -> int:
         variants = args.variant
     else:
         variants = ["cohere-mlx-8bit"]
-        if find_swift_stt_bin(args.swift_stt_bin):
-            variants.append("cohere-mlx-4bit-swift")
+        if find_swift_stt_server_bin(args.swift_stt_bin):
+            variants.append("cohere-mlx-4bit-swift-server")
         else:
             print(
-                "Swift 4-bit runtime not found; default benchmark will run 8-bit only. "
+            "Swift 4-bit server runtime not found; default benchmark will run 8-bit only. "
                 "Run scripts/install_mlx_audio_swift.sh or pass --swift-stt-bin to include 4-bit.",
                 flush=True,
             )

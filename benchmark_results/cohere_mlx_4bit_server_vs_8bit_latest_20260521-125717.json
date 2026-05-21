@@ -1,0 +1,53 @@
+{
+  "audio": "last_recording.wav",
+  "audio_seconds": 11.39775,
+  "runs_per_variant": 5,
+  "variants": [
+    {
+      "variant": "cohere-mlx-8bit",
+      "repo_id": "mlx-community/cohere-transcribe-03-2026-mlx-8bit",
+      "model_dir": "/Users/zackseyun/.cache/huggingface/hub/models--mlx-community--cohere-transcribe-03-2026-mlx-8bit/snapshots/a0acb7f93cd32d82c4fbf801b6d8fb39d20c509f/mlx-int8",
+      "runtime": "mlx_speech",
+      "load_seconds": 1.0259499170060735,
+      "runs": [
+        0.4239980409911368,
+        0.2534826250048354,
+        0.25387650000629947,
+        0.25864045799244195,
+        0.2541326249775011
+      ],
+      "median_seconds": 0.2541326249775011,
+      "min_seconds": 0.2534826250048354,
+      "max_seconds": 0.4239980409911368,
+      "text": "And lastly, were you able to make sure that our summary card actually looks like the red summary card?"
+    },
+    {
+      "variant": "cohere-mlx-4bit-swift-server",
+      "repo_id": "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
+      "model_dir": "mlx-audio-swift cache",
+      "runtime": "mlx_audio_swift_server",
+      "swift_stt_server_bin": "/Users/zackseyun/voice-transcribe/.swift-runtime/Release/mlx-audio-swift-stt-server",
+      "load_seconds": 1.5191466250107624,
+      "runs": [
+        0.27607716698548757,
+        0.17312724998919293,
+        0.16900833300314844,
+        0.17953516700072214,
+        0.1719110419799108
+      ],
+      "model_total_times": [
+        0.2544710636138916,
+        0.16959500312805176,
+        0.1652510166168213,
+        0.1756960153579712,
+        0.1684190034866333
+      ],
+      "median_seconds": 0.17312724998919293,
+      "min_seconds": 0.16900833300314844,
+      "max_seconds": 0.27607716698548757,
+      "median_model_total_seconds": 0.16959500312805176,
+      "peak_memory_gb": 1.895961932,
+      "text": "And lastly, were you able to make sure that our summary card actually looks like the red summary card?"
+    }
+  ]
+}

@@ -17,6 +17,7 @@ Cold-start mitigation:
 """
 import json
 import os
+import queue
 import signal
 import shutil
 import socket
@@ -68,6 +69,7 @@ COHERE_SWIFT_4BIT_MODEL_ID = os.getenv(
     "beshkenadze/cohere-transcribe-03-2026-mlx-4bit",
 )
 COHERE_SWIFT_STT_BIN = os.getenv("VOICE_TRANSCRIBE_SWIFT_STT_BIN", "")
+COHERE_SWIFT_STT_SERVER_BIN = os.getenv("VOICE_TRANSCRIBE_SWIFT_STT_SERVER_BIN", "")
 GRANITE_CRISPASR_BACKEND = os.getenv("VOICE_TRANSCRIBE_GRANITE_BACKEND", "granite-4.1-nar")
 GRANITE_CRISPASR_MODEL = os.getenv("VOICE_TRANSCRIBE_GRANITE_MODEL", "auto")
 GRANITE_CRISPASR_LANGUAGE = os.getenv("VOICE_TRANSCRIBE_GRANITE_LANGUAGE", "en")
@@ -288,6 +290,18 @@ def _find_swift_stt_bin():
         COHERE_SWIFT_STT_BIN,
         str(REPO_DIR / ".swift-runtime" / "Release" / "mlx-audio-swift-stt"),
         shutil.which("mlx-audio-swift-stt"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _find_swift_stt_server_bin():
+    candidates = [
+        COHERE_SWIFT_STT_SERVER_BIN,
+        str(REPO_DIR / ".swift-runtime" / "Release" / "mlx-audio-swift-stt-server"),
+        shutil.which("mlx-audio-swift-stt-server"),
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -655,6 +669,131 @@ class GraniteCrispasrServer:
                 pass
 
 
+class CohereSwiftSttServer:
+    """Resident mlx-audio-swift STT process for the 4-bit Cohere checkpoint."""
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.bin_path = None
+        self.output_queue = queue.Queue()
+
+    def ensure_started(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+
+        server_bin = _find_swift_stt_server_bin()
+        if server_bin is None:
+            raise RuntimeError(
+                "Cohere Swift 4-bit server is selected, but "
+                "mlx-audio-swift-stt-server is not installed. "
+                "Run scripts/install_mlx_audio_swift.sh or set VOICE_TRANSCRIBE_SWIFT_STT_SERVER_BIN."
+            )
+
+        self.bin_path = server_bin
+        self.proc = subprocess.Popen(
+            [
+                server_bin,
+                "--model",
+                COHERE_SWIFT_4BIT_MODEL_ID,
+                "--language",
+                "English",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.output_queue = queue.Queue()
+        threading.Thread(target=self._stdout_reader, daemon=True).start()
+        deadline = time.time() + TRANSCRIBE_TIMEOUT
+        while time.time() < deadline:
+            payload = self._read_json_line(deadline=deadline)
+            if payload.get("event") == "ready":
+                print(
+                    f"Transcription worker: Cohere Swift 4-bit server ready "
+                    f"(pid={self.proc.pid}, bin={server_bin})",
+                    flush=True,
+                )
+                return
+            if payload.get("ok") is False:
+                raise RuntimeError(payload.get("error") or "Cohere Swift 4-bit server failed to start")
+
+        raise RuntimeError("Cohere Swift 4-bit server did not become ready before timeout")
+
+    def _stdout_reader(self):
+        try:
+            if self.proc is None or self.proc.stdout is None:
+                return
+            for line in self.proc.stdout:
+                self.output_queue.put(line)
+        except Exception as exc:
+            self.output_queue.put(json.dumps({"ok": False, "error": f"stdout reader failed: {exc}"}) + "\n")
+
+    def _read_json_line(self, deadline, expected_id=None):
+        if self.proc is None:
+            raise RuntimeError("Cohere Swift 4-bit server is not running")
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"Cohere Swift 4-bit server exited with code {self.proc.returncode}")
+            timeout = max(0.05, min(0.5, deadline - time.time()))
+            try:
+                line = self.output_queue.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                # mlx-audio-swift currently prints cache/download status on stdout.
+                print(f"Transcription worker: Cohere Swift server: {line[:240]}", flush=True)
+                continue
+            if expected_id is not None and payload.get("id") not in {expected_id, None}:
+                continue
+            return payload
+        raise TimeoutError("Timed out waiting for Cohere Swift 4-bit server response")
+
+    def transcribe(self, wav_path, screen_context=""):
+        if screen_context:
+            print(
+                "Transcription worker: Cohere Swift 4-bit does not accept decoder context yet; ignoring context.",
+                flush=True,
+            )
+        with self.lock:
+            self.ensure_started()
+            request_id = uuid.uuid4().hex
+            payload = {
+                "id": request_id,
+                "audio": str(wav_path),
+                "language": "English",
+            }
+            assert self.proc is not None and self.proc.stdin is not None
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
+            response = self._read_json_line(
+                deadline=time.time() + TRANSCRIBE_TIMEOUT,
+                expected_id=request_id,
+            )
+            if not response.get("ok"):
+                raise RuntimeError(response.get("error") or "Cohere Swift 4-bit server transcription failed")
+            return str(response.get("text") or "").strip()
+
+    def stop(self):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
 def run(request_pipe, result_pipe):
     """Receive requests via request_pipe, send results via result_pipe."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -675,6 +814,7 @@ def run(request_pipe, result_pipe):
     cohere_model = None
     cohere_prompt_cache = {}
     cohere_mlx_model = None
+    cohere_swift_server = CohereSwiftSttServer()
     granite_server = GraniteCrispasrServer() if GRANITE_USE_SERVER else None
 
     # Persistent silent WAV for pre-warm + keep-warm (written once, reused forever)
@@ -907,6 +1047,7 @@ def run(request_pipe, result_pipe):
         if request == "__quit__":
             if granite_server is not None:
                 granite_server.stop()
+            cohere_swift_server.stop()
             break
 
         # On-demand warm signal: main app sends this when user presses the Fn key
@@ -916,12 +1057,13 @@ def run(request_pipe, result_pipe):
         if isinstance(request, dict) and request.get("__warm__"):
             warm_model_mode = request.get("model_mode", "cohere")
             if warm_model_mode == "cohere-swift-4bit":
-                if _find_swift_stt_bin() is None:
-                    print(
-                        "Transcription worker: Cohere Swift 4-bit warm skipped; "
-                        "mlx-audio-swift-stt is not installed.",
-                        flush=True,
-                    )
+                def _warm_swift_server():
+                    try:
+                        cohere_swift_server.ensure_started()
+                    except Exception as exc:
+                        print(f"Transcription worker: Cohere Swift 4-bit warm failed: {exc}", flush=True)
+
+                threading.Thread(target=_warm_swift_server, daemon=True).start()
                 continue
             if warm_model_mode == "granite" and granite_server is not None:
                 def _warm_granite():
@@ -1009,7 +1151,7 @@ def run(request_pipe, result_pipe):
                     last_any_inference_at[0] = now
             elif model_mode == "cohere-swift-4bit":
                 with inference_lock:
-                    text = _transcribe_cohere_swift_4bit(
+                    text = cohere_swift_server.transcribe(
                         wav_path,
                         screen_context=screen_context,
                     )
