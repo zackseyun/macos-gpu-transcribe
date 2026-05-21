@@ -92,10 +92,15 @@ class MainWindowController(NSObject):
         self._history_source = None
         self._refresh_timer = None
         self._last_history_len = -1
+        self._reopen_on_activation = False
         return self
 
     def attachApp_(self, app):  # noqa: N802
         self._app = app
+
+    def setReopenOnActivation_(self, enabled):  # noqa: N802
+        """Reopen on app activation only for explicit Dock-style launches."""
+        self._reopen_on_activation = bool(enabled)
 
     # ── Building ──
 
@@ -218,9 +223,9 @@ class MainWindowController(NSObject):
             self._refresh_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.25, self, b"refreshTick:", None, True
             )
-        # First time: observe app activation so clicking the Dock icon reopens
-        # this window if the user closed it.
-        if not getattr(self, "_did_observe_activation", False):
+        # Only Dock-style launches should reopen the window on app activation.
+        # In the default menu-bar mode, clicking the status item must stay quiet.
+        if self._reopen_on_activation and not getattr(self, "_did_observe_activation", False):
             from Foundation import NSNotificationCenter
             NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
                 self, b"appDidBecomeActive:", "NSApplicationDidBecomeActiveNotification", None

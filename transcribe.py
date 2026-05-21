@@ -28,6 +28,7 @@ import queue
 import re
 import shutil
 import shlex
+import sys
 import threading
 import subprocess
 import tempfile
@@ -82,6 +83,10 @@ THERMAL_ICON_SUFFIX = {
 TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
 PASTEBOARD_PRE_PASTE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY", "0.03"))
 PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "0.10"))
+PASTEBOARD_RESTORE_ASYNC = os.getenv(
+    "VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
+IN_MEMORY_AUDIO_MAX_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_IN_MEMORY_AUDIO_MAX_SECONDS", "90"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
     os.getenv("VOICE_TRANSCRIBE_SCREEN_PREFETCH_INTERVAL_SECONDS", "5")
 )
@@ -215,6 +220,30 @@ def _env_flag_value(raw, default=False):
 
 def _env_flag(name, default=False):
     return _env_flag_value(os.getenv(name), default=default)
+
+
+def _argv_has_flag(flag, argv=None):
+    if argv is None:
+        argv = sys.argv
+    return flag in list(argv or [])
+
+
+def _should_show_main_window_on_launch(argv=None, environ=None):
+    """Default to a quiet menu-bar launch; show the window only on request."""
+    if environ is None:
+        environ = os.environ
+    return _env_flag_value(
+        environ.get("VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH"), default=False
+    ) or _argv_has_flag("--show-window", argv)
+
+
+def _should_show_dock_icon(argv=None, environ=None):
+    """Keep the app out of the Dock/⌘-Tab unless explicitly requested."""
+    if environ is None:
+        environ = os.environ
+    return _env_flag_value(
+        environ.get("VOICE_TRANSCRIBE_SHOW_DOCK_ICON"), default=False
+    ) or _argv_has_flag("--show-dock", argv)
 
 
 def _parse_input_volume_osascript_output(output):
@@ -434,6 +463,22 @@ def _parse_pmset_battery_output(output):
     return {"source": source, "percent": percent}
 
 
+def _should_send_audio_in_memory(model_mode, duration_seconds):
+    """Avoid temp WAV write/read loops for ASR paths that accept raw audio."""
+    if model_mode == "granite":
+        return False
+    return float(duration_seconds or 0.0) <= IN_MEMORY_AUDIO_MAX_SECONDS
+
+
+def _write_wav_file(audio, wav_path):
+    """Write 16 kHz mono float audio to a 16-bit WAV file."""
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+
 def _device_name_matches(device, preferred):
     if not preferred:
         return False
@@ -622,9 +667,11 @@ class VoiceTranscribeApp(rumps.App):
         self._hud = get_hud_controller()
         self._main_window = get_main_window_controller()
         self._main_window.attachApp_(self)
+        self._main_window.setReopenOnActivation_(_should_show_dock_icon())
         self._hud_level_peak = 0.0
         self._sound_cache = {}
         self._main_window_shown_once = False
+        self._show_main_window_on_launch = _should_show_main_window_on_launch()
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
         self._model_warmed = self._new_model_warm_state()
@@ -1001,8 +1048,9 @@ class VoiceTranscribeApp(rumps.App):
             elapsed = time.time() - self._recording_start_time
             self.title = f"🔴 {elapsed:.0f}s"
 
-        # Open main window once the runloop is live (can't call before .run()).
-        if not self._main_window_shown_once:
+        # Quiet by default: keep this as a menu-bar utility unless explicitly
+        # launched with --show-window or VOICE_TRANSCRIBE_SHOW_WINDOW_ON_LAUNCH=1.
+        if self._show_main_window_on_launch and not self._main_window_shown_once:
             self._main_window_shown_once = True
             try:
                 self._main_window.showWindow()
@@ -1839,19 +1887,17 @@ class VoiceTranscribeApp(rumps.App):
                 self._set_title(self._idle_icon_with_thermal())
                 return
 
-            qwen_audio = None
-            if model_mode == "cohere" or model_mode == "granite":
-                wav_path = tempfile.mktemp(suffix=".wav")
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(CHANNELS)
-                    wf.setsampwidth(2)
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes((audio * 32767).astype(np.int16).tobytes())
-                self._save_last_recording(wav_path)
+            worker_audio = None
+            if _should_send_audio_in_memory(model_mode, duration):
+                # Cohere and Qwen can consume the already-normalized 16 kHz
+                # float32 buffer directly. This skips the temp WAV write,
+                # worker-side WAV decode, and an extra last_recording copy.
+                worker_audio = (audio.astype(np.float32, copy=False), SAMPLE_RATE)
+                self._save_last_recording_audio(audio)
             else:
-                # Qwen MLX accepts in-memory 16 kHz float32 audio. This avoids a
-                # temp WAV write plus a second decode/resample pass in the worker.
-                qwen_audio = (audio.astype(np.float32, copy=False), SAMPLE_RATE)
+                wav_path = tempfile.mktemp(suffix=".wav")
+                _write_wav_file(audio, wav_path)
+                self._save_last_recording(wav_path)
             latency["prep"] = time.perf_counter() - prep_t0
 
             if self.screen_context_enabled:
@@ -1901,7 +1947,7 @@ class VoiceTranscribeApp(rumps.App):
                 wav_path,
                 model_mode,
                 screen_context=screen_context,
-                audio=qwen_audio,
+                audio=worker_audio,
             )
             latency["asr_wall"] = time.perf_counter() - asr_t0
 
@@ -1934,12 +1980,12 @@ class VoiceTranscribeApp(rumps.App):
                         result = fallback
                         model_mode = "cohere"
                     else:
-                        self._preserve_failed_recording(wav_path, "granite_error")
+                        self._preserve_current_recording(wav_path, audio, "granite_error")
                         if fallback is None:
                             raise Exception(result["error"])
                         raise Exception(fallback.get("error") or result["error"])
                 else:
-                    self._preserve_failed_recording(wav_path, "error")
+                    self._preserve_current_recording(wav_path, audio, "error")
                     raise Exception(result["error"])
 
             # Model produced a result → it's warm now. Subsequent HUDs show
@@ -1971,11 +2017,11 @@ class VoiceTranscribeApp(rumps.App):
                         text = fallback.get("text", "")
                         transcribe_time = fallback.get("time", 0)
                     else:
-                        self._preserve_failed_recording(wav_path, "empty")
+                        self._preserve_current_recording(wav_path, audio, "empty")
                         print("No speech detected.", flush=True)
                         return
                 if not text:
-                    self._preserve_failed_recording(wav_path, "empty")
+                    self._preserve_current_recording(wav_path, audio, "empty")
                     print("No speech detected.", flush=True)
                     return
 
@@ -2010,11 +2056,11 @@ class VoiceTranscribeApp(rumps.App):
                     transcribe_time = fallback.get("time", 0)
                     normalized = text.strip().lower().rstrip(".!?,;: ").strip()
                 else:
-                    self._preserve_failed_recording(wav_path, "granite_hallucination")
+                    self._preserve_current_recording(wav_path, audio, "granite_hallucination")
                     return
 
             if not text:
-                self._preserve_failed_recording(wav_path, "empty")
+                self._preserve_current_recording(wav_path, audio, "empty")
                 print("No speech detected.", flush=True)
                 return
 
@@ -2023,7 +2069,7 @@ class VoiceTranscribeApp(rumps.App):
                     f"Dropping ASR hallucination on low-content audio: {text!r}",
                     flush=True,
                 )
-                self._preserve_failed_recording(wav_path, "hallucination")
+                self._preserve_current_recording(wav_path, audio, "hallucination")
                 return
 
             format_t0 = time.perf_counter()
@@ -2090,7 +2136,6 @@ class VoiceTranscribeApp(rumps.App):
 
         # Save current clipboard contents
         old_contents = pb.stringForType_(NSPasteboardTypeString)
-        old_change_count = pb.changeCount()
 
         # Set clipboard to transcription and paste
         pb.clearContents()
@@ -2106,11 +2151,20 @@ class VoiceTranscribeApp(rumps.App):
         CGEventPost(0, key_down)
         CGEventPost(0, key_up)
 
-        # Wait for paste to complete, then restore original clipboard
-        time.sleep(PASTEBOARD_RESTORE_DELAY)
-        if old_contents is not None:
-            pb.clearContents()
-            pb.setString_forType_(old_contents, NSPasteboardTypeString)
+        def _restore_clipboard():
+            # Wait for paste to complete, then restore original clipboard. By
+            # default this runs after _paste_text returns, shaving ~100ms off
+            # the dictation completion path without changing clipboard safety.
+            time.sleep(PASTEBOARD_RESTORE_DELAY)
+            if old_contents is not None:
+                restore_pb = NSPasteboard.generalPasteboard()
+                restore_pb.clearContents()
+                restore_pb.setString_forType_(old_contents, NSPasteboardTypeString)
+
+        if PASTEBOARD_RESTORE_ASYNC:
+            threading.Thread(target=_restore_clipboard, daemon=True).start()
+        else:
+            _restore_clipboard()
 
     def _save_last_recording(self, wav_path):
         """Keep a copy of the latest recording for manual recovery/debugging."""
@@ -2118,6 +2172,27 @@ class VoiceTranscribeApp(rumps.App):
             shutil.copy2(wav_path, LAST_RECORDING_FILE)
         except Exception as exc:
             print(f"Failed to save last recording: {exc}", flush=True)
+
+    def _save_last_recording_audio(self, audio):
+        """Keep the latest recording without creating a second temp WAV first."""
+        try:
+            _write_wav_file(audio, LAST_RECORDING_FILE)
+        except Exception as exc:
+            print(f"Failed to save last recording: {exc}", flush=True)
+
+    def _preserve_current_recording(self, wav_path, audio, reason):
+        if wav_path and os.path.exists(wav_path):
+            return self._preserve_failed_recording(wav_path, reason)
+        try:
+            FAILED_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest = FAILED_RECORDINGS_DIR / f"{stamp}-{reason}.wav"
+            _write_wav_file(audio, dest)
+            print(f"Preserved failed recording: {dest}", flush=True)
+            return dest
+        except Exception as exc:
+            print(f"Failed to preserve failed recording: {exc}", flush=True)
+            return None
 
     def _preserve_failed_recording(self, wav_path, reason):
         """Archive a failed recording before temp cleanup so audio is recoverable."""
@@ -2272,7 +2347,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.clear()
 
-        self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
+        self.menu.add(rumps.MenuItem("Open Settings Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem(
             f"Fn = {self._model_display_name(self.default_model_mode)}",
@@ -2414,9 +2489,20 @@ if __name__ == "__main__":
     lock_handle.write(str(os.getpid()))
     lock_handle.flush()
 
-    # Regular app: shows in Dock, appears in ⌘-Tab. Also keeps the menu bar icon.
-    from AppKit import NSApplication, NSApplicationActivationPolicyRegular
-    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    # Default to a subtle menu-bar utility: no Dock icon, no ⌘-Tab entry, and no
+    # launch window. Use --show-dock or VOICE_TRANSCRIBE_SHOW_DOCK_ICON=1 for an
+    # explicit regular-app/debug launch.
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSApplicationActivationPolicyRegular,
+    )
+    activation_policy = (
+        NSApplicationActivationPolicyRegular
+        if _should_show_dock_icon()
+        else NSApplicationActivationPolicyAccessory
+    )
+    NSApplication.sharedApplication().setActivationPolicy_(activation_policy)
 
     parent_conn, child_conn = multiprocessing.Pipe()
     monitor = multiprocessing.Process(target=key_monitor.run, args=(child_conn,), daemon=True)

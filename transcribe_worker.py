@@ -147,14 +147,33 @@ def _build_cohere_decoder_prompt_ids(processor, screen_context):
     return torch.tensor([custom_prompt_ids], dtype=torch.long)
 
 
-def _transcribe_cohere(wav_path, processor, model, screen_context=""):
+def _cohere_audio_from_input(audio_input):
+    if isinstance(audio_input, (tuple, list)) and len(audio_input) == 2:
+        audio, sample_rate = audio_input
+        if int(sample_rate) != 16000:
+            raise ValueError(f"Expected 16 kHz audio, got {sample_rate} Hz")
+        return audio
+    if not isinstance(audio_input, (str, os.PathLike)):
+        return audio_input
+
+    from transformers.audio_utils import load_audio
+    return load_audio(audio_input, sampling_rate=16000)
+
+
+def _transcribe_cohere(audio_input, processor, model, screen_context="", prompt_cache=None):
     """Transcribe using Cohere via PyTorch MPS."""
     import torch
-    from transformers.audio_utils import load_audio
 
-    audio = load_audio(wav_path, sampling_rate=16000)
+    audio = _cohere_audio_from_input(audio_input)
     inputs = processor(audio, sampling_rate=16000, return_tensors="pt", language="en")
-    custom_prompt_ids = _build_cohere_decoder_prompt_ids(processor, screen_context)
+    prompt_key = screen_context or ""
+    custom_prompt_ids = None
+    if prompt_cache is not None:
+        custom_prompt_ids = prompt_cache.get(prompt_key)
+    if custom_prompt_ids is None:
+        custom_prompt_ids = _build_cohere_decoder_prompt_ids(processor, screen_context)
+        if prompt_cache is not None:
+            prompt_cache[prompt_key] = custom_prompt_ids
     batch_size = inputs["input_features"].shape[0]
     if batch_size > 1:
         custom_prompt_ids = custom_prompt_ids.repeat(batch_size, 1)
@@ -162,7 +181,7 @@ def _transcribe_cohere(wav_path, processor, model, screen_context=""):
     inputs["decoder_attention_mask"] = torch.ones_like(custom_prompt_ids)
     inputs = inputs.to(model.device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_new_tokens=512,
@@ -530,6 +549,7 @@ def run(request_pipe, result_pipe):
     qwen3_loaded_models = set()
     cohere_processor = None
     cohere_model = None
+    cohere_prompt_cache = {}
     granite_server = GraniteCrispasrServer() if GRANITE_USE_SERVER else None
 
     # Persistent silent WAV for pre-warm + keep-warm (written once, reused forever)
@@ -639,7 +659,11 @@ def run(request_pipe, result_pipe):
         try:
             t0 = time.time()
             _transcribe_cohere(
-                warm_wav_path, cohere_processor, cohere_model, screen_context=""
+                warm_wav_path,
+                cohere_processor,
+                cohere_model,
+                screen_context="",
+                prompt_cache=cohere_prompt_cache,
             )
             last_any_inference_at[0] = time.time()
             dt = time.time() - t0
@@ -787,10 +811,11 @@ def run(request_pipe, result_pipe):
 
                 with inference_lock:
                     text = _transcribe_cohere(
-                        wav_path,
+                        audio_input if audio_input is not None else wav_path,
                         cohere_processor,
                         cohere_model,
                         screen_context=screen_context,
+                        prompt_cache=cohere_prompt_cache,
                     )
                     now = time.time()
                     last_real_inference_at[0] = now
