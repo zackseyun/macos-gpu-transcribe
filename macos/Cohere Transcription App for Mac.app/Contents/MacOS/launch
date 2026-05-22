@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESOURCE_DIR="$APP_DIR/Resources"
+REPO_DIR="${VOICE_TRANSCRIBE_REPO_DIR:-}"
+
+if [[ -z "$REPO_DIR" && -f "$RESOURCE_DIR/repo-dir" ]]; then
+  REPO_DIR="$(cat "$RESOURCE_DIR/repo-dir")"
+fi
+
+# If the .app is being run directly from the repository checkout, infer the repo
+# root from macos/Cohere Transcription App for Mac.app/Contents/MacOS/launch.
+if [[ -z "$REPO_DIR" ]]; then
+  CANDIDATE="$(cd "$APP_DIR/../../.." && pwd)"
+  if [[ -f "$CANDIDATE/transcribe.py" && -x "$CANDIDATE/run.sh" ]]; then
+    REPO_DIR="$CANDIDATE"
+  fi
+fi
+
+# Zack's installed path fallback. The installer writes Resources/repo-dir, so
+# this is only for legacy/manual copies of the app bundle.
+if [[ -z "$REPO_DIR" && -x "/Users/zackseyun/voice-transcribe/run.sh" ]]; then
+  REPO_DIR="/Users/zackseyun/voice-transcribe"
+fi
+
+if [[ -z "$REPO_DIR" || ! -x "$REPO_DIR/run.sh" ]]; then
+  echo "Voice Transcribe repo not found. Set VOICE_TRANSCRIBE_REPO_DIR or run install.sh." >&2
+  exit 1
+fi
+
+exec "$REPO_DIR/run.sh" >> /tmp/voice-transcribe.log 2>&1

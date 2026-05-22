@@ -82,7 +82,7 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
                                                          └──────────────────┘
 ```
 
-**App shell note.** This repo does not currently ship a separate Swift `.app` bundle. The installed Mac app is the Python/AppKit/rumps menu bar app launched by `com.zack.voice-transcribe`; the native Swift piece is the bundled MLX STT helper/server built from `scripts/swift/` into the ignored local `.swift-runtime/` directory.
+**Mac app note.** This repo now includes the installable menu bar app bundle at `macos/Cohere Transcription App for Mac.app`. It is a thin macOS `.app` wrapper around the Python/AppKit/rumps app shell, launched by `com.zack.voice-transcribe`. The native Swift piece is the bundled MLX STT helper/server built from `scripts/swift/` into the ignored local `.swift-runtime/` directory.
 
 **Three processes, three reasons:**
 
@@ -135,7 +135,7 @@ The installer will:
 7. Auto-configure `run.sh` for your machine.
 8. Write local `settings.json` with `default_model_mode: cohere-swift-4bit`.
 9. Walk you through the required macOS permissions.
-10. Install and start `com.zack.voice-transcribe` as a login menu bar app.
+10. Copy `macos/Cohere Transcription App for Mac.app` into `~/Applications/` and start it with `com.zack.voice-transcribe`.
 
 ### Manual
 
@@ -174,7 +174,7 @@ python -c "from huggingface_hub import login; login()"
 
 ### Run
 
-`./install.sh` installs Voice Transcribe as a login menu bar app via `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so it starts automatically after install and at login.
+`./install.sh` copies `macos/Cohere Transcription App for Mac.app` into `~/Applications/` and installs `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so the menu bar app starts automatically after install and at login.
 
 ```bash
 # restart the installed menu bar app
@@ -249,6 +249,7 @@ macos-gpu-transcribe/
 ├── screen_context.py      # Optional frontmost-window screenshot + OCR
 ├── format_text.py         # Post-processing — numbers, currency, percentages
 ├── install.sh             # Install wizard + login menu bar app installer
+├── macos/Cohere Transcription App for Mac.app # Thin macOS app wrapper checked into git
 ├── scripts/install_mlx_audio_swift.sh # Builds the native Swift MLX STT helper/server
 ├── scripts/quantize_qwen3_asr.py # Optional local 4-bit Qwen checkpoint builder
 ├── run.sh                 # Launcher

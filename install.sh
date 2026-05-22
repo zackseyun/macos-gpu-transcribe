@@ -222,6 +222,15 @@ read -rp "Press Enter once you've granted those permissions..."
 
 # ── 12. Install menu bar app LaunchAgent ────────────────────────────────────
 step "Installing Voice Transcribe menu bar app"
+APP_TEMPLATE="$REPO_DIR/macos/Cohere Transcription App for Mac.app"
+APP_DEST="$HOME/Applications/Cohere Transcription App for Mac.app"
+mkdir -p "$HOME/Applications"
+rm -rf "$APP_DEST"
+cp -R "$APP_TEMPLATE" "$APP_DEST"
+mkdir -p "$APP_DEST/Contents/Resources"
+printf "%s\n" "$REPO_DIR" > "$APP_DEST/Contents/Resources/repo-dir"
+chmod +x "$APP_DEST/Contents/MacOS/launch"
+
 VOICE_AGENT="$HOME/Library/LaunchAgents/com.zack.voice-transcribe.plist"
 cat > "$VOICE_AGENT" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -232,8 +241,7 @@ cat > "$VOICE_AGENT" << EOF
     <string>com.zack.voice-transcribe</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>${REPO_DIR}/run.sh</string>
+        <string>${APP_DEST}/Contents/MacOS/launch</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${REPO_DIR}</string>
@@ -258,7 +266,7 @@ EOF
 launchctl bootout "gui/$(id -u)" "$VOICE_AGENT" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$VOICE_AGENT" 2>/dev/null || launchctl load -w "$VOICE_AGENT"
 launchctl kickstart -k "gui/$(id -u)/com.zack.voice-transcribe" 2>/dev/null || true
-ok "Voice Transcribe installed as a login menu bar app"
+ok "Installed $APP_DEST and loaded com.zack.voice-transcribe"
 
 # ── 13. Done ────────────────────────────────────────────────────────────────
 echo ""
