@@ -222,8 +222,8 @@ read -rp "Press Enter once you've granted those permissions..."
 
 # ── 12. Install menu bar app LaunchAgent ────────────────────────────────────
 step "Installing Voice Transcribe menu bar app"
-APP_TEMPLATE="$REPO_DIR/macos/Cohere Transcription App for Mac.app"
-APP_DEST="$HOME/Applications/Cohere Transcription App for Mac.app"
+APP_TEMPLATE="$REPO_DIR/macos/Mac Transcribe App.app"
+APP_DEST="$HOME/Applications/Mac Transcribe App.app"
 mkdir -p "$HOME/Applications"
 rm -rf "$APP_DEST"
 cp -R "$APP_TEMPLATE" "$APP_DEST"

@@ -10,7 +10,7 @@ if [[ -z "$REPO_DIR" && -f "$RESOURCE_DIR/repo-dir" ]]; then
 fi
 
 # If the .app is being run directly from the repository checkout, infer the repo
-# root from macos/Cohere Transcription App for Mac.app/Contents/MacOS/launch.
+# root from macos/Mac Transcribe App.app/Contents/MacOS/launch.
 if [[ -z "$REPO_DIR" ]]; then
   CANDIDATE="$(cd "$APP_DIR/../../.." && pwd)"
   if [[ -f "$CANDIDATE/transcribe.py" && -x "$CANDIDATE/run.sh" ]]; then
