@@ -135,7 +135,7 @@ The installer will:
 7. Auto-configure `run.sh` for your machine.
 8. Write local `settings.json` with `default_model_mode: cohere-swift-4bit`.
 9. Walk you through the required macOS permissions.
-10. Copy `macos/Mac Transcribe App.app` into `~/Applications/` and start it with `com.zack.voice-transcribe`.
+10. Copy `macos/Mac Transcribe App.app` into `/Applications/` when writable, otherwise `~/Applications/`, and start it with `com.zack.voice-transcribe`.
 
 ### Manual
 
@@ -174,7 +174,7 @@ python -c "from huggingface_hub import login; login()"
 
 ### Run
 
-`./install.sh` copies `macos/Mac Transcribe App.app` into `~/Applications/` and installs `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so the menu bar app starts automatically after install and at login.
+`./install.sh` copies `macos/Mac Transcribe App.app` into `/Applications/` when possible, otherwise `~/Applications/`, and installs `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so the menu bar app starts automatically after install and at login. Installing into `/Applications/` gives Spotlight/Alfred the most reliable discovery path.
 
 ```bash
 # restart the installed menu bar app
