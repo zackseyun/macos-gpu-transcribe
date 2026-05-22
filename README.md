@@ -16,7 +16,7 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is the fastest day-to-day Fn dictation path. Cohere Transcribe MLX 8-bit remains available from the menu bar when you want the older steadier path, Cohere Swift 4-bit is available as an experimental tiny/fast path, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
+Everything runs on the GPU. The current default is **Cohere Swift 4-bit** because it is the best local balance we have found for Zack's Fn dictation: resident, Apple-native MLX/Metal, and usually faster than Cohere 8-bit Python MLX in live use. Qwen3-ASR 0.6B remains available from the menu bar as the lowest-latency alternate path, Cohere Transcribe MLX 8-bit remains the safer quality/compatibility fallback, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
@@ -29,9 +29,9 @@ Everything runs on the GPU. The current default is Qwen3-ASR 0.6B because it is 
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | Default selected in menu: Qwen3-ASR 0.6B fast path by default; [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) for comparison | 0.6B / 2B | Qwen via MLX (Metal); Cohere 8-bit via MLX (Metal); experimental Cohere 4-bit via MLX Swift (Metal); legacy Cohere PyTorch remains available; Granite via CrispASR/GGUF (Metal) | Qwen is the lowest-latency resident path; Cohere 4-bit Swift and Cohere 8-bit MLX are both very fast; Granite varies by warm/server state |
+| **Hold Fn** | Default selected in menu: Cohere Transcribe Swift 4-bit; Qwen3-ASR 0.6B, Cohere 8-bit, and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) remain available for comparison | 0.6B / 2B | Cohere 4-bit via MLX Swift (Metal); Cohere 8-bit via MLX (Metal); Qwen via MLX (Metal); legacy Cohere PyTorch remains available; Granite via CrispASR/GGUF (Metal) | Cohere 4-bit Swift is the current default; Qwen is still the lowest-latency alternate path; Granite varies by warm/server state |
 
-Qwen3-ASR is the default for Fn dictation now. Cohere stays one click away in the menu for comparison or when you prefer its wording. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere MLX is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
+Cohere Swift 4-bit is the default for Fn dictation now. Qwen stays one click away in the menu when you want the absolute fastest alternate path, and Cohere 8-bit stays available when you want the safer compatibility fallback. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere MLX is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -82,6 +82,8 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
                                                          └──────────────────┘
 ```
 
+**App shell note.** This repo does not currently ship a separate Swift `.app` bundle. The installed Mac app is the Python/AppKit/rumps menu bar app launched by `com.zack.voice-transcribe`; the native Swift piece is the bundled MLX STT helper/server built from `scripts/swift/` into the ignored local `.swift-runtime/` directory.
+
 **Three processes, three reasons:**
 
 1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
@@ -126,11 +128,14 @@ The installer will:
 
 1. Detect or install Python 3.13/3.14 via Homebrew.
 2. Create a `.venv` with all dependencies.
-3. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
+3. Build the native Swift MLX STT helper/server used by the default Cohere Swift 4-bit mode.
 4. Build CrispASR locally for the Granite Speech runtime.
-5. Prompt for your HuggingFace token (Cohere model is gated).
-6. Auto-configure `run.sh` for your machine.
-7. Walk you through the required macOS permissions.
+5. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
+6. Prompt for your HuggingFace token (Cohere model is gated).
+7. Auto-configure `run.sh` for your machine.
+8. Write local `settings.json` with `default_model_mode: cohere-swift-4bit`.
+9. Walk you through the required macOS permissions.
+10. Install and start `com.zack.voice-transcribe` as a login menu bar app.
 
 ### Manual
 
@@ -169,12 +174,18 @@ python -c "from huggingface_hub import login; login()"
 
 ### Run
 
+`./install.sh` installs Voice Transcribe as a login menu bar app via `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so it starts automatically after install and at login.
+
 ```bash
+# restart the installed menu bar app
+launchctl kickstart -k gui/$(id -u)/com.zack.voice-transcribe
+
+# or launch directly for debugging
 ./run.sh
-# or directly:
 ./.venv/bin/python3 ./transcribe.py
-# background with logs:
-nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
+
+# logs
+tail -f /tmp/voice-transcribe.log
 ```
 
 ### Environment variables
@@ -237,7 +248,8 @@ macos-gpu-transcribe/
 ├── main_window.py         # Main app window (status, settings, history)
 ├── screen_context.py      # Optional frontmost-window screenshot + OCR
 ├── format_text.py         # Post-processing — numbers, currency, percentages
-├── install.sh             # Install wizard
+├── install.sh             # Install wizard + login menu bar app installer
+├── scripts/install_mlx_audio_swift.sh # Builds the native Swift MLX STT helper/server
 ├── scripts/quantize_qwen3_asr.py # Optional local 4-bit Qwen checkpoint builder
 ├── run.sh                 # Launcher
 ├── requirements.txt       # pip dependencies

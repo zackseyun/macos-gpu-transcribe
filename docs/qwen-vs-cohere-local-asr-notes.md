@@ -4,13 +4,14 @@ Date: 2026-05-21
 
 ## Practical finding
 
-For the Mac push-to-talk dictation path, the local Qwen3-ASR fast path is the default because it is materially faster than Cohere while remaining good enough for day-to-day dictation.
+For the Mac push-to-talk dictation path, Qwen3-ASR remains the lowest-latency alternate path, but the current default on Zack's Mac is Cohere Swift 4-bit resident because it has been the best balance of Cohere wording/quality and local speed after warmup fixes.
 
 Current local app setup:
 
-- Fast/default: Qwen3-ASR 0.6B via MLX/Metal
-- Local checkpoint: `models/qwen3-asr-0.6b-4bit` (~509 MB, ignored by git)
-- Fallback/comparison: Cohere Transcribe 2B via PyTorch/MPS
+- Default: Cohere Transcribe Swift 4-bit resident via MLX/Metal
+- Fast alternate: Qwen3-ASR 0.6B via MLX/Metal
+- Local Qwen checkpoint: `models/qwen3-asr-0.6b-4bit` (~509 MB, ignored by git)
+- Fallback/comparison: Cohere Transcribe MLX 8-bit via `mlx-speech`, plus legacy Cohere PyTorch/MPS
 
 ## Local latency evidence
 

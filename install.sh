@@ -85,7 +85,20 @@ ok "Base dependencies installed"
 "$PIP" install --quiet transformers torch librosa accelerate
 ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
 
-# ── 5. CrispASR runtime for Granite Speech ─────────────────────────────────
+# ── 5. Native Swift MLX runtime for Cohere 4-bit ───────────────────────────
+step "Installing native Swift MLX runtime for Cohere 4-bit"
+SWIFT_STT_SERVER="$REPO_DIR/.swift-runtime/Release/mlx-audio-swift-stt-server"
+if [[ -x "$SWIFT_STT_SERVER" ]]; then
+  ok "Swift STT server already built at $SWIFT_STT_SERVER"
+else
+  if ./scripts/install_mlx_audio_swift.sh; then
+    ok "Swift STT server built at $SWIFT_STT_SERVER"
+  else
+    warn "Swift STT build failed. The menu bar app will still install, but Cohere Swift 4-bit will not work until you rerun scripts/install_mlx_audio_swift.sh."
+  fi
+fi
+
+# ── 6. CrispASR runtime for Granite Speech ─────────────────────────────────
 step "Installing CrispASR runtime for Granite Speech"
 CRISP_DIR="$REPO_DIR/.crispasr"
 CRISP_BIN="$CRISP_DIR/build/bin/crispasr"
@@ -115,7 +128,7 @@ else
   fi
 fi
 
-# ── 6. Disable Right Option key (system-wide HID remap) ─────────────────────
+# ── 7. Disable Right Option key (system-wide HID remap) ─────────────────────
 step "Disabling Right Option key (HID-level remap)"
 # Right Option used to be a second hotkey, but it kept leaking stray special
 # characters (®, ¥, etc.) into focused fields when held. Disabling it system-wide
@@ -126,7 +139,7 @@ launchctl unload "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 launchctl load -w "$HOME/Library/LaunchAgents/com.local.DisableRightOption.plist"
 ok "Right Option disabled (LaunchAgent loaded)"
 
-# ── 7. HuggingFace login (Cohere model is gated) ────────────────────────────
+# ── 8. HuggingFace login (Cohere model is gated) ────────────────────────────
 step "HuggingFace authentication (required for Cohere Transcribe model)"
 echo "The Cohere Transcribe model is gated."
 echo "You need a HuggingFace account with access granted at:"
@@ -147,7 +160,7 @@ else
   fi
 fi
 
-# ── 8. Update run.sh with correct paths ─────────────────────────────────────
+# ── 9. Update run.sh with correct paths ─────────────────────────────────────
 step "Configuring run.sh"
 cat > "$REPO_DIR/run.sh" << EOF
 #!/bin/bash
@@ -169,7 +182,28 @@ EOF
 chmod +x "$REPO_DIR/run.sh"
 ok "run.sh configured for this machine"
 
-# ── 9. macOS permissions reminder ───────────────────────────────────────────
+# ── 10. Set default model for this machine ──────────────────────────────────
+step "Configuring local app settings"
+"$VENV_PYTHON" - <<PY
+import json
+from pathlib import Path
+
+p = Path("$REPO_DIR/settings.json")
+data = {}
+if p.exists():
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        data = {}
+data.setdefault("screen_context_enabled", False)
+data.setdefault("sound_effects_enabled", True)
+data.setdefault("vocabulary", "")
+data["default_model_mode"] = "cohere-swift-4bit"
+p.write_text(json.dumps(data, indent=2) + "\\n")
+PY
+ok "Fn default set to Cohere Swift 4-bit in settings.json"
+
+# ── 11. macOS permissions reminder ──────────────────────────────────────────
 step "macOS permissions required (one-time)"
 echo ""
 echo -e "${BOLD}You must grant these permissions manually:${NC}"
@@ -186,15 +220,57 @@ echo "     → Click + and add the same Python.app"
 echo ""
 read -rp "Press Enter once you've granted those permissions..."
 
-# ── 10. Done ────────────────────────────────────────────────────────────────
+# ── 12. Install menu bar app LaunchAgent ────────────────────────────────────
+step "Installing Voice Transcribe menu bar app"
+VOICE_AGENT="$HOME/Library/LaunchAgents/com.zack.voice-transcribe.plist"
+cat > "$VOICE_AGENT" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zack.voice-transcribe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${REPO_DIR}/run.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${REPO_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/voice-transcribe.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/voice-transcribe.log</string>
+</dict>
+</plist>
+EOF
+launchctl bootout "gui/$(id -u)" "$VOICE_AGENT" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$VOICE_AGENT" 2>/dev/null || launchctl load -w "$VOICE_AGENT"
+launchctl kickstart -k "gui/$(id -u)/com.zack.voice-transcribe" 2>/dev/null || true
+ok "Voice Transcribe installed as a login menu bar app"
+
+# ── 13. Done ────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}✓ Installation complete!${NC}"
 echo ""
-echo "To launch:"
-echo "  ${REPO_DIR}/run.sh"
+echo "The menu bar app is installed and should start automatically at login."
 echo ""
-echo "To run in background:"
-echo "  nohup ${REPO_DIR}/run.sh > /tmp/voice-transcribe.log 2>&1 &"
+echo "To restart it manually:"
+echo "  launchctl kickstart -k gui/\$(id -u)/com.zack.voice-transcribe"
+echo ""
+echo "To launch directly:"
+echo "  ${REPO_DIR}/run.sh"
 echo ""
 echo "Usage:"
 echo "  Hold Fn  → record"
