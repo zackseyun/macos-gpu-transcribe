@@ -69,8 +69,8 @@ Do not fully rewrite the macOS app shell in Swift yet. The safest migration path
 
 ## Current app behavior
 
-- `cohere-swift-4bit`: Cohere Transcribe 4-bit via the resident Swift MLX server is the current default on this Mac.
-- `cohere`: Cohere Transcribe MLX 8-bit via `mlx-speech`.
+- `cohere`: Cohere Transcribe MLX 8-bit via `mlx-speech` is the current default on this Mac.
+- `cohere-swift-4bit`: Cohere Transcribe 4-bit via the resident Swift MLX server remains available for comparison.
 - `fast`: Qwen3-ASR 0.6B 4-bit via MLX remains available as the lowest-latency alternate path.
 - `cohere-pytorch`: legacy full 2B PyTorch/MPS Cohere fallback.
 - `granite`: Granite/CrispASR path unchanged.

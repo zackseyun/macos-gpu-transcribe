@@ -16,7 +16,7 @@ Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost 
 4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
 5. The transcription is pasted at your cursor via ⌘V.
 
-Everything runs on the GPU. The current default is **Cohere Swift 4-bit** because it is the best local balance we have found for Zack's Fn dictation: resident, Apple-native MLX/Metal, and usually faster than Cohere 8-bit Python MLX in live use. Qwen3-ASR 0.6B remains available from the menu bar as the lowest-latency alternate path, Cohere Transcribe MLX 8-bit remains the safer quality/compatibility fallback, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
+Everything runs on the GPU. The current default is **Cohere Transcribe MLX 8-bit** because Zack asked to move the Cohere path back from the earlier 4-bit Swift checkpoint to the 8-bit quantized MLX checkpoint. Qwen3-ASR 0.6B remains available from the menu bar as the lowest-latency alternate path, Cohere Swift 4-bit remains available as an optional comparison mode, and Granite Speech 4.1 NAR remains available for side-by-side comparisons; when selected, Granite resolves lazily and then stays resident in a local CrispASR server after the first warm/load so later Granite dictations do not reload the 3GB GGUF.
 
 ## Interface
 
@@ -29,9 +29,9 @@ Everything runs on the GPU. The current default is **Cohere Swift 4-bit** becaus
 
 | Key | Model | Parameters | Framework | Throughput (M4 Max) |
 |-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | Default selected in menu: Cohere Transcribe Swift 4-bit; Qwen3-ASR 0.6B, Cohere 8-bit, and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) remain available for comparison | 0.6B / 2B | Cohere 4-bit via MLX Swift (Metal); Cohere 8-bit via MLX (Metal); Qwen via MLX (Metal); legacy Cohere PyTorch remains available; Granite via CrispASR/GGUF (Metal) | Cohere 4-bit Swift is the current default; Qwen is still the lowest-latency alternate path; Granite varies by warm/server state |
+| **Hold Fn** | Default selected in menu: Cohere Transcribe MLX 8-bit; Qwen3-ASR 0.6B, Cohere Swift 4-bit, and [Granite Speech 4.1 NAR](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) remain available for comparison | 0.6B / 2B | Cohere 8-bit via MLX (Metal); Cohere 4-bit via MLX Swift (Metal); Qwen via MLX (Metal); legacy Cohere PyTorch remains available; Granite via CrispASR/GGUF (Metal) | Cohere 8-bit MLX is the current default; Qwen is still the lowest-latency alternate path; Granite varies by warm/server state |
 
-Cohere Swift 4-bit is the default for Fn dictation now. Qwen stays one click away in the menu when you want the absolute fastest alternate path, and Cohere 8-bit stays available when you want the safer compatibility fallback. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere MLX is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
+Cohere MLX 8-bit is the default for Fn dictation now. Qwen stays one click away in the menu when you want the absolute fastest alternate path, and Cohere Swift 4-bit stays available when you want the earlier resident 4-bit comparison path. The original Hugging Face PyTorch Granite path requires CUDA + `flash_attention_2`, so this Mac app runs Granite through CrispASR's GGUF runtime instead. Granite resolves the model lazily on first Granite dictation, then keeps it loaded in a persistent local server. Cohere MLX is also used as an automatic fallback for real-audio Granite failures; low-volume / no-speech clips now end immediately instead of paying the slow fallback cost.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -128,12 +128,12 @@ The installer will:
 
 1. Detect or install Python 3.13/3.14 via Homebrew.
 2. Create a `.venv` with all dependencies.
-3. Build the native Swift MLX STT helper/server used by the default Cohere Swift 4-bit mode.
+3. Build the native Swift MLX STT helper/server used by the optional Cohere Swift 4-bit mode.
 4. Build CrispASR locally for the Granite Speech runtime.
 5. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
 6. Prompt for your HuggingFace token (Cohere model is gated).
 7. Auto-configure `run.sh` for your machine.
-8. Write local `settings.json` with `default_model_mode: cohere-swift-4bit`.
+8. Write local `settings.json` with `default_model_mode: cohere`.
 9. Walk you through the required macOS permissions.
 10. Copy `macos/Mac Transcribe App.app` into `/Applications/` when writable, otherwise `~/Applications/`, and start it with `com.zack.voice-transcribe`.
 
@@ -289,11 +289,11 @@ MIT. See [`LICENSE`](LICENSE) if present; otherwise do whatever you want with it
 
 The default `cohere` menu option now uses `mlx-community/cohere-transcribe-03-2026-mlx-8bit` through `mlx-speech`/MLX instead of the older PyTorch/MPS path. The old full 2B PyTorch path is still available as `cohere-pytorch` in the menu, so we can revert behavior without reverting the repo. The experimental `cohere-swift-4bit` menu option uses the newer Swift runtime because the Python 4-bit path was the source of the earlier multilingual gibberish.
 
-Current local recommendation for Zack's Fn dictation is `cohere-swift-4bit`: the resident Swift MLX server has been the fastest Cohere path in repeated local tests, while the 8-bit Python MLX path remains the safer quality/compatibility fallback. The live machine setting is stored in ignored `settings.json`, so choose **Cohere Transcribe Swift 4-bit** from the menu, or set:
+Current local recommendation for Zack's Fn dictation is `cohere`: the 8-bit quantized MLX checkpoint is now the active Cohere default, while `cohere-swift-4bit` remains available from the menu for side-by-side comparison. The live machine setting is stored in ignored `settings.json`, so choose **Cohere Transcribe MLX 8-bit** from the menu, or set:
 
 ```json
 {
-  "default_model_mode": "cohere-swift-4bit"
+  "default_model_mode": "cohere"
 }
 ```
 

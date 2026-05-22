@@ -85,8 +85,8 @@ ok "Base dependencies installed"
 "$PIP" install --quiet transformers torch librosa accelerate
 ok "ML dependencies installed (transformers, torch, librosa, accelerate)"
 
-# ── 5. Native Swift MLX runtime for Cohere 4-bit ───────────────────────────
-step "Installing native Swift MLX runtime for Cohere 4-bit"
+# ── 5. Native Swift MLX runtime for optional Cohere 4-bit ───────────────────
+step "Installing native Swift MLX runtime for optional Cohere 4-bit"
 SWIFT_STT_SERVER="$REPO_DIR/.swift-runtime/Release/mlx-audio-swift-stt-server"
 if [[ -x "$SWIFT_STT_SERVER" ]]; then
   ok "Swift STT server already built at $SWIFT_STT_SERVER"
@@ -198,10 +198,10 @@ if p.exists():
 data.setdefault("screen_context_enabled", False)
 data.setdefault("sound_effects_enabled", True)
 data.setdefault("vocabulary", "")
-data["default_model_mode"] = "cohere-swift-4bit"
+data["default_model_mode"] = "cohere"
 p.write_text(json.dumps(data, indent=2) + "\\n")
 PY
-ok "Fn default set to Cohere Swift 4-bit in settings.json"
+ok "Fn default set to Cohere MLX 8-bit in settings.json"
 
 # ── 11. macOS permissions reminder ──────────────────────────────────────────
 step "macOS permissions required (one-time)"
