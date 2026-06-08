@@ -337,6 +337,12 @@ _BRAND_REPLACEMENTS = [
     (re.compile(r"\b(?:qin|quan|quen|quinn?|qwen)\s*(?:three|3)[\s-]*asr\b", re.IGNORECASE), "Qwen3-ASR"),
     (re.compile(r"\b(?:qin|quan|quen|quinn?|qwen)\s*(?:three|3)\b", re.IGNORECASE), "Qwen3"),
     (re.compile(r"\b(?:qin|quan|quen|quinn?|qwen)\b", re.IGNORECASE), "Qwen"),
+    # AI/video-generation product names that ASR often hears as ordinary words.
+    # Keep these deterministic because decoder prompts are not available in every
+    # local/GPU runtime path.
+    (re.compile(r"\b(?:c|sea|see|seed)\s*[- ]?dance\b", re.IGNORECASE), "Seedance"),
+    (re.compile(r"\bseeddance\b", re.IGNORECASE), "Seedance"),
+    (re.compile(r"\b(?:cling|clang|kling)\b", re.IGNORECASE), "Kling"),
     # Common Anthropic/AI brand mishearings
     (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
 ]

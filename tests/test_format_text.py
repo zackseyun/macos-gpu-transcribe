@@ -70,6 +70,25 @@ class BrandReplacementTest(unittest.TestCase):
             "Switch to Qwen3-ASR.",
         )
 
+    def test_corrects_video_model_names(self):
+        self.assertEqual(
+            format_transcription("compare c dance and cling for this video."),
+            "Compare Seedance and Kling for this video.",
+        )
+        self.assertEqual(
+            format_transcription("try sea dance after seeddance."),
+            "Try Seedance after Seedance.",
+        )
+        self.assertEqual(
+            format_transcription("try a different model like clang."),
+            "Try a different model like Kling.",
+        )
+        self.assertEqual(
+            format_transcription("seeddance and kling should be spelled correctly."),
+            "Seedance and Kling should be spelled correctly.",
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()
