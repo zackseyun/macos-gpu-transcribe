@@ -89,6 +89,41 @@ class BrandReplacementTest(unittest.TestCase):
         )
 
 
+class SpacingRepairTest(unittest.TestCase):
+    def test_repairs_missing_space_before_iphone(self):
+        self.assertEqual(
+            format_transcription("can you run Flutter run on myiPhone?"),
+            "Can you run Flutter run on my iPhone?",
+        )
+
+    def test_repairs_inserted_space_inside_iphone(self):
+        self.assertEqual(
+            format_transcription("can you run flutter run on my i phone?"),
+            "Can you run flutter run on my iPhone?",
+        )
+
+    def test_repairs_common_spaced_developer_terms(self):
+        self.assertEqual(
+            format_transcription("the swift ui x code code base was pre launched."),
+            "The SwiftUI Xcode codebase was pre-launch.",
+        )
+
+    def test_repairs_common_spaced_video_words(self):
+        self.assertEqual(
+            format_transcription("update the out ros because this got ner fed."),
+            "Update the outros because this got nerfed.",
+        )
+
+    def test_normalizes_spaced_ampm_only_after_time(self):
+        self.assertEqual(
+            format_transcription("make sure friday at 6 p. m. eastern is bigger."),
+            "Make sure friday at 6 p.m. eastern is bigger.",
+        )
+        self.assertEqual(
+            format_transcription("i am still working."),
+            "I am still working.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

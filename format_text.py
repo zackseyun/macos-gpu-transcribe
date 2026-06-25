@@ -299,6 +299,27 @@ def _normalize_dollars(text):
     return text
 
 
+def _normalize_ampm_spacing(text):
+    """Collapse ASR's spaced-out AM/PM forms.
+
+    The local models sometimes emit "6 p. m." or "6 P M" instead of "6 p.m.".
+    Keep this tied to a preceding numeric time so normal words like "I am" are
+    never touched.
+    """
+    def repl(match):
+        hour = match.group("hour")
+        minute = match.group("minute") or ""
+        meridiem = match.group("meridiem").lower()
+        return f"{hour}{minute} {meridiem}.m."
+
+    return re.sub(
+        r"\b(?P<hour>\d{1,2})(?P<minute>:\d{2})?\s+(?P<meridiem>[ap])\s*\.?\s*m\.?(?=\s|$|[,!?;:])",
+        repl,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _capitalize_first(text):
     """Ensure first character is capitalized."""
     if text and text[0].islower():
@@ -317,6 +338,18 @@ _DOM_SEP = r"(?:[\s,.]+(?:dot[\s,.]+)?)+"
 _CARTHA = r"(?:c|k)artha"
 
 _BRAND_REPLACEMENTS = [
+    # Developer/device terms where ASR frequently inserts or drops spaces.
+    # These are intentionally narrow and deterministic instead of using a broad
+    # compound-word joiner, because "wrong spaces" can also be real words.
+    (re.compile(r"\bmy\s*i\s*phone\b", re.IGNORECASE), "my iPhone"),
+    (re.compile(r"\bi\s+phone\b", re.IGNORECASE), "iPhone"),
+    (re.compile(r"\bswift\s*ui\b", re.IGNORECASE), "SwiftUI"),
+    (re.compile(r"\bx\s*code\b", re.IGNORECASE), "Xcode"),
+    (re.compile(r"\bout\s+ros\b", re.IGNORECASE), "outros"),
+    (re.compile(r"\bout\s+ro\b", re.IGNORECASE), "outro"),
+    (re.compile(r"\bcode\s+base\b", re.IGNORECASE), "codebase"),
+    (re.compile(r"\bpre\s+launch(?:ed)?\b", re.IGNORECASE), "pre-launch"),
+    (re.compile(r"\bner\s+fed\b", re.IGNORECASE), "nerfed"),
     # Homophones — case-normalize "cloud code" / "claude code" → "Claude Code"
     (re.compile(r"\b(?:cloud|claude)\s+code\b", re.IGNORECASE), "Claude Code"),
     # Cartha domain forms — tolerates Cohere's hard-C misspelling ("Kartha"),
@@ -432,6 +465,7 @@ def format_transcription(text):
     text = _convert_number_spans(text)        # "twenty five" → "25"
     text = _normalize_percentages(text)
     text = _normalize_dollars(text)
+    text = _normalize_ampm_spacing(text)      # "6 p. m." → "6 p.m."
     text = _apply_brand_replacements(text)    # "cloud code" → "Claude Code", etc.
     text = _capitalize_first(text)
 
