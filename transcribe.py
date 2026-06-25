@@ -83,9 +83,15 @@ THERMAL_ICON_SUFFIX = {
 TRANSCRIBE_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_TIMEOUT_SECONDS", "900"))
 PASTEBOARD_PRE_PASTE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY", "0.05"))
 PASTEBOARD_SET_TIMEOUT = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_SET_TIMEOUT", "0.20"))
-PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "0.35"))
+PASTEBOARD_RESTORE_DELAY = float(os.getenv("VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY", "3.0"))
 PASTEBOARD_RESTORE_ASYNC = os.getenv(
     "VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
+PASTEBOARD_RESTORE_REQUIRES_UNCHANGED = os.getenv(
+    "VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_REQUIRES_UNCHANGED", "true"
+).strip().lower() not in {"0", "false", "off", "no"}
+PASTEBOARD_ABORT_ON_UNCONFIRMED_SET = os.getenv(
+    "VOICE_TRANSCRIBE_PASTEBOARD_ABORT_ON_UNCONFIRMED_SET", "true"
 ).strip().lower() not in {"0", "false", "off", "no"}
 IN_MEMORY_AUDIO_MAX_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_IN_MEMORY_AUDIO_MAX_SECONDS", "90"))
 SCREEN_CONTEXT_PREFETCH_INTERVAL = float(
@@ -232,6 +238,32 @@ def _argv_has_flag(flag, argv=None):
     if argv is None:
         argv = sys.argv
     return flag in list(argv or [])
+
+
+def _should_restore_clipboard_after_paste(
+    *,
+    paste_generation,
+    current_generation,
+    current_contents,
+    expected_text,
+    old_contents,
+    require_unchanged=True,
+):
+    """Return True only when restoring cannot cause a stale/late paste.
+
+    Cmd+V is asynchronous from our process's point of view. Some focused apps
+    consume the pasteboard well after the key event is posted. Restoring the
+    previous clipboard too quickly can therefore make that slow app paste the
+    previous clipboard/transcription instead of the text this recording just
+    produced.
+    """
+    if old_contents is None:
+        return False
+    if paste_generation != current_generation:
+        return False
+    if require_unchanged and current_contents != expected_text:
+        return False
+    return True
 
 
 def _should_show_main_window_on_launch(argv=None, environ=None):
@@ -2163,8 +2195,10 @@ class VoiceTranscribeApp(rumps.App):
         """Paste text at cursor without clobbering the user's clipboard.
 
         Saves the current clipboard, pastes the transcription via Cmd+V,
-        then restores the original clipboard contents. The user's previous
-        copy is preserved — transcription just gets inserted inline.
+        then restores the original clipboard contents after a slow-target grace
+        window. The grace window is intentionally longer than a normal paste
+        because laggy frontmost apps can process Cmd+V late; restoring too early
+        makes those apps paste the previous clipboard/transcription instead.
         """
         from Quartz import (
             CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
@@ -2189,17 +2223,26 @@ class VoiceTranscribeApp(rumps.App):
             pb.clearContents()
             ok = pb.setString_forType_(text, NSPasteboardTypeString)
             deadline = time.perf_counter() + max(0.0, PASTEBOARD_SET_TIMEOUT)
-            while time.perf_counter() < deadline:
+            confirmed = pb.stringForType_(NSPasteboardTypeString) == text
+            while not confirmed and time.perf_counter() < deadline:
                 if pb.stringForType_(NSPasteboardTypeString) == text:
+                    confirmed = True
                     break
                 time.sleep(0.005)
-            else:
+            if not confirmed:
                 current = pb.stringForType_(NSPasteboardTypeString)
                 print(
                     "Pasteboard did not confirm transcription before paste "
                     f"(set_ok={ok}, current_len={len(current or '')}, expected_len={len(text)})",
                     flush=True,
                 )
+            if not confirmed and PASTEBOARD_ABORT_ON_UNCONFIRMED_SET:
+                print(
+                    "Skipping Cmd+V because pasteboard still contains different text; "
+                    "avoiding a stale paste.",
+                    flush=True,
+                )
+                return False
 
         time.sleep(PASTEBOARD_PRE_PASTE_DELAY)
 
@@ -2213,14 +2256,24 @@ class VoiceTranscribeApp(rumps.App):
 
         def _restore_clipboard():
             # Wait for paste to complete, then restore original clipboard. By
-            # default this runs after _paste_text returns, shaving ~100ms off
-            # the dictation completion path without changing clipboard safety.
+            # default this runs after _paste_text returns. The delay is long
+            # enough for laggy apps to consume Cmd+V before we put the previous
+            # clipboard back.
             time.sleep(PASTEBOARD_RESTORE_DELAY)
-            with self._paste_lock:
-                if paste_generation != self._paste_generation:
-                    return
             if old_contents is not None:
                 restore_pb = NSPasteboard.generalPasteboard()
+                current_contents = restore_pb.stringForType_(NSPasteboardTypeString)
+                with self._paste_lock:
+                    should_restore = _should_restore_clipboard_after_paste(
+                        paste_generation=paste_generation,
+                        current_generation=self._paste_generation,
+                        current_contents=current_contents,
+                        expected_text=text,
+                        old_contents=old_contents,
+                        require_unchanged=PASTEBOARD_RESTORE_REQUIRES_UNCHANGED,
+                    )
+                if not should_restore:
+                    return
                 restore_pb.clearContents()
                 restore_pb.setString_forType_(old_contents, NSPasteboardTypeString)
 
@@ -2228,6 +2281,7 @@ class VoiceTranscribeApp(rumps.App):
             threading.Thread(target=_restore_clipboard, daemon=True).start()
         else:
             _restore_clipboard()
+        return True
 
     def _save_last_recording(self, wav_path):
         """Keep a copy of the latest recording for manual recovery/debugging."""

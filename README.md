@@ -233,8 +233,10 @@ tail -f /tmp/voice-transcribe.log
 | `VOICE_TRANSCRIBE_IN_MEMORY_AUDIO_MAX_SECONDS` | `90` | Send Cohere/Qwen recordings up to this length directly to the worker, skipping temp WAV write/read overhead |
 | `VOICE_TRANSCRIBE_PASTEBOARD_PRE_PASTE_DELAY` | `0.05` | Small safety delay after writing the transcription pasteboard and before sending ⌘V |
 | `VOICE_TRANSCRIBE_PASTEBOARD_SET_TIMEOUT` | `0.20` | Max wait for AppKit to report that the pasteboard contains the new transcription before ⌘V |
-| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY` | `0.35` | How long to keep the transcription on the pasteboard before restoring the user's previous clipboard |
+| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_DELAY` | `3.0` | How long to keep the transcription on the pasteboard before restoring the user's previous clipboard; this guards laggy frontmost apps that process ⌘V late |
 | `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_ASYNC` | `true` | Restore the previous clipboard in the background after ⌘V; restores are generation-guarded so an old restore cannot clobber a newer paste |
+| `VOICE_TRANSCRIBE_PASTEBOARD_RESTORE_REQUIRES_UNCHANGED` | `true` | Restore only if the pasteboard still contains this transcription, so a manual copy or late app clipboard change is never overwritten |
+| `VOICE_TRANSCRIBE_PASTEBOARD_ABORT_ON_UNCONFIRMED_SET` | `true` | Skip ⌘V instead of risking a stale paste when AppKit does not confirm the transcription was written to the pasteboard |
 | `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
 
 ## Files
