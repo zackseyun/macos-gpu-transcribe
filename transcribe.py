@@ -1,8 +1,8 @@
-#!/Users/zackseyun/voice-transcribe/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Voice Transcribe — hold Fn to record, release to transcribe & paste.
 
-Menu bar app using local Cohere ASR with optional screenshot-aware context.
+Menu bar app using local Qwen3-ASR with optional screenshot-aware context.
 
 Architecture:
   - Main process: rumps menu bar app + always-on audio stream
@@ -28,7 +28,6 @@ import threading
 import subprocess
 import tempfile
 import time
-import wave
 import fcntl
 from datetime import datetime
 from pathlib import Path
@@ -88,6 +87,9 @@ GLOSSARY_MEMORY_TOP_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_TOP_
 GLOSSARY_MEMORY_MAX_TERMS = int(os.getenv("VOICE_TRANSCRIBE_GLOSSARY_MEMORY_MAX_TERMS", "256"))
 SCREEN_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS", "320"))
 RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS", "0.2"))
+STREAMING_FEED_INTERVAL_SECONDS = float(
+    os.getenv("VOICE_TRANSCRIBE_STREAM_FEED_INTERVAL_SECONDS", "0.5")
+)
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -171,6 +173,15 @@ class VoiceTranscribeApp(rumps.App):
         self._screen_ocr_requests = queue.Queue(maxsize=1)
         self._last_recording_refresh = 0.0
         self._glossary_memory = self._load_glossary_memory()
+        streaming_default = bool(self.settings.get("streaming_enabled", False))
+        self.streaming_enabled = _env_flag("VOICE_TRANSCRIBE_STREAMING", streaming_default)
+        self._tx_send_lock = threading.Lock()
+        self._stream_seq = 0
+        self._stream_id = None
+        self._stream_feed_index = 0
+        self._stream_feed_lock = threading.Lock()
+        self._stream_feed_stop = threading.Event()
+        self._stream_failed = False
 
         # Visual feedback — floating HUD near cursor and optional main window
         self._hud = get_hud_controller()
@@ -180,7 +191,7 @@ class VoiceTranscribeApp(rumps.App):
         self._main_window_shown_once = False
         # Per-model "has this ever completed a transcription this session" flag.
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
-        self._model_warmed = {"cohere": False}
+        self._model_warmed = {"fast": False}
 
         # Transcription worker subprocess (holds the local ASR model(s) in memory)
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
@@ -285,7 +296,14 @@ class VoiceTranscribeApp(rumps.App):
         # Fresh worker → models are cold again. Reset warm state so the HUD
         # shows "Loading model…" on the next use.
         if hasattr(self, "_model_warmed"):
-            self._model_warmed = {"cohere": False}
+            self._model_warmed = {"fast": False}
+        if _env_flag("VOICE_TRANSCRIBE_PREWARM_ON_START", True):
+            warm_timer = threading.Timer(
+                2.0,
+                lambda: self._send_warm_signal("fast", allow_load=True),
+            )
+            warm_timer.daemon = True
+            warm_timer.start()
 
     # ── Wake / keep-warm ──
     # macOS tears down Metal GPU state during sleep. The weights stay in the
@@ -348,34 +366,48 @@ class VoiceTranscribeApp(rumps.App):
         except Exception as exc:
             print(f"App Nap disable failed: {exc}", flush=True)
 
-    def _send_warm_signal(self):
-        """Tell the worker to pre-warm MPS while the user is recording.
+    def _send_warm_signal(self, model_mode="fast", allow_load=False):
+        """Tell the worker to pre-warm the active local ASR model.
 
-        Fired on Fn key down for Cohere mode. The worker checks if the model has
+        Fired on Fn key down. The worker checks if the model has
         been idle long enough to need warming and runs a silent dummy inference
-        in a background thread. By the time the user releases the key, MPS is
+        in a background thread. By the time the user releases the key, Metal is
         hot and ready — eliminating the cold-start latency that otherwise hits
         the first transcription after an idle period.
         """
         try:
-            self._tx_req_parent.send({"__warm__": True})
+            self._send_worker_request({
+                "__warm__": True,
+                "model_mode": model_mode,
+                "allow_load": allow_load,
+            })
+            if allow_load:
+                print(f"Warm signal sent ({model_mode}, allow_load={allow_load})", flush=True)
         except (BrokenPipeError, OSError):
             # Worker is dead — the next real request will respawn it.
             pass
 
-    def _transcribe_via_worker(self, wav_path, model_mode="fast", screen_context=""):
-        """Send wav to worker and wait for result with timeout. Returns dict or None."""
+    def _send_worker_request(self, request):
+        """Serialize writes to the worker pipe across warm/feed/finalize threads."""
+        with self._tx_send_lock:
+            self._tx_req_parent.send(request)
+
+    def _transcribe_via_worker(self, audio_input, model_mode="fast", screen_context=""):
+        """Send audio to worker and wait for result with timeout. Returns dict or None."""
         request = {
-            "wav_path": wav_path,
             "model_mode": model_mode,
             "screen_context": screen_context,
         }
+        if isinstance(audio_input, (str, Path)):
+            request["wav_path"] = str(audio_input)
+        else:
+            request["audio"] = audio_input
         try:
-            self._tx_req_parent.send(request)
+            self._send_worker_request(request)
         except (BrokenPipeError, OSError):
             print("Worker pipe broken, respawning...", flush=True)
             self._spawn_transcribe_worker()
-            self._tx_req_parent.send(request)
+            self._send_worker_request(request)
 
         # Wait for result with timeout
         if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
@@ -399,6 +431,106 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, killing worker...", flush=True)
             self._spawn_transcribe_worker()
             return None
+
+    def _streaming_available_for_model(self, model_mode):
+        return self.streaming_enabled and model_mode != "cohere"
+
+    def _start_streaming_session(self, model_mode):
+        """Start a worker-side streaming session for the active recording."""
+        if not self._streaming_available_for_model(model_mode):
+            return None
+
+        self._stream_seq += 1
+        stream_id = f"{os.getpid()}-{self._stream_seq}-{int(time.time() * 1000)}"
+        self._stream_id = stream_id
+        self._stream_feed_index = 0
+        self._stream_failed = False
+        self._stream_feed_stop = threading.Event()
+
+        try:
+            self._send_worker_request({
+                "__stream_start__": True,
+                "stream_id": stream_id,
+                "model_mode": model_mode,
+                "screen_context": "",
+            })
+        except (BrokenPipeError, OSError) as exc:
+            print(f"Streaming start failed: {exc}", flush=True)
+            self._stream_failed = True
+            self._stream_id = None
+            return None
+
+        print(f"Streaming started ({stream_id})", flush=True)
+        threading.Thread(
+            target=self._stream_feed_loop,
+            args=(stream_id,),
+            daemon=True,
+        ).start()
+        return stream_id
+
+    def _stream_feed_loop(self, stream_id):
+        while self.is_recording and self._stream_id == stream_id:
+            self._flush_stream_audio(stream_id)
+            if self._stream_feed_stop.wait(STREAMING_FEED_INTERVAL_SECONDS):
+                break
+
+    def _flush_stream_audio(self, stream_id):
+        if not stream_id or self._stream_failed:
+            return False
+
+        with self._stream_feed_lock:
+            if stream_id != self._stream_id:
+                return False
+            current_len = len(self.audio_buffer)
+            if current_len <= self._stream_feed_index:
+                return False
+            chunks = list(self.audio_buffer[self._stream_feed_index:current_len])
+            self._stream_feed_index = current_len
+
+        if not chunks:
+            return False
+
+        try:
+            audio = np.concatenate(chunks, axis=0).flatten()
+            self._send_worker_request({
+                "__stream_feed__": True,
+                "stream_id": stream_id,
+                "audio": audio,
+            })
+            return True
+        except Exception as exc:
+            self._stream_failed = True
+            print(f"Streaming feed failed: {exc}", flush=True)
+            return False
+
+    def _finish_streaming_via_worker(self, stream_id):
+        if not stream_id:
+            return None
+        try:
+            self._send_worker_request({
+                "__stream_finish__": True,
+                "stream_id": stream_id,
+            })
+        except (BrokenPipeError, OSError) as exc:
+            print(f"Streaming finish failed: {exc}", flush=True)
+            return {"text": "", "time": 0, "error": str(exc), "streaming": True}
+
+        if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
+            return self._tx_res_parent.recv()
+
+        print(f"Streaming finish timed out after {TRANSCRIBE_TIMEOUT}s", flush=True)
+        return None
+
+    def _cancel_streaming_session(self, stream_id):
+        if not stream_id:
+            return
+        try:
+            self._send_worker_request({
+                "__stream_cancel__": True,
+                "stream_id": stream_id,
+            })
+        except (BrokenPipeError, OSError):
+            pass
 
     # ── UI Helpers ──
 
@@ -745,11 +877,11 @@ class VoiceTranscribeApp(rumps.App):
 
     # ── Pipe Polling ──
     # Runs in a background thread. Receives messages from the key monitor subprocess.
-    # Messages: "heartbeat", "down:cohere", "up"
+    # Messages: "heartbeat", "down:fast", "up"
 
     def _poll_pipe(self):
         self._last_heartbeat = time.time()
-        self._pending_model = None  # "cohere"
+        self._pending_model = None  # "fast"
         while True:
             try:
                 # Use poll with timeout so we can detect a dead key monitor
@@ -766,13 +898,9 @@ class VoiceTranscribeApp(rumps.App):
                     continue
                 elif msg.startswith("down:"):
                     if not self.is_recording and not self.is_processing:
-                        self._pending_model = "cohere"
-                        print("Fn hold → recording (Cohere 2B)", flush=True)
+                        self._pending_model = msg.split(":", 1)[1] or "fast"
+                        print("Fn hold -> recording (Qwen3 0.6B)", flush=True)
                         self._play_sound("Tink")
-                        # Speculatively warm MPS while user is recording. By the time
-                        # they release the key, the model will be hot and ready, so
-                        # cold-start latency is hidden inside the recording duration.
-                        self._send_warm_signal()
                         self._start_recording()
                 elif msg == "up":
                     if self.is_recording:
@@ -782,7 +910,7 @@ class VoiceTranscribeApp(rumps.App):
                             continue
                         self._last_release_handled_at = now
                         elapsed = time.time() - self._recording_start_time if self._recording_start_time else 0
-                        print(f"Release → stop ({elapsed:.1f}s), transcribing with Cohere 2B...", flush=True)
+                        print(f"Release -> stop ({elapsed:.1f}s), transcribing with Qwen3 0.6B...", flush=True)
                         self._play_sound("Pop")
                         self._stop_recording()
             except (EOFError, OSError):
@@ -850,8 +978,11 @@ class VoiceTranscribeApp(rumps.App):
         if self.is_recording or self.is_processing:
             return
         self.audio_buffer = []
+        self._stream_feed_index = 0
+        self._stream_failed = False
         self.is_recording = True
         self._recording_start_time = time.time()
+        model_mode = self._pending_model or "fast"
         self._run_on_main_thread(self._hud.show)
         if self.screen_context_enabled:
             now = time.time()
@@ -862,13 +993,20 @@ class VoiceTranscribeApp(rumps.App):
                     kwargs={"reason": "recording-start"},
                     daemon=True,
                 ).start()
+        self._start_streaming_session(model_mode)
+        self._send_warm_signal(model_mode)
         self._set_title(ICON_RECORDING)
 
     def _stop_recording(self):
         if not self.is_recording:
             return
+        stream_id = self._stream_id
         self.is_recording = False
         self._recording_start_time = None
+        if stream_id:
+            self._stream_feed_stop.set()
+            self._flush_stream_audio(stream_id)
+            self._stream_id = None
         # Set is_processing synchronously here (not inside the worker thread) so
         # there's no race window where both is_recording and is_processing are
         # False — otherwise a stray flagsChanged echo arriving in that gap could
@@ -880,27 +1018,35 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
 
         if not audio_data:
+            self._cancel_streaming_session(stream_id)
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             self._run_on_main_thread(self._hud.hide)
             return
 
-        model_mode = self._pending_model or "cohere"
+        model_mode = self._pending_model or "fast"
+        if self._stream_failed:
+            self._cancel_streaming_session(stream_id)
+            stream_id = None
         loading = not self._model_warmed.get(model_mode, False)
         hud_label = "Loading model…" if loading else "Transcribing…"
         self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
         threading.Thread(
-            target=self._transcribe_and_paste, args=(audio_data, model_mode), daemon=True
+            target=self._transcribe_and_paste,
+            args=(audio_data, model_mode, stream_id),
+            daemon=True,
         ).start()
 
     # ── Transcription ──
 
-    def _transcribe_and_paste(self, audio_data, model_mode="fast"):
+    def _transcribe_and_paste(self, audio_data, model_mode="fast", stream_id=None):
+        total_t0 = time.time()
+        timings = {}
         self.is_processing = True
-        wav_path = None
         screenshot_path = None
         screen_context = ""
         try:
+            prepare_t0 = time.time()
             audio = np.concatenate(audio_data, axis=0).flatten()
             duration = len(audio) / SAMPLE_RATE
             peak = np.max(np.abs(audio))
@@ -924,6 +1070,7 @@ class VoiceTranscribeApp(rumps.App):
                 f"({'SILENT' if peak < 0.001 else 'OK'}){thermal_note}",
                 flush=True,
             )
+            timings["prepare"] = time.time() - prepare_t0
 
             # Silence gate — skip ASR entirely on silent audio. This prevents
             # the model from hallucinating "Thank you."-style outputs, and
@@ -935,16 +1082,11 @@ class VoiceTranscribeApp(rumps.App):
                     f"{SILENCE_RMS_THRESHOLD}), skipping transcription.",
                     flush=True,
                 )
+                self._cancel_streaming_session(stream_id)
                 self._set_title(self._idle_icon_with_thermal())
                 return
 
-            wav_path = tempfile.mktemp(suffix=".wav")
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes((audio * 32767).astype(np.int16).tobytes())
-
+            screen_t0 = time.time()
             if self.screen_context_enabled:
                 try:
                     screenshot_path, screenshot_source, screenshot_age = self._take_screen_context_snapshot()
@@ -974,12 +1116,27 @@ class VoiceTranscribeApp(rumps.App):
                         )
                 except Exception as screen_err:
                     print(f"Screen context capture skipped: {screen_err}", flush=True)
+            timings["screen"] = time.time() - screen_t0
 
-            result = self._transcribe_via_worker(
-                wav_path,
-                model_mode,
-                screen_context=screen_context,
-            )
+            worker_t0 = time.time()
+            result = None
+            used_streaming = False
+            if stream_id and self._streaming_available_for_model(model_mode):
+                result = self._finish_streaming_via_worker(stream_id)
+                used_streaming = bool(result and result.get("streaming") and not result.get("error"))
+                if result is None or result.get("error") or not result.get("text"):
+                    err = (result or {}).get("error") if isinstance(result, dict) else "timeout"
+                    print(f"Streaming unavailable for this clip ({err}); falling back to full transcription.", flush=True)
+                    result = None
+
+            if result is None:
+                result = self._transcribe_via_worker(
+                    audio,
+                    model_mode,
+                    screen_context=screen_context,
+                )
+                used_streaming = False
+            timings["worker_wait"] = time.time() - worker_t0
 
             if result is None:
                 print("Transcription timed out, skipping.", flush=True)
@@ -995,6 +1152,8 @@ class VoiceTranscribeApp(rumps.App):
 
             text = result.get("text", "")
             transcribe_time = result.get("time", 0)
+            if used_streaming:
+                timings["stream_feed"] = float(result.get("streaming_feed_time", 0) or 0)
 
             if not text:
                 print("No speech detected.", flush=True)
@@ -1012,14 +1171,24 @@ class VoiceTranscribeApp(rumps.App):
                 )
                 return
 
+            format_t0 = time.time()
             text = format_transcription(text)
+            timings["format"] = time.time() - format_t0
             post_thermal_level, post_thermal_label, _ = self._get_thermal_state()
             slow_note = ""
             if transcribe_time > 3.0:
                 slow_note = f" ⚠️ SLOW (thermal={post_thermal_label})"
-            print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
+            mode_note = " streaming-finalize" if used_streaming else ""
+            print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{mode_note}{slow_note}): {text}", flush=True)
             self._add_to_history(text)
+            paste_t0 = time.time()
             self._paste_text(text)
+            timings["paste"] = time.time() - paste_t0
+            timings["total"] = time.time() - total_t0
+            timing_text = ", ".join(
+                f"{name}={value:.2f}s" for name, value in timings.items()
+            )
+            print(f"Timing: {timing_text}", flush=True)
 
         except Exception as e:
             print(f"Transcription error: {e}", flush=True)
@@ -1029,8 +1198,6 @@ class VoiceTranscribeApp(rumps.App):
             self._set_title(self._idle_icon_with_thermal())
             self._run_on_main_thread(self._rebuild_menu)
             self._run_on_main_thread(self._hud.hide)
-            if wav_path and os.path.exists(wav_path):
-                os.unlink(wav_path)
             if screenshot_path and os.path.exists(screenshot_path):
                 os.unlink(screenshot_path)
 
@@ -1099,7 +1266,11 @@ class VoiceTranscribeApp(rumps.App):
                     return data
             except (json.JSONDecodeError, IOError):
                 pass
-        return {"screen_context_enabled": False, "sound_effects_enabled": True}
+        return {
+            "screen_context_enabled": False,
+            "sound_effects_enabled": True,
+            "streaming_enabled": False,
+        }
 
     def _save_settings(self):
         try:
@@ -1211,7 +1382,7 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Open Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Fn = Cohere 2B", callback=None))
+        self.menu.add(rumps.MenuItem("Fn = Qwen3 0.6B", callback=None))
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
@@ -1297,6 +1468,12 @@ class VoiceTranscribeApp(rumps.App):
 if __name__ == "__main__":
     import atexit
     import signal
+    import sys
+
+    log_handle = open("/tmp/voice-transcribe.log", "a", buffering=1)
+    sys.stdout = log_handle
+    sys.stderr = log_handle
+    print("Voice Transcribe GUI launch", flush=True)
 
     lock_handle = LOCK_FILE.open("w")
     try:

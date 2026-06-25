@@ -1,222 +1,153 @@
-# macOS GPU Transcribe
+# Voice Transcribe Qwen
 
-A push-to-talk dictation app for Apple Silicon Macs. **Hold Fn** to record, **release** to transcribe — the text is pasted at your cursor. All transcription runs locally on the GPU via Metal / MLX / PyTorch-MPS. No cloud round-trips, no API keys at inference time, no speech leaves your machine.
+A local push-to-talk dictation app for Apple Silicon Macs.
 
-![demo placeholder — hold Fn, see floating HUD near cursor, get text at cursor]
+Hold `Fn`, speak, release, and the app transcribes with Qwen3-ASR on your Mac's GPU and pastes the text at your cursor. No API key is needed for transcription, and speech does not leave your machine.
 
-## Why this exists
+## Features
 
-Cloud dictation (Siri, Whisper API, Otter, etc.) has latency, privacy, and cost downsides. Apple Silicon is fast enough to run 2B-parameter ASR models in real time entirely on-device. This app wires that into a hold-to-talk hotkey with native Mac UI — menu bar icon, Dock icon, a cursor-tracking HUD, and a main settings window.
-
-## How it works
-
-1. **Hold Fn** anywhere in macOS.
-2. A floating waveform HUD appears near your cursor showing the mic is live.
-3. **Speak**.
-4. **Release** the key. The HUD switches to `Transcribing…` (or `Loading model…` on a cold start).
-5. The transcription is pasted at your cursor via ⌘V.
-
-Everything runs on the GPU. A 10-second clip transcribes in ~2.5s on an M4 Max with Cohere 2B.
-
-## Interface
-
-- **Floating HUD** — borderless, click-through, follows the cursor. Live waveform while recording; text label while transcribing or loading. Appears only during active use.
-- **Menu bar icon** — classic rumps-style status indicator (`🎙` idle / `🔴 2s` recording / `⏳` processing). Clicking it gives you a history list (last 20, click to copy) and toggles for sound effects / screen context.
-- **Main window** — regular Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. Opens automatically at launch; reopens when you click the Dock icon.
-- **Keep-warm** — wake-from-sleep hook + App Nap opt-out + 15-min background ping means the GPU kernels stay hot, so the first press after opening your laptop is instant instead of a 7-second cold start.
-
-## Model & key binding
-
-| Key | Model | Parameters | Framework | Throughput (M4 Max) |
-|-----|-------|-----------|-----------|---------------------|
-| **Hold Fn** | [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | 2B | PyTorch (MPS) | ~3–4× real-time |
-
-Cohere Transcribe handles homophones, technical terms, and sentence boundaries reliably at this size — the right tradeoff for dictation where the output should rarely need manual corrections.
-
-**Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
-
-### Throughput explained
-
-Throughput = audio-duration ÷ wall-clock-transcribe-time. At 4× real-time, a 30-second clip transcribes in ~7.5s. The silence-RMS gate drops audio below the mic noise floor before ASR runs, which prevents the Whisper-family "Thank you." hallucination on near-silent clips.
-
-### Post-processing
-
-Raw ASR output runs through `format_text.py`, which normalizes:
-
-- Number words → digits (`twenty five` → `25`, `three hundred K` → `300K`)
-- Multipliers (`3 thousand` → `3,000`, `5 million` → `5,000,000`)
-- Percentages (`25 percent` → `25%`)
-- Currency (`500 dollars` → `$500`)
-- First-letter capitalization
-
-### Screen context (optional, off by default)
-
-Opt-in feature that prefetches a screenshot of your frontmost window, runs local Vision OCR, and injects the resulting glossary into the ASR prompt. Helps with proper nouns and jargon. It proved too noisy for general dictation, so it ships disabled; toggle it from the menu bar or main window if you want to try it.
-
-## Architecture
-
-```
-┌─────────────────────┐      multiprocessing.Pipe       ┌──────────────────┐
-│   Key Monitor       │ ─── "down:cohere" / "up" ─────▶ │   Main App       │
-│   (subprocess)      │                                  │   (rumps menu    │
-│                     │                                  │    bar app)      │
-│  Quartz CGEvent tap │                                  │                  │
-│  detects Fn hold/   │      multiprocessing.Pipe        │  • Record audio  │
-│  release            │                                  │  • HUD + window  │
-└─────────────────────┘                                  │  • Dispatch to   │
-                                                         │    worker        │
-                                                         └────────┬─────────┘
-                                                                  │
-                                                    multiprocessing.Pipe
-                                                                  │
-                                                         ┌────────▼─────────┐
-                                                         │  Transcription   │
-                                                         │  Worker          │
-                                                         │  (subprocess)    │
-                                                         │                  │
-                                                         │  Cohere 2B (MPS) │
-                                                         │                  │
-                                                         │  Model stays     │
-                                                         │  resident in GPU │
-                                                         │  memory          │
-                                                         └──────────────────┘
-```
-
-**Three processes, three reasons:**
-
-1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
-2. **Transcription Worker** — Holds the ML models in GPU memory permanently. Isolates model-loading crashes, compile warm-up, and Metal buffer leaks from the UI process. Auto-restarts after 50 transcriptions or 4 GB active memory to cap leak accumulation.
-3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens once at startup and is never stopped — CoreAudio's `HALB_Mutex` deadlocks if you call `Pa_StopStream` while the callback is active. Recording is controlled by a boolean flag checked inside the callback.
-
-**Hold-to-talk, not toggle.** The key monitor uses a low-level Quartz event tap for press/release fidelity — not a global hotkey. macOS disables event taps after sleep/wake; the monitor auto-recovers, and a heartbeat watchdog restarts it if it dies completely.
-
-**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on a 15-minute periodic ping. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during idle stretches.
-
-## Tech stack
-
-| Component | Technology |
-|-----------|-----------|
-| Language | Python 3.13+ (Homebrew) |
-| ASR | Cohere Transcribe 2B via PyTorch (MPS) |
-| Menu bar | `rumps` |
-| HUD + main window | AppKit via PyObjC (NSWindow, NSBezierPath, NSTimer) |
-| Audio capture | `sounddevice` (16 kHz mono float32 PCM) |
-| Key monitoring | Quartz CGEvent tap, subprocess-isolated |
-| Clipboard/paste | `AppKit.NSPasteboard` + Quartz ⌘V event simulation |
-| Screen OCR (optional) | Frontmost-window screenshot + `pyobjc-framework-Vision` text extraction |
+- Hold-to-talk with the `Fn` / Globe key
+- Local Qwen3-ASR 0.6B transcription through MLX / Metal
+- Automatic paste into the focused app
+- Floating cursor HUD while recording and processing
+- Menu bar history for recent transcriptions
+- Model pre-warm and keep-warm to reduce cold-start delays
+- Optional Screen Assist OCR for local window text context, off by default
+- Experimental streaming code is present but disabled by default because full-clip transcription is more reliable for dictation
 
 ## Requirements
 
-- **macOS** on Apple Silicon (M1/M2/M3/M4)
-- **Python 3.13 or 3.14** (Homebrew)
-- **HuggingFace account** with access to [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
+- Apple Silicon Mac: M1, M2, M3, or M4
+- macOS 13 or newer
+- Homebrew
+- Python 3.13 or 3.14 from Homebrew
+- A few GB of free disk space for model weights
 
-## Setup
+The first transcription downloads `Qwen/Qwen3-ASR-0.6B` from Hugging Face through `mlx-qwen3-asr`.
 
-### Automated
+## Quick Start
 
 ```bash
 git clone https://github.com/zackseyun/macos-gpu-transcribe.git
 cd macos-gpu-transcribe
 ./install.sh
-```
-
-The installer will:
-
-1. Detect or install Python 3.13/3.14 via Homebrew.
-2. Create a `.venv` with all dependencies.
-3. Deploy `com.local.DisableRightOption.plist` as a user LaunchAgent that disables the Right Option key system-wide via `hidutil` (see [Right Option, why disabled](#model--key-binding)).
-4. Prompt for your HuggingFace token (Cohere model is gated).
-5. Auto-configure `run.sh` for your machine.
-6. Walk you through the required macOS permissions.
-
-### Manual
-
-```bash
-# 1. Create venv
-python3.13 -m venv --system-site-packages .venv
-source .venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-pip install transformers torch librosa accelerate
-
-# 3. Disable Right Option key system-wide (deploys LaunchAgent)
-mkdir -p ~/Library/LaunchAgents
-cp com.local.DisableRightOption.plist ~/Library/LaunchAgents/
-launchctl load -w ~/Library/LaunchAgents/com.local.DisableRightOption.plist
-
-# 4. Authenticate HuggingFace
-python -c "from huggingface_hub import login; login()"
-
-# 5. Update run.sh paths for your machine (see run.sh comments)
-```
-
-### macOS permissions (one-time)
-
-- **System Settings → Keyboard → "Press 🌐 key to"**: set to **Do Nothing** (otherwise Fn triggers the globe menu)
-- **Privacy & Security → Accessibility**: add the `Python.app` printed by `install.sh`
-- **Privacy & Security → Input Monitoring**: add the same `Python.app`
-- **Microphone**: prompts automatically on first recording
-- **Screen Recording** (only needed if you turn on screen context): add the same `Python.app`
-
-### Run
-
-```bash
 ./run.sh
-# or directly:
-./.venv/bin/python3 ./transcribe.py
-# background with logs:
-nohup ./run.sh > /tmp/voice-transcribe.log 2>&1 &
 ```
 
-### Environment variables
+The installer also creates:
 
-| Variable | Default | What it does |
-|----------|---------|--------------|
-| `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.008` | Silence gate threshold (raise if you get false transcriptions of ambient noise) |
-| `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `900` | How often to ping the worker to keep the model warm |
-| `VOICE_TRANSCRIBE_SCREEN_CONTEXT` | unset | Start with screen context enabled |
-| `VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SECONDS` | `0.2` | Ignore duplicate release events within this window |
-
-## Files
-
-```
-macos-gpu-transcribe/
-├── transcribe.py          # Main app — menu bar UI, audio, paste, orchestration
-├── transcribe_worker.py   # Worker subprocess — model loading & inference
-├── key_monitor.py         # Key monitor subprocess — Quartz CGEvent tap
-├── hud_overlay.py         # Floating cursor HUD (AppKit borderless window)
-├── main_window.py         # Main app window (status, settings, history)
-├── screen_context.py      # Optional frontmost-window screenshot + OCR
-├── format_text.py         # Post-processing — numbers, currency, percentages
-├── install.sh             # Install wizard
-├── run.sh                 # Launcher
-├── requirements.txt       # pip dependencies
-├── com.local.DisableRightOption.plist  # User LaunchAgent — disables Right Option via hidutil
-├── settings.json          # Per-user toggles (auto-managed)
-├── history.json           # Transcription log (last 100)
-└── README.md
+```text
+dist/Voice Transcribe Qwen.app
 ```
 
-## Troubleshooting
+You can open that app bundle after install, but keep the cloned repo in place because the app wrapper points back to this checkout.
 
-| Problem | Fix |
-|---------|-----|
-| Fn key not detected | Toggle Input Monitoring OFF/ON for Python.app, restart the app |
-| No audio recording | Grant Microphone permission when prompted |
-| "Loading model…" takes a while on first run | Downloading weights — ~2 GB for Cohere, ~1.2 GB for Qwen3. One-time |
-| First press after opening laptop is slow | Should be rare with the wake-hook; if it persists, check for "System woke from sleep → warming ASR model" in the log |
-| Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
-| Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |
-| Broken pipe error on quit | Expected — subprocesses shutting down |
+## macOS Permissions
 
-## Logs
+macOS permissions are the fiddly part. The app runs through Homebrew's `Python.app`, so grant permissions to the Python.app path printed by `./install.sh`.
+
+Required:
+
+- System Settings -> Keyboard -> set "Press Globe key to" to "Do Nothing"
+- Privacy & Security -> Accessibility -> add the printed `Python.app`
+- Privacy & Security -> Input Monitoring -> add the same `Python.app`
+- Microphone -> allow when macOS prompts on first recording
+
+Optional:
+
+- Privacy & Security -> Screen Recording -> add the same `Python.app` only if you enable Screen Assist
+
+If the `Fn` key stops being detected after changing permissions, quit the app and run `./run.sh` again.
+
+## Usage
+
+1. Launch with `./run.sh` or open `dist/Voice Transcribe Qwen.app`.
+2. Hold `Fn`.
+3. Speak.
+4. Release `Fn`.
+5. The transcript is pasted into the active text field.
+
+Logs are written to:
+
+```bash
+/tmp/voice-transcribe.log
+```
+
+Watch logs live:
 
 ```bash
 tail -f /tmp/voice-transcribe.log
 ```
 
-## License
+## Configuration
 
-MIT. See [`LICENSE`](LICENSE) if present; otherwise do whatever you want with it — just don't blame the author if it sets your GPU on fire.
+Local settings are stored in `settings.json`, which is ignored by git.
+
+Useful environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `VOICE_TRANSCRIBE_PREWARM_ON_START` | `true` | Load and warm Qwen shortly after launch |
+| `VOICE_TRANSCRIBE_KEEP_WARM_INTERVAL` | `20` | Seconds between keep-warm checks while active |
+| `VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE` | `300` | Stop keep-warming after this much idle time |
+| `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.008` | Drop near-silent recordings before ASR |
+| `VOICE_TRANSCRIBE_STREAMING` | `false` | Enables experimental streaming mode |
+| `VOICE_TRANSCRIBE_SCREEN_CONTEXT_MAX_CHARS` | `320` | Max OCR context injected when Screen Assist is on |
+
+Example:
+
+```bash
+VOICE_TRANSCRIBE_PREWARM_ON_START=false ./run.sh
+```
+
+## Architecture
+
+```text
+Fn key press/release
+        |
+        v
+key_monitor.py  --pipe-->  transcribe.py  --pipe-->  transcribe_worker.py
+Quartz event tap            menu app, HUD, audio       Qwen3-ASR model process
+```
+
+Why separate processes:
+
+- `key_monitor.py` owns the low-level Quartz event tap.
+- `transcribe.py` owns the UI, audio stream, clipboard, paste, and app state.
+- `transcribe_worker.py` keeps the ASR model resident and isolated from the UI process.
+
+The audio stream is opened once at startup and kept open. Recording is controlled by a boolean checked inside the audio callback; this avoids CoreAudio deadlocks that can happen when repeatedly starting and stopping PortAudio streams.
+
+## Files
+
+```text
+transcribe.py          Main app: menu bar, audio, paste, orchestration
+transcribe_worker.py   Worker: Qwen3-ASR loading, warmup, inference
+key_monitor.py         Fn key event tap subprocess
+hud_overlay.py         Floating recording/processing HUD
+main_window.py         Native status/settings window
+screen_context.py      Optional frontmost-window OCR context
+format_text.py         Transcript cleanup and formatting
+install.sh             Dependency and setup helper
+run.sh                 Portable launcher
+package_app.sh         Builds dist/Voice Transcribe Qwen.app
+requirements.txt       Python dependencies
+```
+
+## Troubleshooting
+
+| Problem | Try |
+| --- | --- |
+| `Fn` does nothing | Re-grant Input Monitoring for Python.app, then restart the app |
+| Text does not paste | Re-grant Accessibility for Python.app |
+| No microphone input | Allow Microphone access when prompted, or remove/re-add Python.app in Privacy settings |
+| First run is slow | The model is downloading or compiling MLX kernels; later runs should be faster |
+| A recording is ignored | Check `/tmp/voice-transcribe.log`; the silence gate may have treated it as silence |
+| Multiple menu icons | Run `pkill -f transcribe.py`, then relaunch |
+| Streaming misses words | Leave `VOICE_TRANSCRIBE_STREAMING` off; full-clip Qwen is the reliable default |
+
+## Notes
+
+- The app is tuned for local dictation, not meeting transcription.
+- Qwen3-ASR 0.6B is the default because it is fast and does not require gated model access.
+- Cohere support remains in the worker for experiments, but the packaged app does not use it by default.

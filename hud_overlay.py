@@ -8,6 +8,7 @@ import math
 import threading
 
 import objc
+import Quartz
 from AppKit import (
     NSBezierPath,
     NSColor,
@@ -15,18 +16,20 @@ from AppKit import (
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
-    NSScreenSaverWindowLevel,
     NSString,
     NSView,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
-    NSWindowCollectionBehaviorStationary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSWindowCollectionBehaviorMoveToActiveSpace,
+    NSWindowCollectionBehaviorTransient,
 )
 from Foundation import NSMakeRect, NSObject, NSTimer
 
 NSBackingStoreBuffered = 2
 NSWindowStyleMaskBorderless = 0
+HUD_WINDOW_LEVEL = Quartz.CGWindowLevelForKey(Quartz.kCGMaximumWindowLevelKey) - 1
 
 HUD_WIDTH = 200.0
 HUD_HEIGHT = 52.0
@@ -194,13 +197,15 @@ class HUDController(NSObject):
         )
         self._window.setOpaque_(False)
         self._window.setBackgroundColor_(NSColor.clearColor())
-        self._window.setLevel_(NSScreenSaverWindowLevel)
+        self._window.setLevel_(HUD_WINDOW_LEVEL)
         self._window.setIgnoresMouseEvents_(True)
         self._window.setHasShadow_(True)
         self._window.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorMoveToActiveSpace
             | NSWindowCollectionBehaviorFullScreenAuxiliary
-            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorTransient
+            | NSWindowCollectionBehaviorIgnoresCycle
         )
         # Hide from ⌘-Tab and window menu
         self._window.setHidesOnDeactivate_(False)
@@ -213,6 +218,7 @@ class HUDController(NSObject):
             self._view.setState_("recording")
             self._view.setLabel_("")
         self._visible = True
+        self._window.setLevel_(HUD_WINDOW_LEVEL)
         self._positionNearCursor()
         self._window.orderFrontRegardless()
         self._startTimers()
@@ -228,9 +234,13 @@ class HUDController(NSObject):
         if not self._visible:
             # Show even if not previously visible (covers the silence-gate path)
             self._visible = True
+            self._window.setLevel_(HUD_WINDOW_LEVEL)
             self._positionNearCursor()
             self._window.orderFrontRegardless()
             self._startTimers()
+        else:
+            self._window.setLevel_(HUD_WINDOW_LEVEL)
+            self._window.orderFrontRegardless()
 
     def hide(self):
         self._visible = False
@@ -266,9 +276,10 @@ class HUDController(NSObject):
         loc = NSEvent.mouseLocation()
         x = loc.x + CURSOR_OFFSET_X
         y = loc.y + CURSOR_OFFSET_Y
-        # Keep inside the main screen bounds. AppKit uses lower-left origin.
+        # Keep inside the screen that currently contains the cursor.
+        # AppKit uses a lower-left origin across the global desktop.
         frame = self._window.frame()
-        screen = self._window.screen() or _main_screen()
+        screen = _screen_containing_point(loc) or _main_screen()
         if screen is not None:
             vis = screen.visibleFrame()
             x = max(vis.origin.x + 4, min(x, vis.origin.x + vis.size.width - frame.size.width - 4))
@@ -291,6 +302,18 @@ class HUDController(NSObject):
 def _main_screen():
     from AppKit import NSScreen
     return NSScreen.mainScreen()
+
+
+def _screen_containing_point(point):
+    from AppKit import NSScreen
+    for screen in NSScreen.screens():
+        frame = screen.frame()
+        if (
+            frame.origin.x <= point.x <= frame.origin.x + frame.size.width
+            and frame.origin.y <= point.y <= frame.origin.y + frame.size.height
+        ):
+            return screen
+    return None
 
 
 _controller = None

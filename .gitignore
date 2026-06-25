@@ -1,5 +1,11 @@
 .venv/
 __pycache__/
+.DS_Store
+.env.local
+.keep_warm_silent.wav
+*.log
 history.json
 screen_glossary_memory.json
 settings.json
+start-qwen.sh
+dist/
