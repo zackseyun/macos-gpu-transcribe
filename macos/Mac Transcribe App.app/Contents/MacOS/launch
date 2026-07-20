@@ -29,4 +29,11 @@ if [[ -z "$REPO_DIR" || ! -x "$REPO_DIR/run.sh" ]]; then
   exit 1
 fi
 
-exec "$REPO_DIR/run.sh" >> /tmp/voice-transcribe.log 2>&1
+# The LaunchAgent owns the always-on, quiet menu-bar instance. A Finder,
+# Spotlight, or Alfred launch should instead ask that instance to show its
+# settings window (transcribe.py forwards the request through the PID lock).
+if [[ "${XPC_SERVICE_NAME:-}" == "com.zack.voice-transcribe" ]]; then
+  exec "$REPO_DIR/run.sh" >> /tmp/voice-transcribe.log 2>&1
+fi
+
+exec "$REPO_DIR/run.sh" --show-window --show-dock >> /tmp/voice-transcribe.log 2>&1

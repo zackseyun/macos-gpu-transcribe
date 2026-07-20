@@ -284,6 +284,23 @@ def _should_show_dock_icon(argv=None, environ=None):
     ) or _argv_has_flag("--show-dock", argv)
 
 
+def _is_launchd_managed(environ=None):
+    """Return whether the app was started by its persistent LaunchAgent."""
+    if environ is None:
+        environ = os.environ
+    return environ.get("XPC_SERVICE_NAME") == "com.zack.voice-transcribe"
+
+
+def _read_lock_owner_pid(lock_handle):
+    """Read a valid existing-instance PID without disturbing the held lock."""
+    try:
+        lock_handle.seek(0)
+        pid = int(lock_handle.read().strip())
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
 def _parse_input_volume_osascript_output(output):
     """Parse osascript output as (previous_volume, current_volume).
 
@@ -1648,6 +1665,20 @@ class VoiceTranscribeApp(rumps.App):
             flush=True,
         )
 
+        # A launchd-managed process must not spawn a detached replacement. If it
+        # does, that orphan can win the singleton lock while launchd's own
+        # replacement exits successfully, leaving the LaunchAgent marked as
+        # stopped. A non-zero exit lets KeepAlive own the restart cleanly.
+        if _is_launchd_managed():
+            print("Handing the restart back to launchd.", flush=True)
+            for proc in multiprocessing.active_children():
+                try:
+                    proc.kill()
+                    proc.join(timeout=1)
+                except Exception:
+                    pass
+            os._exit(75)
+
         repo_dir = Path(__file__).resolve().parent
         relaunch_script = _build_self_relaunch_script(
             repo_dir,
@@ -2606,15 +2637,47 @@ if __name__ == "__main__":
     import atexit
     import signal
 
-    lock_handle = LOCK_FILE.open("w")
+    # Do not open with "w": a duplicate launch would truncate the live owner's
+    # PID before discovering that it cannot acquire the flock.
+    lock_handle = LOCK_FILE.open("a+")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("Another Voice Transcribe instance is already running; exiting duplicate launch.", flush=True)
+        if _should_show_main_window_on_launch():
+            existing_pid = _read_lock_owner_pid(lock_handle)
+            if existing_pid is not None:
+                try:
+                    os.kill(existing_pid, signal.SIGUSR1)
+                    print(
+                        "Voice Transcribe is already running; requested its settings window.",
+                        flush=True,
+                    )
+                except (OSError, ProcessLookupError):
+                    print(
+                        "Voice Transcribe is already running, but its window request failed.",
+                        flush=True,
+                    )
+            else:
+                print(
+                    "Voice Transcribe is already running, but its PID was unavailable.",
+                    flush=True,
+                )
+        else:
+            print(
+                "Another Voice Transcribe instance is already running; exiting duplicate launch.",
+                flush=True,
+            )
         raise SystemExit(0)
 
+    lock_handle.seek(0)
+    lock_handle.truncate()
     lock_handle.write(str(os.getpid()))
     lock_handle.flush()
+
+    # SIGUSR1 is the lightweight bridge used when Finder/Spotlight opens the
+    # app bundle while the quiet menu-bar instance already owns the lock.
+    window_request = threading.Event()
+    signal.signal(signal.SIGUSR1, lambda *_: window_request.set())
 
     # Default to a subtle menu-bar utility: no Dock icon, no ⌘-Tab entry, and no
     # launch window. Use --show-dock or VOICE_TRANSCRIBE_SHOW_DOCK_ICON=1 for an
@@ -2637,6 +2700,14 @@ if __name__ == "__main__":
 
     app = VoiceTranscribeApp(parent_conn)
     app._key_monitor = monitor
+
+    def _window_request_loop():
+        while True:
+            window_request.wait()
+            window_request.clear()
+            app._run_on_main_thread(app._main_window.showWindow)
+
+    threading.Thread(target=_window_request_loop, daemon=True).start()
 
     # Ensure all child processes are killed on exit (prevents orphan buildup).
     # Without this, each restart leaves zombie key_monitor/worker/tracker processes

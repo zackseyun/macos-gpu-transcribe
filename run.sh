@@ -13,4 +13,4 @@ fi
 
 cd "${REPO_DIR}"
 export PYTHONUNBUFFERED=1
-exec "${PYTHON_BIN}" "${SCRIPT}"
+exec "${PYTHON_BIN}" "${SCRIPT}" "$@"

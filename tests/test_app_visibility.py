@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 
 import transcribe
 
@@ -40,6 +41,31 @@ class AppVisibilityDefaultsTest(unittest.TestCase):
                 environ={"VOICE_TRANSCRIBE_SHOW_DOCK_ICON": "1"},
             )
         )
+
+    def test_launchd_managed_only_for_the_persistent_agent(self):
+        self.assertTrue(
+            transcribe._is_launchd_managed(
+                {"XPC_SERVICE_NAME": "com.zack.voice-transcribe"}
+            )
+        )
+        self.assertFalse(
+            transcribe._is_launchd_managed(
+                {"XPC_SERVICE_NAME": "application.com.zack.voice-transcribe.123"}
+            )
+        )
+        self.assertFalse(transcribe._is_launchd_managed({}))
+
+    def test_lock_owner_pid_is_read_without_truncation(self):
+        lock_handle = StringIO("12345")
+        lock_handle.seek(5)
+
+        self.assertEqual(12345, transcribe._read_lock_owner_pid(lock_handle))
+        self.assertEqual("12345", lock_handle.getvalue())
+
+    def test_invalid_lock_owner_pid_is_ignored(self):
+        self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("")))
+        self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("not-a-pid")))
+        self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("-7")))
 
 
 if __name__ == "__main__":

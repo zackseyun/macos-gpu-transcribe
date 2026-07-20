@@ -177,7 +177,7 @@ SCRIPT="\${REPO_DIR}/transcribe.py"
 cd "\${REPO_DIR}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="\${VENV_SITE}:\${REPO_DIR}:\${PYTHONPATH:-}"
-exec "\${PYTHON_BIN}" "\${SCRIPT}"
+exec "\${PYTHON_BIN}" "\${SCRIPT}" "\$@"
 EOF
 chmod +x "$REPO_DIR/run.sh"
 ok "run.sh configured for this machine"
