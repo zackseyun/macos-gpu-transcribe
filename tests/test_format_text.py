@@ -40,6 +40,12 @@ class BrandReplacementTest(unittest.TestCase):
             "Zachary can review it later.",
         )
 
+    def test_corrects_michelle_to_mishaal(self):
+        self.assertEqual(
+            format_transcription("michelle should review it later."),
+            "Mishaal should review it later.",
+        )
+
     def test_corrects_quinn_to_qwen(self):
         self.assertEqual(
             format_transcription("the quinn branch feels faster."),

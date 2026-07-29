@@ -365,6 +365,7 @@ _BRAND_REPLACEMENTS = [
     (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
     # User name: Cohere tends to choose the more common spelling.
     (re.compile(r"\bzach\b", re.IGNORECASE), "Zack"),
+    (re.compile(r"\bmichelle\b", re.IGNORECASE), "Mishaal"),
     # Model name: ASR often hears "Qwen" as common names / syllables like
     # "Quinn", "Quan", or the phonetic spelling "Quen".
     (re.compile(r"\b(?:qin|quan|quen|quinn?|qwen)\s*(?:three|3)[\s-]*asr\b", re.IGNORECASE), "Qwen3-ASR"),
