@@ -23,7 +23,7 @@ Everything runs on the GPU. The current default is **Cohere Transcribe MLX 8-bit
 - **Floating HUD** — borderless, click-through, follows the cursor. Live waveform while recording; text label while transcribing or loading. Appears only during active use.
 - **Menu bar icon** — classic rumps-style status indicator (`🎙` idle / `🔴 2s` recording / `⏳` processing). Clicking it gives you a history list (last 20, click to copy), toggles for sound effects / screen context, and a default-model selector.
 - **Main window** — optional Mac window with current status, hotkey reminders, settings toggles, and a table of recent transcriptions. It stays hidden at launch; open it intentionally from the menu bar's **Open Settings Window** item.
-- **Keep-warm** — wake-from-sleep hook + App Nap opt-out + 15-min background ping means the GPU kernels stay hot, so the first press after opening your laptop is instant instead of a 7-second cold start.
+- **Keep-warm** — wake-from-sleep hook + sleep-safe App Nap opt-out + adaptive background ping means the GPU kernels stay hot while the Mac is awake, so the first press after opening your laptop is fast without blocking normal battery sleep.
 
 ## Model & key binding
 
@@ -88,11 +88,11 @@ Opt-in feature that prefetches a screenshot of your frontmost window, runs local
 
 1. **Key Monitor** — Quartz CGEvent tap and `rumps` both use AppKit internally. Running them in the same process causes the tap to silently stop receiving events. Separate process + pipe solves this.
 2. **Transcription Worker** — Holds the ML models in GPU memory permanently. Isolates model-loading crashes, compile warm-up, and Metal buffer leaks from the UI process. Auto-restarts after 50 transcriptions or 4 GB active memory to cap leak accumulation.
-3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. The audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. A flat mic during an active Fn hold can still open a replacement stream, but idle callback gaps are ignored by default so the app does not relaunch itself and make Cohere cold again.
+3. **Main App** — rumps menu bar UI, AppKit HUD + main window, audio recording via `sounddevice`. During an awake-display session, the audio stream opens at startup and is never stopped/closed in-place — CoreAudio's `HALB_Mutex` can deadlock if you call `Pa_StopStream` while the callback is active. When the display sleeps, the app safely releases the microphone by exiting; launchd restarts it in mic-deferred mode, and the next Fn press opens a fresh stream. This lets macOS enter battery sleep without sacrificing the reliable awake-session capture path.
 
 **Hold-to-talk, not toggle.** The key monitor uses a low-level Quartz event tap for press/release fidelity — not a global hotkey. macOS disables event taps after sleep/wake; the monitor auto-recovers, and a heartbeat watchdog restarts it if it dies completely.
 
-**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on an adaptive background ping. On AC / healthy thermal state it pings more often; on low battery, Low Power Mode, or serious thermal pressure it backs off and logs that the slow path is energy-related. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap so the worker isn't paged out during active stretches.
+**Staying warm.** The worker pre-warms MLX/MPS on Fn key-down (so releasing finds a hot model), on a `NSWorkspaceDidWakeNotification` observer (so opening the lid re-warms the GPU kernels before your first press), and on an adaptive background ping. On AC / healthy thermal state it pings more often; on low battery, Low Power Mode, or serious thermal pressure it backs off and logs that the slow path is energy-related. The main process also calls `NSProcessInfo.beginActivityWithOptions_reason_` to opt out of App Nap during active stretches, explicitly using the allowing-idle-system-sleep variant so this persistent menu bar app cannot keep the Mac awake.
 
 ## Tech stack
 

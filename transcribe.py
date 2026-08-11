@@ -5,20 +5,23 @@ Voice Transcribe — hold Fn to record, release to transcribe & paste.
 Menu bar app using local ASR with optional screenshot-aware context.
 
 Architecture:
-  - Main process: rumps menu bar app + always-on audio stream
+  - Main process: rumps menu bar app + awake-session audio stream
   - Key monitor subprocess: Quartz CGEvent tap for Fn detection
   - Transcription worker subprocess: loads local ASR model, transcribes on demand
   - Optional screen assist: prefetches frontmost-window screenshots and injects fast local text context into ASR
 
 IMPORTANT — CoreAudio threading constraints:
-  The audio stream (sounddevice/PortAudio) is opened at startup and is NEVER
-  stopped or closed. This is intentional. PortAudio's Pa_StopStream and
+  While the display is awake, the audio stream (sounddevice/PortAudio) is opened
+  at startup and is NEVER stopped or closed. This is intentional. PortAudio's Pa_StopStream and
   Pa_AbortStream both call AudioDeviceStop, which tries to acquire CoreAudio's
   internal HALB_Mutex. If the audio callback is running (which it is every ~10ms),
   the callback thread already holds that mutex → DEADLOCK. This happens regardless
   of which thread calls stop/abort. The safe refresh path is to open a new input
   stream and retire the old object until process exit, never stop it in-place.
   Recording is controlled by toggling a boolean flag that the active callback checks.
+  When the display sleeps, the app exits and lets launchd restart it without opening
+  the microphone. Process exit safely releases CoreAudio without Pa_StopStream, and
+  the next Fn press opens a fresh stream after the user wakes the display.
 """
 
 import json
@@ -62,6 +65,7 @@ SETTINGS_FILE = Path(__file__).parent / "settings.json"
 LAST_RECORDING_FILE = Path(__file__).parent / "last_recording.wav"
 FAILED_RECORDINGS_DIR = Path(__file__).parent / "failed_recordings"
 LOCK_FILE = Path("/tmp/voice-transcribe.lock")
+DISPLAY_SLEEP_MARKER = Path("/tmp/voice-transcribe-display-asleep")
 MAX_HISTORY = 100
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
@@ -700,6 +704,16 @@ def _choose_input_device_index(devices, default_device=None, preferred_name=None
     return None
 
 
+def _is_main_display_asleep():
+    """Best-effort display state used to avoid opening the mic while idle."""
+    try:
+        from Quartz import CGDisplayIsAsleep, CGMainDisplayID
+
+        return bool(CGDisplayIsAsleep(CGMainDisplayID()))
+    except Exception:
+        return False
+
+
 class VoiceTranscribeApp(rumps.App):
     def __init__(self, key_pipe):
         super().__init__(ICON_IDLE, quit_button=None)
@@ -758,9 +772,9 @@ class VoiceTranscribeApp(rumps.App):
         # Used to label the HUD "Loading model…" on first use (cold MLX load ≈ 7s).
         self._model_warmed = self._new_model_warm_state()
 
-        # Audio stream health. We keep the capture stream always-on, but track
-        # callback freshness and can soft-refresh by opening a replacement stream
-        # if CoreAudio/device state goes stale.
+        # Audio stream health. The capture stream stays open for the current
+        # awake session, but display sleep restarts the app without opening the
+        # mic so CoreAudio cannot block idle system sleep.
         self._audio_stream = None
         self._retired_audio_streams = []
         self._audio_generation = 0
@@ -798,8 +812,12 @@ class VoiceTranscribeApp(rumps.App):
 
         self._rebuild_menu()
 
-        # Open always-on audio stream. See module docstring for why we never close it.
-        self._open_audio_stream()
+        # Never open the microphone in a launchd restart that occurs while the
+        # display is asleep. The first Fn press after wake opens it on demand.
+        if DISPLAY_SLEEP_MARKER.exists() or _is_main_display_asleep():
+            print("Display is asleep; deferring audio stream until recording", flush=True)
+        else:
+            self._open_audio_stream()
 
         # Poll pipe for key events in background thread
         threading.Thread(target=self._poll_pipe, daemon=True).start()
@@ -816,7 +834,7 @@ class VoiceTranscribeApp(rumps.App):
         # a full re-warm if GPU state is cold. See _send_warm_signal docstring.
         self._install_wake_observer()
         threading.Thread(target=self._warm_ping_loop, daemon=True).start()
-        self._disable_app_nap()
+        self._disable_app_nap_allowing_system_sleep()
 
     # ── Thermal Monitoring ──
 
@@ -996,11 +1014,38 @@ class VoiceTranscribeApp(rumps.App):
                     print("System woke from sleep → warming ASR model", flush=True)
                     app_self._send_warm_signal()
 
+                def screensDidSleep_(self, _notification):  # noqa: N802
+                    # PortAudio stop/close can deadlock in CoreAudio. Process
+                    # exit is the safe release boundary; launchd restarts us in
+                    # mic-deferred mode while the display remains asleep.
+                    threading.Thread(
+                        target=app_self._restart_for_display_sleep,
+                        daemon=True,
+                    ).start()
+
+                def screensDidWake_(self, _notification):  # noqa: N802
+                    threading.Thread(
+                        target=app_self._resume_audio_after_display_wake,
+                        daemon=True,
+                    ).start()
+
             self._wake_observer = _WakeObserver.alloc().init()
             NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
                 self._wake_observer,
                 b"wokeUp:",
                 "NSWorkspaceDidWakeNotification",
+                None,
+            )
+            NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+                self._wake_observer,
+                b"screensDidSleep:",
+                "NSWorkspaceScreensDidSleepNotification",
+                None,
+            )
+            NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+                self._wake_observer,
+                b"screensDidWake:",
+                "NSWorkspaceScreensDidWakeNotification",
                 None,
             )
         except Exception as exc:
@@ -1038,25 +1083,30 @@ class VoiceTranscribeApp(rumps.App):
             except Exception as exc:
                 print(f"Warm ping failed: {exc}", flush=True)
 
-    def _disable_app_nap(self):
-        """Keep the main process active — macOS won't page it out or throttle it.
+    def _disable_app_nap_allowing_system_sleep(self):
+        """Avoid App Nap while awake without preventing normal idle sleep.
 
         Stored as self._app_nap_activity so the activity doesn't get GC'd.
         """
         try:
             from Foundation import NSProcessInfo
 
-            # Flags: background-ok + latency-critical + disable idle system sleep
-            # Combined bitmask = 0x00FFFFFF | (1 << 20) | (1 << 19) etc. Easier to
-            # use the documented constants.
             pi = NSProcessInfo.processInfo()
-            # NSActivityUserInitiated (0x00FFFFFF) | NSActivityLatencyCritical (0xFF00000000)
-            # See NSProcessInfo.h. Encoded as one large long in Objective-C.
+            # NSActivityUserInitiated includes NSActivityIdleSystemSleepDisabled.
+            # Clear that bit so the hotkey stays responsive while the Mac is awake
+            # but the always-on menu bar process never acts like caffeinate.
             NSActivityUserInitiated = 0x00FFFFFF
+            NSActivityIdleSystemSleepDisabled = 1 << 20
+            NSActivityUserInitiatedAllowingIdleSystemSleep = (
+                NSActivityUserInitiated & ~NSActivityIdleSystemSleepDisabled
+            )
             NSActivityLatencyCritical = 0xFF00000000
-            options = NSActivityUserInitiated | NSActivityLatencyCritical
+            options = (
+                NSActivityUserInitiatedAllowingIdleSystemSleep
+                | NSActivityLatencyCritical
+            )
             self._app_nap_activity = pi.beginActivityWithOptions_reason_(
-                options, "Keep ASR worker responsive across sleep/wake"
+                options, "Keep ASR hotkey responsive while system is awake"
             )
         except Exception as exc:
             print(f"App Nap disable failed: {exc}", flush=True)
@@ -1526,7 +1576,7 @@ class VoiceTranscribeApp(rumps.App):
                 self._restart_key_monitor()
                 continue
 
-    # ── Audio Stream (always-on) ──
+    # ── Audio Stream (persistent only during an awake-display session) ──
     # DO NOT add stream.stop(), stream.abort(), or stream.close() anywhere.
     # See module docstring for the CoreAudio HALB_Mutex deadlock explanation.
 
@@ -1550,7 +1600,7 @@ class VoiceTranscribeApp(rumps.App):
         return device_idx, dev_name
 
     def _open_audio_stream(self, reason="startup"):
-        """Open a persistent audio input stream.
+        """Open an awake-session audio input stream.
 
         The callback always fires (~every 10ms). When is_recording is False, it
         discards the data (negligible CPU). When True, it appends to audio_buffer.
@@ -1709,6 +1759,36 @@ class VoiceTranscribeApp(rumps.App):
                 pass
         os._exit(75)
 
+    def _restart_for_display_sleep(self):
+        """Release the persistent mic safely so macOS may enter idle sleep."""
+        if self._relaunch_requested:
+            return
+        self._relaunch_requested = True
+        print(
+            "Display slept → releasing microphone through a clean app restart",
+            flush=True,
+        )
+        try:
+            DISPLAY_SLEEP_MARKER.touch()
+        except Exception as exc:
+            print(f"Could not write display-sleep marker: {exc}", flush=True)
+        for proc in multiprocessing.active_children():
+            try:
+                proc.kill()
+                proc.join(timeout=1)
+            except Exception:
+                pass
+        os._exit(75)
+
+    def _resume_audio_after_display_wake(self):
+        """Clear sleep mode and restore low-latency capture after display wake."""
+        try:
+            DISPLAY_SLEEP_MARKER.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"Could not clear display-sleep marker: {exc}", flush=True)
+        if self._audio_stream is None:
+            self._refresh_audio_stream("display-wake: no stream", force=True)
+
     def _refresh_audio_stream(self, reason, force=False):
         """Soft-refresh input without stopping the old CoreAudio stream."""
         if not self._audio_refresh_lock.acquire(blocking=False):
@@ -1818,6 +1898,11 @@ class VoiceTranscribeApp(rumps.App):
             try:
                 if self.is_recording or self.is_processing:
                     continue
+                if DISPLAY_SLEEP_MARKER.exists() or _is_main_display_asleep():
+                    # A launchd restart after display sleep deliberately has no
+                    # input stream. Do not let the health watchdog reopen the
+                    # microphone and recreate a sleep-blocking CoreAudio claim.
+                    continue
                 # Idle callback staleness is not reliable enough to justify a
                 # refresh/relaunch. On this Mac it was repeatedly cycling:
                 # stale callback → replacement streams → retired-stream cap →
@@ -1878,6 +1963,7 @@ class VoiceTranscribeApp(rumps.App):
     def _start_recording(self):
         if self.is_recording or self.is_processing:
             return
+        DISPLAY_SLEEP_MARKER.unlink(missing_ok=True)
         self._ensure_audio_stream_healthy("recording-start")
         self.audio_buffer = []
         self._recording_started_monotonic = time.monotonic()
