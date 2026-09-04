@@ -1,132 +1,61 @@
-"""Key monitor subprocess — hold-to-record via Quartz CGEvent tap.
+"""Fn-key monitor subprocess for hold-to-record.
 
-Hold Fn (Globe) -> Qwen3-ASR 0.6B.
-
-Uses low-level Quartz event tap to detect actual key press/release state.
-Auto-recovers when macOS disables the event tap (sleep/wake, screen lock).
+Polling the physical Quartz key state is deliberately used instead of a
+CGEvent tap. Recent macOS versions can repeatedly disable listen-only event
+taps even when Input Monitoring is granted; key-state polling stays active and
+is sufficient because this app only needs the Fn press/release state.
 """
+
 import os
-import threading
 import time
 
 
-# Send heartbeats so parent can detect a dead monitor
-HEARTBEAT_INTERVAL = 10  # seconds
+POLL_INTERVAL = 0.01
+HEARTBEAT_INTERVAL = 10.0
+FN_KEYCODE = 63
 
 
 def run(pipe):
-    """Monitor Fn key press/release. Hold = record, release = stop.
-    Auto-recovers when macOS disables the event tap."""
+    """Send ``down:fast`` and ``up`` messages as the Fn modifier changes."""
     print(f"Key monitor process started (PID {os.getpid()})", flush=True)
 
     try:
         from Quartz import (
-            CGEventTapCreate,
-            CGEventMaskBit,
-            CGEventGetFlags,
-            CGEventTapIsEnabled,
-            kCGEventFlagsChanged,
-            kCGEventFlagMaskSecondaryFn,
-            kCGEventTapDisabledByTimeout,
-            kCGEventTapDisabledByUserInput,
-            kCGHeadInsertEventTap,
-            kCGSessionEventTap,
-            CGEventTapEnable,
-        )
-        from CoreFoundation import (
-            CFMachPortCreateRunLoopSource,
-            CFRunLoopAddSource,
-            CFRunLoopGetCurrent,
-            CFRunLoopRunInMode,
-            CFRunLoopStop,
-            kCFRunLoopDefaultMode,
-            kCFRunLoopCommonModes,
+            CGEventSourceKeyState,
+            kCGEventSourceStateHIDSystemState,
         )
         print("Key monitor: Quartz imported OK", flush=True)
-    except Exception as e:
-        print(f"Key monitor: Quartz import failed: {e}", flush=True)
+    except Exception as exc:
+        print(f"Key monitor: Quartz import failed: {exc}", flush=True)
         return
 
-    is_held = [False]
-    last_event_time = [0.0]
-    tap_ref = [None]
-
-    def callback(proxy, event_type, event, refcon):
-        # macOS sends special event types when the tap is disabled
-        if event_type == kCGEventTapDisabledByTimeout or event_type == kCGEventTapDisabledByUserInput:
-            print(f"Key monitor: tap disabled (type={event_type}), re-enabling...", flush=True)
-            if tap_ref[0] is not None:
-                CGEventTapEnable(tap_ref[0], True)
-            return event
-
-        now = time.monotonic()
-        if now - last_event_time[0] < 0.03:
-            return event
-        last_event_time[0] = now
-
-        flags = CGEventGetFlags(event)
-        fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
-
-        try:
-            if not is_held[0] and fn_now:
-                is_held[0] = True
-                pipe.send("down:fast")
-            elif is_held[0] and not fn_now:
-                is_held[0] = False
-                pipe.send("up")
-        except (BrokenPipeError, OSError):
-            pass
-
-        return event
-
-    def _heartbeat():
-        """Send periodic heartbeats so parent knows we're alive."""
-        while True:
-            time.sleep(HEARTBEAT_INTERVAL)
-            try:
-                pipe.send("heartbeat")
-            except (BrokenPipeError, OSError):
-                os._exit(0)
-
-    threading.Thread(target=_heartbeat, daemon=True).start()
+    is_held = False
+    last_heartbeat = time.monotonic()
+    print("Key monitor: polling active (Fn=Qwen3 0.6B)", flush=True)
 
     while True:
-        mask = CGEventMaskBit(kCGEventFlagsChanged)
-        tap = CGEventTapCreate(
-            kCGSessionEventTap,
-            kCGHeadInsertEventTap,
-            0,
-            mask,
-            callback,
-            None,
-        )
+        try:
+            # Arrow/navigation keys can also set SecondaryFn. Query the actual
+            # Fn key instead so moving the cursor never starts a recording.
+            fn_now = bool(CGEventSourceKeyState(
+                kCGEventSourceStateHIDSystemState, FN_KEYCODE
+            ))
 
-        if tap is None:
-            print("Key monitor: failed to create event tap. Grant Accessibility permission in System Settings.", flush=True)
-            time.sleep(5)
-            continue
+            if fn_now and not is_held:
+                is_held = True
+                pipe.send("down:fast")
+            elif is_held and not fn_now:
+                is_held = False
+                pipe.send("up")
 
-        tap_ref[0] = tap
-        source = CFMachPortCreateRunLoopSource(None, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes)
-        CGEventTapEnable(tap, True)
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                pipe.send("heartbeat")
+                last_heartbeat = now
 
-        print("Key monitor: listener active (Fn=Qwen3 0.6B)", flush=True)
-
-        while True:
-            result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5.0, False)
-
-            if not CGEventTapIsEnabled(tap):
-                print("Key monitor: tap was disabled by macOS, re-enabling...", flush=True)
-                CGEventTapEnable(tap, True)
-                if not CGEventTapIsEnabled(tap):
-                    print("Key monitor: re-enable failed, recreating tap...", flush=True)
-                    if is_held[0]:
-                        is_held[0] = False
-                        try:
-                            pipe.send("up")
-                        except (BrokenPipeError, OSError):
-                            pass
-                    break
-
-        time.sleep(1)
+            time.sleep(POLL_INTERVAL)
+        except (BrokenPipeError, EOFError, OSError):
+            return
+        except Exception as exc:
+            print(f"Key monitor: polling error: {exc}", flush=True)
+            time.sleep(1.0)

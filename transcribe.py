@@ -929,21 +929,25 @@ class VoiceTranscribeApp(rumps.App):
         discards the data (negligible CPU). When True, it appends to audio_buffer.
         """
         device_idx = None
+        input_devices = []
         try:
             for i, dev in enumerate(sd.query_devices()):
-                if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
+                if dev['max_input_channels'] > 0:
+                    input_devices.append(i)
+                if device_idx is None and dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
                     device_idx = i
-                    break
-            if device_idx is None:
-                for i, dev in enumerate(sd.query_devices()):
-                    if dev['max_input_channels'] > 0:
-                        device_idx = i
-                        break
         except Exception:
             pass
 
-        dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
-        print(f"Audio stream opened on device {device_idx}: {dev_name}", flush=True)
+        # CoreAudio can briefly reject a stream while an AirPods/default-device
+        # route is changing. Try the built-in mic first, then every other input,
+        # and retry the complete list before treating startup as failed.
+        candidates = []
+        if device_idx is not None:
+            candidates.append(device_idx)
+        candidates.extend(i for i in input_devices if i not in candidates)
+        if not candidates:
+            candidates.append(None)
 
         def audio_callback(indata, frames, time_info, status):
             if status:
@@ -962,14 +966,27 @@ class VoiceTranscribeApp(rumps.App):
                 except Exception:
                     pass
 
-        self._audio_stream = sd.InputStream(
-            device=device_idx,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            callback=audio_callback,
-        )
-        self._audio_stream.start()
+        last_error = None
+        for attempt in range(3):
+            for candidate in candidates:
+                try:
+                    stream = sd.InputStream(
+                        device=candidate,
+                        samplerate=SAMPLE_RATE,
+                        channels=CHANNELS,
+                        dtype="float32",
+                        callback=audio_callback,
+                    )
+                    stream.start()
+                    self._audio_stream = stream
+                    dev_name = sd.query_devices(candidate)['name'] if candidate is not None else 'default'
+                    print(f"Audio stream opened on device {candidate}: {dev_name}", flush=True)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    print(f"Audio device {candidate} unavailable (attempt {attempt + 1}/3): {exc}", flush=True)
+            time.sleep(1.0)
+        raise RuntimeError(f"Unable to open any microphone after retries: {last_error}")
 
     # ── Recording ──
     # Start/stop are just flag toggles — no CoreAudio calls, no mutex, no deadlock.

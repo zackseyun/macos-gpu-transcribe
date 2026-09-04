@@ -22,7 +22,6 @@ from AppKit import (
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorIgnoresCycle,
-    NSWindowCollectionBehaviorMoveToActiveSpace,
     NSWindowCollectionBehaviorTransient,
 )
 from Foundation import NSMakeRect, NSObject, NSTimer
@@ -202,7 +201,6 @@ class HUDController(NSObject):
         self._window.setHasShadow_(True)
         self._window.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorMoveToActiveSpace
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorTransient
             | NSWindowCollectionBehaviorIgnoresCycle
