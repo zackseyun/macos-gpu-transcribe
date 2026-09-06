@@ -11,3 +11,5 @@ dist/
 models/
 .swift-runtime/
 default.profraw
+
+.swift-runtime/

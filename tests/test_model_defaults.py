@@ -4,10 +4,10 @@ import transcribe
 
 
 class ModelDefaultsTest(unittest.TestCase):
-    def test_fn_default_model_is_cohere_mlx_8bit(self):
-        self.assertEqual(transcribe.DEFAULT_MODEL_MODE, "cohere")
-        self.assertEqual(transcribe.MENU_MODEL_MODES[0], "cohere")
-        self.assertEqual(transcribe.MODEL_LABELS["fast"], "Qwen3-ASR 0.6B 4-bit")
+    def test_fn_default_model_is_qwen_swift_mlx(self):
+        self.assertEqual(transcribe.DEFAULT_MODEL_MODE, "fast")
+        self.assertEqual(transcribe.MENU_MODEL_MODES[0], "fast")
+        self.assertEqual(transcribe.MODEL_LABELS["fast"], "Qwen3-ASR 0.6B (MLX)")
         self.assertIn("cohere", transcribe.MENU_MODEL_MODES)
         self.assertIn("fast", transcribe.MENU_MODEL_MODES)
         self.assertIn("cohere-swift-4bit", transcribe.MENU_MODEL_MODES)

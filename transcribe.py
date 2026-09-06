@@ -163,16 +163,16 @@ BACKGROUND_WARM_LOW_BATTERY_PERCENT = int(os.getenv("VOICE_TRANSCRIBE_WARM_LOW_B
 # Set "vocabulary" in settings.json to opt back in for specialised dictation.
 STATIC_VOCABULARY_DEFAULT = ""
 
-DEFAULT_MODEL_MODE = "cohere"
+DEFAULT_MODEL_MODE = "fast"
 MODEL_LABELS = {
     "granite": "Granite Speech 4.1 NAR",
     "cohere": "Cohere Transcribe MLX 8-bit",
     "cohere-swift-4bit": "Cohere Transcribe Swift 4-bit",
     "cohere-pytorch": "Cohere Transcribe 2B PyTorch",
-    "fast": "Qwen3-ASR 0.6B 4-bit",
+    "fast": "Qwen3-ASR 0.6B (MLX)",
     "accurate": "Qwen3-ASR 1.7B",
 }
-MENU_MODEL_MODES = ("cohere", "cohere-swift-4bit", "fast", "cohere-pytorch", "granite")
+MENU_MODEL_MODES = ("fast", "cohere", "cohere-swift-4bit", "cohere-pytorch", "granite")
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.

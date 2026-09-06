@@ -829,6 +829,9 @@ def run(request_pipe, result_pipe):
     except Exception as e:
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
 
+    from swift_asr import SwiftASR
+    swift_qwen = SwiftASR()
+
     qwen3_transcribe_fn = None
     qwen3_loaded_models = set()
     cohere_processor = None
@@ -872,7 +875,14 @@ def run(request_pipe, result_pipe):
         }
         if QWEN3_MAX_NEW_TOKENS is not None:
             kwargs["max_new_tokens"] = QWEN3_MAX_NEW_TOKENS
-        raw = transcribe_fn(audio_input, **kwargs)
+        raw = swift_qwen.transcribe(
+            audio_input, lambda: transcribe_fn(audio_input, **kwargs),
+            fast=(model_id == QWEN3_MODEL_IDS["fast"]
+                  and not os.getenv("VOICE_TRANSCRIBE_QWEN_FAST_MODEL")
+                  and QWEN3_MAX_NEW_TOKENS is None
+                  and QWEN3_LANGUAGE in (None, "en", "English")),
+            context=screen_context, warm=warm,
+        )
         if warm:
             qwen3_loaded_models.add(model_id)
         return raw
@@ -1135,7 +1145,7 @@ def run(request_pipe, result_pipe):
                 continue
             if warm_model_mode != "cohere":
                 now = time.time()
-                if now - last_any_inference_at[0] >= ON_DEMAND_WARM_SKIP_THRESHOLD:
+                if not qwen3_loaded_models or now - last_any_inference_at[0] >= ON_DEMAND_WARM_SKIP_THRESHOLD:
                     threading.Thread(
                         target=_warm_qwen3, args=("on-demand", warm_model_mode), daemon=True
                     ).start()
@@ -1261,4 +1271,5 @@ def run(request_pipe, result_pipe):
         except Exception as e:
             result_pipe.send({"text": "", "time": 0, "error": str(e)})
 
+    swift_qwen.stop()
     print("Transcription worker: exiting", flush=True)
