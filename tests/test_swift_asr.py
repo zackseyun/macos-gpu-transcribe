@@ -27,6 +27,13 @@ class SwiftASRTests(unittest.TestCase):
     def test_continuous_long_speech_requests_full_clip_fallback(self):
         self.assertIsNone(_split_wav(_wav_bytes(np.full(30 * 16000, 0.2))))
 
+    def test_short_pauses_above_noise_floor_stay_on_swift(self):
+        speech = np.full(8 * 16000, 0.02, dtype=np.float32)
+        pause = np.full(int(0.08 * 16000), 0.003, dtype=np.float32)
+        chunks = _split_wav(_wav_bytes(np.concatenate([speech, pause, speech, pause, speech])))
+        self.assertIsNotNone(chunks)
+        self.assertEqual(len(chunks), 3)
+
     def test_sample_rate_preserved(self):
         with wave.open(io.BytesIO(_wav_bytes((np.zeros(8000), 8000)))) as wav:
             self.assertEqual(wav.getframerate(), 8000)

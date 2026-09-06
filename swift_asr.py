@@ -64,17 +64,26 @@ def _split_wav(data):
     frame = 320  # 20 ms
     framed = samples[:len(samples) // frame * frame].astype(np.float32).reshape(-1, frame)
     rms = np.sqrt(np.mean(framed ** 2, axis=1))
-    threshold = max(3.0, float(np.percentile(rms, 95)) * 0.10)
+    speech_level = float(np.percentile(rms, 95))
+    noise_level = float(np.percentile(rms, 10))
+    threshold = max(3.0, min(speech_level * 0.30,
+                             max(speech_level * 0.12, noise_level * 1.5)))
     quiet = rms < threshold
-    pauses = np.convolve(quiet.astype(int), np.ones(8, dtype=int), mode="valid") == 8
+    transitions = np.diff(np.concatenate(([False], quiet, [False])).astype(int))
+    pause_starts = np.flatnonzero(transitions == 1) * frame
+    pause_ends = np.flatnonzero(transitions == -1) * frame
     boundaries = []
     start = 0
     while len(samples) - start > limit:
-        candidates = np.flatnonzero(pauses) * frame + 4 * frame
-        candidates = candidates[(candidates >= start + 6 * 16000) & (candidates <= start + limit)]
-        if not len(candidates):
+        # Prefer the widest pause, not the last tiny gap near a word onset.
+        # Restrict the search to the safe chunk-size window before ranking.
+        starts = np.maximum(pause_starts, start + 6 * 16000)
+        ends = np.minimum(pause_ends, start + limit)
+        widths = ends - starts
+        if not len(widths) or int(widths.max()) < 3 * frame:
             return None
-        end = int(candidates[-1])
+        best = int(np.argmax(widths))
+        end = int((starts[best] + ends[best]) // 2)
         boundaries.append((start, end))
         start = end
     boundaries.append((start, len(samples)))
@@ -168,7 +177,7 @@ class SwiftASR:
                     print(f"Swift MLX unavailable: {exc}; using Python MLX until worker restart", flush=True)
             self.last_backend = "python-mlx"
             if not warm:
-                reason = " (screen context)" if context else ""
+                reason = " (screen context)" if context else " (no safe pause or explicit fallback)"
                 print(f"ASR backend: {self.last_backend}{reason}", flush=True)
             return fallback()
 

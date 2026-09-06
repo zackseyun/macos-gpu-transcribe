@@ -831,6 +831,7 @@ def run(request_pipe, result_pipe):
 
     from swift_asr import SwiftASR
     swift_qwen = SwiftASR()
+    fallback_warmed = set()
 
     qwen3_transcribe_fn = None
     qwen3_loaded_models = set()
@@ -883,6 +884,12 @@ def run(request_pipe, result_pipe):
                   and QWEN3_LANGUAGE in (None, "en", "English")),
             context=screen_context, warm=warm,
         )
+        # Prepare the alternate backend during startup, not on a long dictation.
+        if warm and swift_qwen.last_backend == "swift-mlx-int4" and model_id not in fallback_warmed:
+            transcribe_fn(audio_input, model=model_id, language="English", max_new_tokens=16)
+            fallback_warmed.add(model_id)
+            print("Python MLX fallback warmed: " + model_id, flush=True)
+
         if warm:
             qwen3_loaded_models.add(model_id)
         return raw

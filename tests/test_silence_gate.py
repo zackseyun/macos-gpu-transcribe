@@ -42,6 +42,11 @@ class SilenceGateTest(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertTrue(transcribe._is_low_confidence_no_volume(stats))
 
+    def test_quiet_dictation_below_old_cutoff_is_not_discarded(self):
+        stats, reason = self.decision_for(sine(3.0, amplitude=0.011))
+        self.assertLess(stats["max_rms"], 0.008)
+        self.assertIsNone(reason)
+
     def test_sustained_speech_like_audio_is_allowed(self):
         audio = sine(0.55, amplitude=0.06)
         stats, reason = self.decision_for(audio)

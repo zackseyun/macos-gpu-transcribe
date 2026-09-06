@@ -177,12 +177,12 @@ MENU_MODEL_MODES = ("fast", "cohere", "cohere-swift-4bit", "cohere-pytorch", "gr
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
 # Prevents Whisper-style ASR hallucinations on silent/near-silent input
-# ("Thank you.", ".", "you", etc.). Tuned for MacBook Pro internal mic noise
-# floor (~0.002-0.005 RMS); real speech is typically 0.02+.
-SILENCE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_RMS", "0.008"))
+# ("Thank you.", ".", "you", etc.). Keep this conservative: quiet real
+# dictation on the MacBook Air measured only 0.0078 RMS.
+SILENCE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_RMS", "0.0025"))
 SILENCE_WINDOW_SECONDS = 0.2
 SILENCE_FRAME_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_FRAME_SECONDS", "0.03"))
-SILENCE_ACTIVE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS", "0.012"))
+SILENCE_ACTIVE_RMS_THRESHOLD = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS", "0.003"))
 SILENCE_MIN_RECORDING_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_MIN_RECORDING_SECONDS", "0.25"))
 SILENCE_MIN_ACTIVE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_MIN_ACTIVE_SECONDS", "0.28"))
 SILENCE_LOW_CONFIDENCE_FULL_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS", "0.010"))
@@ -2340,6 +2340,7 @@ class VoiceTranscribeApp(rumps.App):
             pb.clearContents()
             ok = pb.setString_forType_(text, NSPasteboardTypeString)
             deadline = time.perf_counter() + max(0.0, PASTEBOARD_SET_TIMEOUT)
+            paste_change_count = pb.changeCount()
             confirmed = pb.stringForType_(NSPasteboardTypeString) == text
             while not confirmed and time.perf_counter() < deadline:
                 if pb.stringForType_(NSPasteboardTypeString) == text:
@@ -2389,10 +2390,10 @@ class VoiceTranscribeApp(rumps.App):
                         old_contents=old_contents,
                         require_unchanged=PASTEBOARD_RESTORE_REQUIRES_UNCHANGED,
                     )
-                if not should_restore:
-                    return
-                restore_pb.clearContents()
-                restore_pb.setString_forType_(old_contents, NSPasteboardTypeString)
+                    if not should_restore or restore_pb.changeCount() != paste_change_count:
+                        return
+                    restore_pb.clearContents()
+                    restore_pb.setString_forType_(old_contents, NSPasteboardTypeString)
 
         if PASTEBOARD_RESTORE_ASYNC:
             threading.Thread(target=_restore_clipboard, daemon=True).start()

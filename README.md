@@ -200,7 +200,7 @@ tail -f /tmp/voice-transcribe.log
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
-| `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.008` | Silence gate threshold (raise if you get false transcriptions of ambient noise) |
+| `VOICE_TRANSCRIBE_SILENCE_RMS` | `0.0025` | Silence gate threshold (raise if you get false transcriptions of ambient noise) |
 | `VOICE_TRANSCRIBE_SILENCE_ACTIVE_RMS` | `0.012` | Per-frame RMS level counted as active audio for smoother no-volume detection |
 | `VOICE_TRANSCRIBE_SILENCE_MIN_ACTIVE_SECONDS` | `0.28` | Minimum sustained active audio before a quiet recording is treated as a real clip |
 | `VOICE_TRANSCRIBE_SILENCE_LOW_FULL_RMS` | `0.010` | Overall RMS below this keeps low-content Granite output from falling back to Cohere |
@@ -322,3 +322,16 @@ scripts/install_mlx_audio_swift.sh
 ```
 
 Checkpoint before this experiment: `checkpoint/pre-cohere-mlx-swift-20260521-113301`.
+
+
+### Quiet dictation and fallback latency
+
+The silence cutoff is now 0.0025 RMS (override with `VOICE_TRANSCRIBE_SILENCE_RMS`). Quiet phrases around 0.008 RMS must reach ASR instead of being discarded. The live app confirms the clipboard write before posting paste and gives the receiving app three seconds to consume it before restoring the old clipboard; restoration never overwrites a later clipboard write. Transcripts remain available in history if automatic paste fails.
+
+Swift pause splitting accepts 60 ms gaps and adapts to microphone noise. When no safe pause exists, Python MLX remains the full-clip fallback. Startup warmup prepares that fallback too, so the first fallback request does not load the model. Create the smaller local fallback checkpoint with:
+
+```bash
+.venv/bin/python scripts/quantize_qwen3_asr.py
+```
+
+Restart after creating the checkpoint. The default Qwen fallback automatically selects `models/qwen3-asr-0.6b-4bit` when present.
