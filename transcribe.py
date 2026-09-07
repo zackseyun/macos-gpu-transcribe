@@ -528,6 +528,15 @@ def _should_relaunch_after_audio_refresh_failure(reason, error_text):
     )
 
 
+def _low_power_menu_title(low_power):
+    """Menu line naming the most common cause of slow Fn dictation on this Mac."""
+    if low_power is True:
+        return "⚡ Low Power Mode: ON (GPU clock-capped — expect slower transcriptions)"
+    if low_power is False:
+        return "⚡ Low Power Mode: off"
+    return "⚡ Low Power Mode: unknown"
+
+
 def _parse_pmset_battery_output(output):
     """Parse `pmset -g batt` enough for low-power diagnostics/logging."""
     text = output or ""
@@ -926,6 +935,21 @@ class VoiceTranscribeApp(rumps.App):
         elif level >= 3:
             suffix = " (heavily throttled — transcriptions will be very slow)"
         return f"{icon} Thermal: {label}{suffix}"
+
+    def _is_low_power_mode(self):
+        """NSProcessInfo-only check (no pmset subprocess) so menu rebuilds stay cheap."""
+        try:
+            from Foundation import NSProcessInfo
+
+            pi = NSProcessInfo.processInfo()
+            if hasattr(pi, "isLowPowerModeEnabled"):
+                return bool(pi.isLowPowerModeEnabled())
+        except Exception:
+            pass
+        return None
+
+    def _power_menu_title(self):
+        return _low_power_menu_title(self._is_low_power_mode())
 
     def _idle_icon_with_thermal(self):
         """Return the idle icon, appending a thermal warning if needed."""
@@ -2613,6 +2637,7 @@ class VoiceTranscribeApp(rumps.App):
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
+        self.menu.add(rumps.MenuItem(self._power_menu_title(), callback=None))
         self.menu.add(rumps.separator)
 
         if self.history:

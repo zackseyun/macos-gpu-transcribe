@@ -222,6 +222,9 @@ tail -f /tmp/voice-transcribe.log
 | `VOICE_TRANSCRIBE_WARM_PING_SECONDS` | `240` | Background warm cadence while power/thermal state is healthy |
 | `VOICE_TRANSCRIBE_WARM_PING_LOW_POWER_SECONDS` | `900` | Slower background warm cadence when Low Power Mode, low battery, or serious thermal pressure is detected |
 | `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
+| `VOICE_TRANSCRIBE_ON_DEMAND_WARM_SKIP_SECONDS` | `45` | Skip the Fn-down warm if any inference ran this recently. Longer than the 20s keep-warm cadence so a redundant warm never holds the inference lock while a short dictation waits |
+| `VOICE_TRANSCRIBE_MLX_CACHE_LIMIT_GB` | `2` | MLX buffer-cache cap for freed scratch memory. Cohere 8-bit peaks near 1.4GB of scratch per 35s chunk; the old 6GB cap grew the worker to a ~10GB footprint that macOS swapped out between dictations |
+| `VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB` | `8` | MLX wired-memory limit so the ~3.8GB of Cohere weights stay resident instead of being paged to swap while idle. Capped to MLX's recommended working set; `0` disables |
 | `VOICE_TRANSCRIBE_QWEN_FAST_MODEL` | local quantized model if present, else `Qwen/Qwen3-ASR-0.6B` | Model used by the fast Fn path |
 | `VOICE_TRANSCRIBE_QWEN_PRELOAD` | `false` | Legacy worker-side Qwen preload. The app now warms the selected default model after worker start instead, so Cohere defaults do not compete with Qwen preload |
 | `VOICE_TRANSCRIBE_QWEN_KEEP_WARM` | `true` | Keep Qwen warm during active use instead of clearing the MLX cache after each dictation |
@@ -281,6 +284,7 @@ macos-gpu-transcribe/
 | Granite says CrispASR is not installed | Run `./install.sh` or manually build `.crispasr/build/bin/crispasr`; switch the menu default to Cohere meanwhile |
 | Granite returns only punctuation | Real-audio failures fall back to Cohere; low-volume / no-speech clips end immediately so the app is not stuck waiting. Failed real recordings are preserved under `failed_recordings/`, and the most recent raw recording is always copied to `last_recording.wav` |
 | First press after opening laptop is slow | Check `/tmp/voice-transcribe.log` for `SLOW (...)`: it now includes thermal, battery, and Low Power Mode context. If energy state is healthy, the likely cause is cold GPU/model state; the adaptive warm ping should reduce that |
+| Every transcription is 5-10× slower than usual (`SLOW (... low_power=on ...)` in the log) | The model is not the problem: Cohere MLX 8-bit runs ~40× real-time on an M4 Max, and the same clip drops to 3-7× when Low Power Mode caps the GPU clock and other GPU-heavy apps (Chrome, iOS Simulator, screen sharing, video encode) share the GPU. Turn Low Power Mode off in System Settings → Battery (set it to "Never" or "Only on Battery"); the menu bar shows the current state. `.venv/bin/python3 scripts/probe_cohere_mlx_latency.py --simple` measures the live-state throughput of the exact worker code path |
 | Multiple menu bar icons | `pkill -9 -f transcribe.py` then restart |
 | Cohere: 401 Unauthorized | Request access at `huggingface.co/CohereLabs/cohere-transcribe-03-2026`, re-run `install.sh` |
 | Broken pipe error on quit | Expected — subprocesses shutting down |

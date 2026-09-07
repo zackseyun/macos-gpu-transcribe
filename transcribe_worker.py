@@ -33,8 +33,24 @@ from urllib import request as urlrequest
 import numpy as np
 
 
-# Metal cache limit — caps GPU buffer cache to 6GB (both models + headroom)
-METAL_CACHE_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
+# MLX buffer-cache limit. This bounds how much *freed* scratch memory MLX keeps
+# around for reuse; model weights are active memory and are unaffected. The old
+# 6GB cap let the resident worker grow to a ~10GB dirty footprint that macOS
+# then compressed/swapped while the app idled and faulted back in on the next
+# Fn release (seen as 20-30s "on-demand warm" stalls). Cohere 8-bit peaks at
+# ~1.4GB of scratch per 35s chunk in local measurements (clips are chunked at
+# 35s, so longer clips do not need more), so 2GB keeps every scratch buffer
+# reusable while roughly halving the resident footprint.
+METAL_CACHE_LIMIT_BYTES = int(
+    float(os.getenv("VOICE_TRANSCRIBE_MLX_CACHE_LIMIT_GB", "2")) * 1024 ** 3
+)
+
+# MLX wired-memory limit. Wiring keeps the ~3.8GB of Cohere weights (plus scratch)
+# resident so they cannot be paged out to swap between dictations; mlx-lm does
+# the same during generation. Capped to MLX's recommended working set. 0 disables.
+METAL_WIRED_LIMIT_BYTES = int(
+    float(os.getenv("VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB", "8")) * 1024 ** 3
+)
 
 REPO_DIR = Path(__file__).resolve().parent
 QWEN3_QUANTIZED_FAST_MODEL = REPO_DIR / "models" / "qwen3-asr-0.6b-4bit"
@@ -107,8 +123,15 @@ KEEP_WARM_AUDIO_SECONDS = 0.5  # 0.5s of silence = trivially fast dummy inferenc
 # This prevents constant GPU heat during long idle periods.
 KEEP_WARM_MAX_IDLE = float(os.getenv("VOICE_TRANSCRIBE_KEEP_WARM_MAX_IDLE", "300"))
 
-# Skip on-demand warm if model was used within this many seconds (already hot).
-ON_DEMAND_WARM_SKIP_THRESHOLD = 15.0
+# Skip the Fn-down on-demand warm if any inference ran within this window. The
+# keep-warm loop fires every ~20s while dictation is active, so the old 15s
+# threshold made roughly one in four Fn presses launch a redundant warm that
+# held inference_lock and delayed the real transcription by the warm's full
+# duration (1.5-4s under GPU contention). Longer than the keep-warm cadence, so
+# on-demand warming now only runs after genuine idle.
+ON_DEMAND_WARM_SKIP_THRESHOLD = float(
+    os.getenv("VOICE_TRANSCRIBE_ON_DEMAND_WARM_SKIP_SECONDS", "45")
+)
 QWEN3_LANGUAGE = (os.getenv("VOICE_TRANSCRIBE_QWEN_LANGUAGE", "English").strip() or None)
 QWEN3_PRELOAD = _env_bool("VOICE_TRANSCRIBE_QWEN_PRELOAD", False)
 QWEN3_KEEP_WARM = _env_bool("VOICE_TRANSCRIBE_QWEN_KEEP_WARM", True)
@@ -268,17 +291,29 @@ def _cohere_mlx_audio_from_input(audio_input):
 def _resolve_cohere_mlx_model_dir():
     from huggingface_hub import snapshot_download
 
-    root = Path(snapshot_download(
-        repo_id=COHERE_MLX_MODEL_ID,
-        allow_patterns=[
-            "*.json",
-            "*.safetensors",
-            "*.model",
-            "*.txt",
-            "*.md",
-            f"{COHERE_MLX_SUBDIR}/*",
-        ],
-    ))
+    allow_patterns = [
+        "*.json",
+        "*.safetensors",
+        "*.model",
+        "*.txt",
+        "*.md",
+        f"{COHERE_MLX_SUBDIR}/*",
+    ]
+    # The worker reloads the model after every display sleep. Resolve the cached
+    # snapshot offline first so a reconnecting network after wake cannot stall
+    # the load on a Hub metadata round-trip; only go to the network when the
+    # model has not been downloaded yet.
+    try:
+        root = Path(snapshot_download(
+            repo_id=COHERE_MLX_MODEL_ID,
+            allow_patterns=allow_patterns,
+            local_files_only=True,
+        ))
+    except Exception:
+        root = Path(snapshot_download(
+            repo_id=COHERE_MLX_MODEL_ID,
+            allow_patterns=allow_patterns,
+        ))
     if COHERE_MLX_SUBDIR and COHERE_MLX_SUBDIR not in {".", ""}:
         return root / COHERE_MLX_SUBDIR
     return root
@@ -828,6 +863,18 @@ def run(request_pipe, result_pipe):
         print(f"Transcription worker: Metal cache limit set to {METAL_CACHE_LIMIT_BYTES / (1024**3):.0f}GB", flush=True)
     except Exception as e:
         print(f"Transcription worker: failed to set cache limit: {e}", flush=True)
+    if mx is not None and METAL_WIRED_LIMIT_BYTES > 0:
+        try:
+            recommended = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
+            wired = min(METAL_WIRED_LIMIT_BYTES, recommended) if recommended else METAL_WIRED_LIMIT_BYTES
+            mx.set_wired_limit(wired)
+            print(
+                f"Transcription worker: Metal wired limit set to {wired / (1024**3):.0f}GB "
+                "(keeps model weights resident between dictations)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"Transcription worker: failed to set wired limit: {e}", flush=True)
 
     from swift_asr import SwiftASR
     swift_qwen = SwiftASR()
@@ -1272,7 +1319,16 @@ def run(request_pipe, result_pipe):
 
             elapsed = time.time() - t0
             context_note = f", screen_context={len(screen_context)} chars" if screen_context else ""
-            print(f"Transcription worker: [{model_mode}] {elapsed:.1f}s{context_note}", flush=True)
+            mem_note = ""
+            if mx is not None and model_mode in ("cohere", "fast", "accurate"):
+                try:
+                    mem_note = (
+                        f", gpu_active={mx.get_active_memory() / 1024**3:.1f}GB"
+                        f" cache={mx.get_cache_memory() / 1024**3:.1f}GB"
+                    )
+                except Exception:
+                    pass
+            print(f"Transcription worker: [{model_mode}] {elapsed:.1f}s{context_note}{mem_note}", flush=True)
             result_pipe.send({"text": text, "time": elapsed, "error": None})
 
         except Exception as e:
