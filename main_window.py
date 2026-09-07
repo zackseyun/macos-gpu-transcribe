@@ -269,6 +269,8 @@ class MainWindowController(NSObject):
             else mode
         )
         prefix = "Active model" if pending else "Default model"
+        if not pending and getattr(self._app, "default_model_is_auto", False):
+            label = f"{label} (auto for this Mac)"
         self._model_label.setStringValue_(f"{prefix}: {label}")
 
         if len(self._app.history) != self._last_history_len:

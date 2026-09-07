@@ -4,6 +4,7 @@ from unittest import mock
 
 import huggingface_hub
 
+import hardware
 import transcribe_worker
 
 
@@ -52,7 +53,7 @@ class WarmCadenceTest(unittest.TestCase):
         # must not recreate the old ~10GB swapped-out footprint.
         self.assertGreaterEqual(transcribe_worker.METAL_CACHE_LIMIT_BYTES, int(1.5 * gib))
         self.assertLessEqual(transcribe_worker.METAL_CACHE_LIMIT_BYTES, 3 * gib)
-        self.assertGreaterEqual(transcribe_worker.METAL_WIRED_LIMIT_BYTES, 6 * gib)
+        self.assertEqual(hardware.recommended_wired_limit_bytes(), transcribe_worker.METAL_WIRED_LIMIT_BYTES)
 
 
 if __name__ == "__main__":

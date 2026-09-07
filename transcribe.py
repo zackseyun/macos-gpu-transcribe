@@ -47,6 +47,7 @@ import sounddevice as sd
 
 # Subprocess target functions live in separate files (no rumps/sd imports)
 import key_monitor
+import hardware
 import transcribe_worker
 from format_text import format_transcription
 from hud_overlay import get_controller as get_hud_controller
@@ -163,7 +164,6 @@ BACKGROUND_WARM_LOW_BATTERY_PERCENT = int(os.getenv("VOICE_TRANSCRIBE_WARM_LOW_B
 # Set "vocabulary" in settings.json to opt back in for specialised dictation.
 STATIC_VOCABULARY_DEFAULT = ""
 
-DEFAULT_MODEL_MODE = "fast"
 MODEL_LABELS = {
     "granite": "Granite Speech 4.1 NAR",
     "cohere": "Cohere Transcribe MLX 8-bit",
@@ -172,7 +172,20 @@ MODEL_LABELS = {
     "fast": "Qwen3-ASR 0.6B (MLX)",
     "accurate": "Qwen3-ASR 1.7B",
 }
-MENU_MODEL_MODES = ("fast", "cohere", "cohere-swift-4bit", "cohere-pytorch", "granite")
+# The Fn default derives from the machine (see hardware.py) instead of being
+# hard-coded: this checkout runs on both a 128GB M4 Max MacBook Pro and a
+# MacBook Air, and every pull used to flip the other machine's default. Cohere
+# Transcribe MLX 8-bit wins where memory allows; Qwen3-ASR 0.6B wins on 8-24GB
+# machines. settings.json "auto" (the default) follows this rule; picking a
+# concrete model in the menu pins it.
+AUTO_MODEL_MODE = "auto"
+HARDWARE_PROFILE = hardware.describe()
+DEFAULT_MODEL_MODE = hardware.recommended_default_model_mode(valid_modes=MODEL_LABELS)
+_ALL_MENU_MODEL_MODES = ("cohere", "fast", "cohere-swift-4bit", "cohere-pytorch", "granite")
+# Hardware-recommended model first, then the rest in a stable order.
+MENU_MODEL_MODES = (DEFAULT_MODEL_MODE,) + tuple(
+    mode for mode in _ALL_MENU_MODEL_MODES if mode != DEFAULT_MODEL_MODE
+)
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -528,6 +541,18 @@ def _should_relaunch_after_audio_refresh_failure(reason, error_text):
     )
 
 
+def _resolve_default_model_setting(value):
+    """Map settings.json default_model_mode to (is_auto, concrete_mode).
+
+    "auto", a missing value, or an unknown mode follow the hardware rule; any
+    known concrete mode is treated as a user pin.
+    """
+    mode = str(value or "").strip().lower()
+    if mode in ("", AUTO_MODEL_MODE) or mode not in MODEL_LABELS:
+        return True, DEFAULT_MODEL_MODE
+    return False, mode
+
+
 def _low_power_menu_title(low_power):
     """Menu line naming the most common cause of slow Fn dictation on this Mac."""
     if low_power is True:
@@ -744,12 +769,22 @@ class VoiceTranscribeApp(rumps.App):
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
         self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
-        self.default_model_mode = self._normalize_model_mode(
-            self.settings.get("default_model_mode", DEFAULT_MODEL_MODE)
+        self.default_model_is_auto, self.default_model_mode = _resolve_default_model_setting(
+            self.settings.get("default_model_mode", AUTO_MODEL_MODE)
         )
-        if self.settings.get("default_model_mode") != self.default_model_mode:
-            self.settings["default_model_mode"] = self.default_model_mode
+        stored_default = AUTO_MODEL_MODE if self.default_model_is_auto else self.default_model_mode
+        if self.settings.get("default_model_mode") != stored_default:
+            self.settings["default_model_mode"] = stored_default
             self._save_settings()
+        print(
+            f"Default model: {MODEL_LABELS[self.default_model_mode]} "
+            + (
+                f"(auto for {HARDWARE_PROFILE})"
+                if self.default_model_is_auto
+                else "(pinned in settings.json)"
+            ),
+            flush=True,
+        )
         self._screen_assist_selftest_enabled = False
         self._screen_context_cache_lock = threading.Lock()
         self._screen_context_cached_path = None
@@ -2505,7 +2540,7 @@ class VoiceTranscribeApp(rumps.App):
         return {
             "screen_context_enabled": False,
             "sound_effects_enabled": True,
-            "default_model_mode": DEFAULT_MODEL_MODE,
+            "default_model_mode": AUTO_MODEL_MODE,
         }
 
     def _save_settings(self):
@@ -2618,11 +2653,19 @@ class VoiceTranscribeApp(rumps.App):
 
         self.menu.add(rumps.MenuItem("Open Settings Window", callback=self._open_main_window))
         self.menu.add(rumps.separator)
+        fn_suffix = " (auto for this Mac)" if self.default_model_is_auto else ""
         self.menu.add(rumps.MenuItem(
-            f"Fn = {self._model_display_name(self.default_model_mode)}",
+            f"Fn = {self._model_display_name(self.default_model_mode)}{fn_suffix}",
             callback=None,
         ))
         self.menu.add(rumps.MenuItem("Default Model", callback=None))
+        auto_item = rumps.MenuItem(self._auto_model_menu_title(), callback=self._set_default_model)
+        auto_item.representedObject = AUTO_MODEL_MODE
+        try:
+            auto_item.state = 1 if self.default_model_is_auto else 0
+        except Exception:
+            pass
+        self.menu.add(auto_item)
         for mode in MENU_MODEL_MODES:
             item = rumps.MenuItem(
                 self._default_model_menu_title(mode),
@@ -2630,7 +2673,7 @@ class VoiceTranscribeApp(rumps.App):
             )
             item.representedObject = mode
             try:
-                item.state = 1 if mode == self.default_model_mode else 0
+                item.state = 1 if (not self.default_model_is_auto and mode == self.default_model_mode) else 0
             except Exception:
                 pass
             self.menu.add(item)
@@ -2685,22 +2728,35 @@ class VoiceTranscribeApp(rumps.App):
         return MODEL_LABELS.get(self._normalize_model_mode(mode), MODEL_LABELS[DEFAULT_MODEL_MODE])
 
     def _default_model_menu_title(self, mode):
-        prefix = "✓ " if mode == self.default_model_mode else "   "
+        pinned = not self.default_model_is_auto and mode == self.default_model_mode
+        prefix = "✓ " if pinned else "   "
         return f"{prefix}{self._model_display_name(mode)}"
 
+    def _auto_model_menu_title(self):
+        prefix = "✓ " if self.default_model_is_auto else "   "
+        return f"{prefix}Auto: {MODEL_LABELS[DEFAULT_MODEL_MODE]} (best for this Mac)"
+
     def _set_default_model(self, sender):
-        mode = self._normalize_model_mode(getattr(sender, "representedObject", None))
-        if mode == self.default_model_mode:
-            return
+        raw = str(getattr(sender, "representedObject", None) or "").strip().lower()
+        if raw == AUTO_MODEL_MODE:
+            if self.default_model_is_auto:
+                return
+            self.default_model_is_auto = True
+            mode = DEFAULT_MODEL_MODE
+            stored = AUTO_MODEL_MODE
+            note = f"Fn now uses {self._model_display_name(mode)} (auto for this Mac)."
+        else:
+            mode = self._normalize_model_mode(raw)
+            if not self.default_model_is_auto and mode == self.default_model_mode:
+                return
+            self.default_model_is_auto = False
+            stored = mode
+            note = f"Fn now uses {self._model_display_name(mode)}."
         self.default_model_mode = mode
-        self.settings["default_model_mode"] = mode
+        self.settings["default_model_mode"] = stored
         self._save_settings()
         self._rebuild_menu()
-        rumps.notification(
-            "Voice Transcribe",
-            "Default Model",
-            f"Fn now uses {self._model_display_name(mode)}.",
-        )
+        rumps.notification("Voice Transcribe", "Default Model", note)
 
     def _screen_context_menu_title(self):
         status = "On" if self.screen_context_enabled else "Off"

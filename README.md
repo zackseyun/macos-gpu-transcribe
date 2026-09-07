@@ -39,7 +39,7 @@ On this M2, an 11.4-second synthetic speech clip took 0.69–0.77 seconds on war
 
 ## Model & key binding
 
-Fn uses the model selected in the menu. New installations default to Qwen3-ASR 0.6B with Swift MLX preferred. Cohere MLX 8-bit, Cohere Swift 4-bit, legacy Cohere PyTorch, and Granite remain selectable. Granite uses a resident local CrispASR server and retains its Cohere fallback.
+Fn uses the model selected in the menu. The default is derived from the machine (`hardware.py`): Macs with at least 32GB of unified memory default to Cohere Transcribe MLX 8-bit (a 2B model, ~3.8GB resident, ~40x real-time on an M4 Max), while smaller machines such as a MacBook Air default to Qwen3-ASR 0.6B with Swift MLX preferred. The menu's **Auto** entry follows that rule and is what a fresh `settings.json` uses; picking a concrete model pins it. Cohere MLX 8-bit, Cohere Swift 4-bit, legacy Cohere PyTorch, and Granite remain selectable everywhere. Granite uses a resident local CrispASR server and retains its Cohere fallback. Force the rule with `VOICE_TRANSCRIBE_DEFAULT_MODEL_MODE` or move the threshold with `VOICE_TRANSCRIBE_COHERE_MIN_MEMORY_GB`.
 
 **Right Option is disabled** at the HID layer by a LaunchAgent that `install.sh` deploys (see [`com.local.DisableRightOption.plist`](com.local.DisableRightOption.plist)). It used to be a second hotkey, but it kept emitting stray special characters (®, ¥, etc.) into focused fields. Disabling it system-wide is the simplest fix.
 
@@ -224,7 +224,9 @@ tail -f /tmp/voice-transcribe.log
 | `VOICE_TRANSCRIBE_WARM_LOW_BATTERY_PERCENT` | `25` | Battery percentage at or below which background warm backs off |
 | `VOICE_TRANSCRIBE_ON_DEMAND_WARM_SKIP_SECONDS` | `45` | Skip the Fn-down warm if any inference ran this recently. Longer than the 20s keep-warm cadence so a redundant warm never holds the inference lock while a short dictation waits |
 | `VOICE_TRANSCRIBE_MLX_CACHE_LIMIT_GB` | `2` | MLX buffer-cache cap for freed scratch memory. Cohere 8-bit peaks near 1.4GB of scratch per 35s chunk; the old 6GB cap grew the worker to a ~10GB footprint that macOS swapped out between dictations |
-| `VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB` | `8` | MLX wired-memory limit so the ~3.8GB of Cohere weights stay resident instead of being paged to swap while idle. Capped to MLX's recommended working set; `0` disables |
+| `VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB` | `8` on Macs with ≥32GB unified memory, `0` elsewhere | MLX wired-memory limit so the ~3.8GB of Cohere weights stay resident instead of being paged to swap while idle. Capped to MLX's recommended working set; `0` disables |
+| `VOICE_TRANSCRIBE_DEFAULT_MODEL_MODE` | unset | Force the model that the menu's **Auto** entry resolves to, bypassing the hardware rule |
+| `VOICE_TRANSCRIBE_COHERE_MIN_MEMORY_GB` | `32` | Unified-memory threshold at or above which Auto picks Cohere Transcribe MLX 8-bit (and MLX memory is wired); below it Auto picks Qwen3-ASR 0.6B |
 | `VOICE_TRANSCRIBE_QWEN_FAST_MODEL` | local quantized model if present, else `Qwen/Qwen3-ASR-0.6B` | Model used by the fast Fn path |
 | `VOICE_TRANSCRIBE_QWEN_PRELOAD` | `false` | Legacy worker-side Qwen preload. The app now warms the selected default model after worker start instead, so Cohere defaults do not compete with Qwen preload |
 | `VOICE_TRANSCRIBE_QWEN_KEEP_WARM` | `true` | Keep Qwen warm during active use instead of clearing the MLX cache after each dictation |
@@ -256,6 +258,7 @@ tail -f /tmp/voice-transcribe.log
 macos-gpu-transcribe/
 ├── transcribe.py          # Main app — menu bar UI, audio, paste, orchestration
 ├── transcribe_worker.py   # Worker subprocess — model loading & inference
+├── hardware.py            # Per-machine defaults (Fn model choice, MLX wired memory)
 ├── key_monitor.py         # Key monitor subprocess — Quartz CGEvent tap
 ├── hud_overlay.py         # Floating cursor HUD (AppKit borderless window)
 ├── main_window.py         # Main app window (status, settings, history)
@@ -265,6 +268,7 @@ macos-gpu-transcribe/
 ├── macos/Mac Transcribe App.app # Thin macOS app wrapper checked into git
 ├── scripts/install_mlx_audio_swift.sh # Builds the native Swift MLX STT helper/server
 ├── scripts/quantize_qwen3_asr.py # Optional local 4-bit Qwen checkpoint builder
+├── scripts/probe_cohere_mlx_latency.py # Live-state latency + MLX memory probe for the Cohere path
 ├── run.sh                 # Launcher
 ├── requirements.txt       # pip dependencies
 ├── .crispasr/             # Local CrispASR checkout/build (ignored)
@@ -303,7 +307,7 @@ MIT. See [`LICENSE`](LICENSE) if present; otherwise do whatever you want with it
 
 The optional `cohere` menu option uses `mlx-community/cohere-transcribe-03-2026-mlx-8bit` through `mlx-speech`/MLX instead of the older PyTorch/MPS path. The old full 2B PyTorch path is still available as `cohere-pytorch` in the menu, so we can revert behavior without reverting the repo. The experimental `cohere-swift-4bit` menu option uses the newer Swift runtime because the Python 4-bit path was the source of the earlier multilingual gibberish.
 
-To compare Cohere with the new Qwen Swift default, choose **Cohere Transcribe MLX 8-bit** from the menu, or set the following in ignored `settings.json`:
+On machines where **Auto** resolves to Qwen (under 32GB unified memory), compare Cohere by choosing **Cohere Transcribe MLX 8-bit** from the menu, or set the following in ignored `settings.json` (`"auto"` returns to the hardware rule):
 
 ```json
 {

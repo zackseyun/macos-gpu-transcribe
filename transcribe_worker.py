@@ -32,6 +32,8 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+import hardware
+
 
 # MLX buffer-cache limit. This bounds how much *freed* scratch memory MLX keeps
 # around for reuse; model weights are active memory and are unaffected. The old
@@ -47,9 +49,14 @@ METAL_CACHE_LIMIT_BYTES = int(
 
 # MLX wired-memory limit. Wiring keeps the ~3.8GB of Cohere weights (plus scratch)
 # resident so they cannot be paged out to swap between dictations; mlx-lm does
-# the same during generation. Capped to MLX's recommended working set. 0 disables.
-METAL_WIRED_LIMIT_BYTES = int(
-    float(os.getenv("VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB", "8")) * 1024 ** 3
+# the same during generation. Capped to MLX's recommended working set. Defaults
+# to 8GB on Macs with >= 32GB unified memory and off elsewhere (see hardware.py)
+# so a 16GB Air never wires half its RAM. 0 disables.
+_WIRED_LIMIT_ENV = os.getenv("VOICE_TRANSCRIBE_MLX_WIRED_LIMIT_GB", "").strip()
+METAL_WIRED_LIMIT_BYTES = (
+    int(float(_WIRED_LIMIT_ENV) * 1024 ** 3)
+    if _WIRED_LIMIT_ENV
+    else hardware.recommended_wired_limit_bytes()
 )
 
 REPO_DIR = Path(__file__).resolve().parent
