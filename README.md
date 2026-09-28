@@ -182,7 +182,7 @@ python -c "from huggingface_hub import login; login()"
 
 ### Run
 
-`./install.sh` copies `macos/Mac Transcribe App.app` into `/Applications/` when possible, otherwise `~/Applications/`, and installs `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so the menu bar app starts automatically after install and at login. Installing into `/Applications/` gives Spotlight/Alfred the most reliable discovery path.
+`./install.sh` copies `macos/Mac Transcribe App.app` into `/Applications/` when possible, otherwise `~/Applications/`, and installs `~/Library/LaunchAgents/com.zack.voice-transcribe.plist`, so the menu bar app starts automatically after install and at login. The LaunchAgent restarts it after an unexpected exit or a sleep/audio reset; the menu-bar **Quit** command stops the agent until the next login. Installing into `/Applications/` gives Spotlight/Alfred the most reliable discovery path.
 
 ```bash
 # restart the installed menu bar app

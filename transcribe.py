@@ -1839,6 +1839,20 @@ class VoiceTranscribeApp(rumps.App):
                 pass
         os._exit(75)
 
+    def _quit_application(self, _sender=None):
+        """Honor an explicit Quit without launchd immediately reopening the app."""
+        if _is_launchd_managed():
+            job = f"gui/{os.getuid()}/com.zack.voice-transcribe"
+            result = subprocess.run(
+                ["/bin/launchctl", "bootout", job],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                print(f"Could not stop LaunchAgent on Quit: {result.stderr.strip()}", flush=True)
+                return
+        rumps.quit_application()
+
     def _resume_audio_after_display_wake(self):
         """Clear sleep mode and restore low-latency capture after display wake."""
         try:
@@ -2704,7 +2718,7 @@ class VoiceTranscribeApp(rumps.App):
             self.menu.add(rumps.MenuItem("No transcriptions yet", callback=None))
 
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
+        self.menu.add(rumps.MenuItem("Quit", callback=self._quit_application))
 
     def _open_main_window(self, _sender=None):
         self._run_on_main_thread(self._main_window.showWindow)
@@ -2894,7 +2908,9 @@ if __name__ == "__main__":
             pass
 
     atexit.register(_cleanup)
-    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), os._exit(0)))
+    # Unexpected termination should be restarted by launchd. Explicit Quit
+    # bootouts the job first, so it remains stopped until the next login.
+    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), os._exit(75)))
     signal.signal(signal.SIGINT, lambda *_: (_cleanup(), os._exit(0)))
 
     app.run()

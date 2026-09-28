@@ -256,11 +256,10 @@ cat > "$VOICE_AGENT" << EOF
     <string>${REPO_DIR}</string>
     <key>RunAtLoad</key>
     <true/>
+    <!-- A sleep/audio reset must never strand the menu-bar app, even if macOS
+         reports the exit as successful. The Quit menu item bootouts this job. -->
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>ProcessType</key>

@@ -1,5 +1,7 @@
 import unittest
 from io import StringIO
+from unittest import mock
+from types import SimpleNamespace
 
 import transcribe
 
@@ -66,6 +68,27 @@ class AppVisibilityDefaultsTest(unittest.TestCase):
         self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("")))
         self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("not-a-pid")))
         self.assertIsNone(transcribe._read_lock_owner_pid(StringIO("-7")))
+
+    def test_quit_bootouts_managed_job_before_exiting(self):
+        with mock.patch.object(transcribe, "_is_launchd_managed", return_value=True), \
+             mock.patch.object(transcribe.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="")) as run, \
+             mock.patch.object(transcribe.rumps, "quit_application") as quit_app:
+            transcribe.VoiceTranscribeApp._quit_application(None)
+
+        run.assert_called_once_with(
+            ["/bin/launchctl", "bootout", f"gui/{transcribe.os.getuid()}/com.zack.voice-transcribe"],
+            capture_output=True,
+            text=True,
+        )
+        quit_app.assert_called_once_with()
+
+    def test_quit_does_not_exit_if_managed_job_cannot_stop(self):
+        with mock.patch.object(transcribe, "_is_launchd_managed", return_value=True), \
+             mock.patch.object(transcribe.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="error")), \
+             mock.patch.object(transcribe.rumps, "quit_application") as quit_app:
+            transcribe.VoiceTranscribeApp._quit_application(None)
+
+        quit_app.assert_not_called()
 
 
 if __name__ == "__main__":
