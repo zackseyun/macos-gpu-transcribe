@@ -43,7 +43,7 @@ class HardwareDefaultTest(unittest.TestCase):
         )
         self.assertEqual(transcribe.DEFAULT_MODEL_MODE, transcribe.MENU_MODEL_MODES[0])
         self.assertEqual(set(transcribe.MENU_MODEL_MODES),
-                         {"cohere", "fast", "cohere-swift-4bit", "cohere-pytorch", "granite"})
+                         {"cohere", "fast", "cohere-swift-4bit", "cohere-pytorch", "granite", "granite5", "nemotron35"})
         self.assertIn("GB unified memory", transcribe.HARDWARE_PROFILE)
 
 

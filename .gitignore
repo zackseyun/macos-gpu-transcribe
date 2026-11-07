@@ -13,3 +13,5 @@ models/
 default.profraw
 
 .swift-runtime/
+
+.mlx-next/

@@ -171,6 +171,8 @@ MODEL_LABELS = {
     "cohere-pytorch": "Cohere Transcribe 2B PyTorch",
     "fast": "Qwen3-ASR 0.6B (MLX)",
     "accurate": "Qwen3-ASR 1.7B",
+    "granite5": "Granite Speech 5.0 2B (MLX)",
+    "nemotron35": "Nemotron 3.5 Transcribe 4-bit (MLX)",
 }
 # The Fn default derives from the machine (see hardware.py) instead of being
 # hard-coded: this checkout runs on both a 128GB M4 Max MacBook Pro and a
@@ -181,7 +183,7 @@ MODEL_LABELS = {
 AUTO_MODEL_MODE = "auto"
 HARDWARE_PROFILE = hardware.describe()
 DEFAULT_MODEL_MODE = hardware.recommended_default_model_mode(valid_modes=MODEL_LABELS)
-_ALL_MENU_MODEL_MODES = ("cohere", "fast", "cohere-swift-4bit", "cohere-pytorch", "granite")
+_ALL_MENU_MODEL_MODES = ("cohere", "fast", "cohere-swift-4bit", "cohere-pytorch", "granite", "granite5", "nemotron35")
 # Hardware-recommended model first, then the rest in a stable order.
 MENU_MODEL_MODES = (DEFAULT_MODEL_MODE,) + tuple(
     mode for mode in _ALL_MENU_MODEL_MODES if mode != DEFAULT_MODEL_MODE

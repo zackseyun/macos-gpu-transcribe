@@ -343,3 +343,39 @@ Swift pause splitting accepts 60 ms gaps and adapts to microphone noise. When no
 ```
 
 Restart after creating the checkpoint. The default Qwen fallback automatically selects `models/qwen3-asr-0.6b-4bit` when present.
+
+## Optional November 2026 MLX models
+
+The menu includes **Granite Speech 5.0 2B (MLX)** (`granite5`) and
+**Nemotron 3.5 Transcribe 4-bit (MLX)** (`nemotron35`). These use a separate
+resident Python/MLX Audio process, leaving the GUI's existing dependencies and
+microphone/Accessibility permissions untouched. Hardware Auto defaults are not
+changed; a concrete selection is saved only on the local Mac.
+
+Install the pinned source and checkpoints with `bash scripts/install_mlx_next.sh`.
+Allow roughly 25 GB for both checkpoints. The isolated runtime lives under
+`.mlx-next/venv14`; inference is offline and WAV audio goes over private process
+pipes, not a network service. The model is warmed at app startup. Its subprocess
+exits when the transcription worker closes its pipe or dies. Errors and token-limit
+truncation are surfaced rather than silently substituting a different model.
+Long recordings use overlapping 110-second windows with exact-word overlap removal.
+Screen Assist glossary injection is not currently enabled for these modes.
+
+Select **Qwen3-ASR 0.6B (MLX)** in the menu to return to the previous fast engine.
+The original model and runtime are retained.
+
+For a reproducible, limited English comparison, install `pyarrow jiwer soundfile`
+in the isolated runtime and download the public
+`hf-internal-testing/librispeech_asr_dummy` clean validation Parquet file. Run:
+
+```bash
+.mlx-next/venv14/bin/python scripts/benchmark_mlx_next.py granite5 \
+  --corpus /absolute/path/to/validation.parquet --out /absolute/path/to/results
+.mlx-next/venv14/bin/python scripts/benchmark_mlx_next.py nemotron35 \
+  --corpus /absolute/path/to/validation.parquet --out /absolute/path/to/results
+```
+
+This measures normalized word errors and synchronized warm latency on eight
+clean clips, eight deterministic 15 dB noise variants, and one concatenated clip.
+It is a small, single-speaker reading-speech test, not evidence of general accuracy
+or a substitute for evaluating the owner's spontaneous dictation.

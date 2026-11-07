@@ -884,6 +884,8 @@ def run(request_pipe, result_pipe):
             print(f"Transcription worker: failed to set wired limit: {e}", flush=True)
 
     from swift_asr import SwiftASR
+    from mlx_next_asr import NextASR, MODES as NEXT_MODES
+    next_asr = NextASR()
     swift_qwen = SwiftASR()
     fallback_warmed = set()
 
@@ -1172,6 +1174,7 @@ def run(request_pipe, result_pipe):
             if granite_server is not None:
                 granite_server.stop()
             cohere_swift_server.stop()
+            next_asr.stop()
             break
 
         # On-demand warm signal: main app sends this when user presses the Fn key
@@ -1180,6 +1183,15 @@ def run(request_pipe, result_pipe):
         # the upcoming real transcription request.
         if isinstance(request, dict) and request.get("__warm__"):
             warm_model_mode = request.get("model_mode", "cohere")
+            if warm_model_mode in NEXT_MODES:
+                def _warm_next(mode=warm_model_mode):
+                    try:
+                        next_asr.warm(mode)
+                        print(f"Transcription worker: {mode} ready (isolated MLX)", flush=True)
+                    except Exception as exc:
+                        print(f"Transcription worker: {mode} warm failed: {exc}", flush=True)
+                threading.Thread(target=_warm_next, daemon=True).start()
+                continue
             if warm_model_mode == "cohere-swift-4bit":
                 def _warm_swift_server():
                     try:
@@ -1241,7 +1253,14 @@ def run(request_pipe, result_pipe):
         try:
             t0 = time.time()
 
-            if model_mode == "granite":
+            if model_mode in NEXT_MODES:
+                with inference_lock:
+                    text = next_asr.transcribe(
+                        audio_input if audio_input is not None else wav_path, model_mode
+                    )
+                    last_real_inference_at[0] = time.time()
+                    last_any_inference_at[0] = time.time()
+            elif model_mode == "granite":
                 if granite_server is not None:
                     try:
                         text = granite_server.transcribe(
@@ -1341,5 +1360,6 @@ def run(request_pipe, result_pipe):
         except Exception as e:
             result_pipe.send({"text": "", "time": 0, "error": str(e)})
 
+    next_asr.stop()
     swift_qwen.stop()
     print("Transcription worker: exiting", flush=True)
