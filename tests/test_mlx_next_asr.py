@@ -70,5 +70,30 @@ class NextASRTest(unittest.TestCase):
         self.assertEqual(model.generate.call_count, 2)
         self.assertEqual([len(c.args[0]) for c in model.generate.call_args_list], [110*16000, 7*16000])
 
+    def test_nemotron_prefix_cache_replaces_model_generate(self):
+        model, prefix = Mock(), Mock()
+        prefix.generate.return_value = types.SimpleNamespace(
+            text=' Hello. ', finish_reason='stop', generation_tokens=2)
+        self.assertEqual(backend.generate(model, np.zeros(16000), 'nemotron35', prefix=prefix), 'Hello.')
+        model.generate.assert_not_called()
+        audio, budget = prefix.generate.call_args.args
+        self.assertEqual((len(audio), budget), (16000, 128))
+
+    def test_nemotron_prefix_cache_still_refuses_truncation(self):
+        prefix = Mock()
+        prefix.generate.return_value = types.SimpleNamespace(
+            text='Partial', finish_reason='length', generation_tokens=128)
+        with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+            backend.generate(Mock(), np.zeros(16000), 'nemotron35', prefix=prefix)
+
+    def test_nemotron_prefix_cache_chunks_long_audio(self):
+        prefix = Mock()
+        prefix.generate.side_effect = [
+            types.SimpleNamespace(text='One two three.', finish_reason='stop', generation_tokens=3),
+            types.SimpleNamespace(text='Two three, Four.', finish_reason='stop', generation_tokens=3)]
+        self.assertEqual(backend.generate(Mock(), np.zeros(115*16000), 'nemotron35', prefix=prefix),
+                         'One two three. Four.')
+        self.assertEqual([len(c.args[0]) for c in prefix.generate.call_args_list], [110*16000, 7*16000])
+
 if __name__ == '__main__':
     unittest.main()

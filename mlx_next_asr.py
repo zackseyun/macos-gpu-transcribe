@@ -105,22 +105,24 @@ def serve(mode):
         import numpy as np
         import soundfile as sf
         from mlx_audio.stt import load
-        model = None
+        model = prefix = None
         for line in sys.stdin:
             try:
                 request = json.loads(line)
                 if model is None:
                     model = load(str(ROOT / ".mlx-next/models" / MODEL_DIRS[mode]))
+                    if mode == "nemotron35":
+                        prefix = NemotronPrefixCache(model)
                 if request.get("warm"):
                     # Compile the same path used for speech, without recording.
                     audio = np.zeros(16000, dtype=np.float32)
-                    generate(model, audio, mode, max_tokens=128)
+                    generate(model, audio, mode, max_tokens=128, prefix=prefix)
                     response = {"ready": True}
                 else:
                     audio, sr = sf.read(io.BytesIO(base64.b64decode(request["wav"])), dtype="float32")
                     if sr != 16000 or audio.ndim != 1 or not len(audio):
                         raise ValueError("Expected nonempty mono 16 kHz audio")
-                    response = {"text": generate(model, audio, mode)}
+                    response = {"text": generate(model, audio, mode, prefix=prefix)}
                 mx.clear_cache()
             except Exception as exc:
                 response = {"error": f"{type(exc).__name__}: {exc}"}
@@ -128,7 +130,88 @@ def serve(mode):
             protocol.flush()
 
 
-def generate(model, audio, mode, max_tokens=None):
+class NemotronPrefixCache:
+    """Reuse the constant prompt prefix across Nemotron requests.
+
+    Nemotron's ASR prompt puts the audio after 56 fixed tokens (empty system
+    turn plus the transcription instruction). Their attention and Mamba state is
+    computed once at load; each request prefills only its audio and the 8-token
+    assistant suffix. Greedy output matched model.generate() exactly on every
+    test clip, and it saves roughly 0.4-0.6 s per dictation in Low Power Mode.
+    """
+
+    def __init__(self, model):
+        import mlx.core as mx
+        from mlx_audio.lm.models.cache import KVCache
+        from mlx_audio.stt.models.nemotron_transcribe.nemotron_transcribe import resolve_prompt
+        self.model = model
+        tag = model.config.audio_locator_tag
+        prompt = resolve_prompt("asr", None, None, None, tag)
+        # Same turns as Model._prepare_inputs (no system prompt, thinking off).
+        turns = [
+            "<|im_start|>system\n<|im_end|>\n",
+            f"<|im_start|>user\n{prompt}<|im_end|>\n",
+            "<|im_start|>assistant\n<think></think>",
+        ]
+        tokenizer = model._tokenizer
+        ids = [t for turn in turns for t in tokenizer.encode(turn, add_special_tokens=False)]
+        index = ids.index(tokenizer.convert_tokens_to_ids(tag))
+        self.prefix_ids, self.suffix_ids = ids[:index], ids[index + 1:]
+        embed = model.llm.backbone.embeddings
+        self.suffix_embeddings = embed(mx.array(self.suffix_ids)[None])
+        prefix = mx.array(self.prefix_ids)[None]
+        cache = model.make_cache()
+        model(prefix, cache=cache, input_embeddings=embed(prefix))
+        mx.eval([c.state for c in cache], self.suffix_embeddings)
+        self._saved = [("kv", c.state) if isinstance(c, KVCache) else ("ssm", list(c.state))
+                       for c in cache]
+
+    def _fresh_cache(self):
+        from mlx_audio.lm.models.cache import KVCache
+        from mlx_audio.stt.models.nemotron_transcribe.language_model import MambaCache
+        caches = []
+        for kind, state in self._saved:
+            # The saved KV arrays are exactly prefix-sized, so the first update
+            # reallocates and later in-place writes never touch the saved prefix.
+            cache = KVCache() if kind == "kv" else MambaCache()
+            cache.state = state if kind == "kv" else list(state)
+            caches.append(cache)
+        return caches
+
+    def generate(self, audio, max_tokens):
+        import types
+        import mlx.core as mx
+        from mlx_audio.lm.generate import StreamingDetokenizer, generate_step
+        from mlx_audio.stt.utils import wired_limit
+        model = self.model
+        audio = mx.array(audio, dtype=mx.float32)
+        if audio.ndim != 1 or audio.size < model.config.processor_config.hop_length:
+            raise ValueError("Expected nonempty mono audio at the model sample rate")
+        if not mx.all(mx.isfinite(audio)).item():
+            raise ValueError("Audio contains non-finite samples")
+        with wired_limit(model):
+            audio_embeddings = model.perception(audio)
+            embeddings = mx.concatenate(
+                [audio_embeddings.astype(self.suffix_embeddings.dtype), self.suffix_embeddings],
+                axis=1)[0]
+            tokens = mx.array([model.config.pad_token_id] * audio_embeddings.shape[1]
+                              + self.suffix_ids)
+            decoder = StreamingDetokenizer(model._tokenizer, skip_special_tokens=False)
+            count, finish_reason = 0, "length"
+            for token, _ in generate_step(tokens, model, input_embeddings=embeddings,
+                                          prompt_cache=self._fresh_cache(),
+                                          max_tokens=max_tokens, prefill_step_size=512):
+                if token in model.config.eos_token_id:
+                    finish_reason = "stop"
+                    break
+                count += 1
+                decoder.add_token(token)
+            decoder.finalize()
+        return types.SimpleNamespace(text=decoder.text.strip(), finish_reason=finish_reason,
+                                     generation_tokens=count)
+
+
+def generate(model, audio, mode, max_tokens=None, prefix=None):
     """Bound long recordings with overlapping chunks; never silently truncate."""
     import mlx.core as mx
     # Granite recommends <=2 minutes. Use overlap to retain boundary words.
@@ -140,7 +223,10 @@ def generate(model, audio, mode, max_tokens=None):
         kwargs = {"max_tokens": budget, "temperature": 0.0}
         if mode == "granite5":
             kwargs.update(punctuate=True)
-        result = model.generate(mx.array(chunk), **kwargs)
+        if prefix is not None:
+            result = prefix.generate(chunk, budget)
+        else:
+            result = model.generate(mx.array(chunk), **kwargs)
         if max_tokens is None and (getattr(result, "finish_reason", None) == "length"
                 or getattr(result, "generation_tokens", 0) >= budget):
             raise RuntimeError("Transcription reached its token limit; refusing incomplete text")

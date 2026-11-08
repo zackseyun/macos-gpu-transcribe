@@ -361,6 +361,11 @@ truncation are surfaced rather than silently substituting a different model.
 Long recordings use overlapping 110-second windows with exact-word overlap removal.
 Screen Assist glossary injection is not currently enabled for these modes.
 
+Nemotron computes its fixed 56-token instruction prompt once at load and reuses
+that state, so each dictation prefills only its audio. Nemotron speed is limited
+by GPU memory bandwidth: Low Power Mode cuts it to roughly a fifth. See
+`docs/nemotron-speed-20261107.md` for measurements and rejected options.
+
 Select **Qwen3-ASR 0.6B (MLX)** in the menu to return to the previous fast engine.
 The original model and runtime are retained.
 
