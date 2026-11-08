@@ -49,6 +49,7 @@ import sounddevice as sd
 import key_monitor
 import hardware
 import transcribe_worker
+import live_chunker
 from format_text import format_transcription
 from hud_overlay import get_controller as get_hud_controller
 from main_window import get_controller as get_main_window_controller
@@ -205,6 +206,13 @@ SILENCE_LOW_CONFIDENCE_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_M
 SILENCE_LOW_CONFIDENCE_ACTIVE_RATIO = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_LOW_ACTIVE_RATIO", "0.16"))
 SILENCE_SHORT_BLIP_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_SECONDS", "0.50"))
 SILENCE_SHORT_BLIP_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_MAX_RMS", "0.050"))
+
+# "Transcribe While Talking": for slow, accurate models, transcribe each finished
+# piece of a long dictation (cut at a real pause) while the user keeps talking,
+# so releasing Fn leaves only the last piece. See live_chunker.py.
+LIVE_PIECE_MODES = frozenset({"nemotron35"})
+LIVE_PIECE_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS", "8"))
+LIVE_PIECE_PAUSE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS", "0.5"))
 
 # Known ASR hallucination outputs on silent/near-silent audio. These are the
 # most common ones Whisper-family and Cohere Transcribe emit from training
@@ -770,6 +778,8 @@ class VoiceTranscribeApp(rumps.App):
         self._paste_generation = 0
         self.screen_context_enabled = bool(self.settings.get("screen_context_enabled", False))
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
+        self.live_pieces_enabled = bool(self.settings.get("live_pieces_enabled", False))
+        self._live_pieces = None
         self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
         self.default_model_is_auto, self.default_model_mode = _resolve_default_model_setting(
             self.settings.get("default_model_mode", AUTO_MODEL_MODE)
@@ -854,6 +864,10 @@ class VoiceTranscribeApp(rumps.App):
         self._tx_req_parent, self._tx_req_child = multiprocessing.Pipe()
         self._tx_res_parent, self._tx_res_child = multiprocessing.Pipe()
         self._tx_worker = None
+        # One request/response at a time on the worker pipe (live pieces and the
+        # final request come from different threads).
+        self._worker_request_lock = threading.RLock()
+        self._worker_send_lock = threading.Lock()
         self._spawn_transcribe_worker()
 
         self._rebuild_menu()
@@ -1179,12 +1193,13 @@ class VoiceTranscribeApp(rumps.App):
         the persistent CrispASR server so the 3GB GGUF is not reloaded per run.
         """
         try:
-            self._tx_req_parent.send({
-                "__warm__": True,
-                "model_mode": self._normalize_model_mode(
-                    model_mode or self.default_model_mode
-                ),
-            })
+            with self._worker_send_lock:
+                self._tx_req_parent.send({
+                    "__warm__": True,
+                    "model_mode": self._normalize_model_mode(
+                        model_mode or self.default_model_mode
+                    ),
+                })
         except (BrokenPipeError, OSError):
             # Worker is dead — the next real request will respawn it.
             pass
@@ -1198,12 +1213,18 @@ class VoiceTranscribeApp(rumps.App):
         }
         if audio is not None:
             request["audio"] = audio
+        with self._worker_request_lock:
+            return self._send_worker_request(request)
+
+    def _send_worker_request(self, request):
         try:
-            self._tx_req_parent.send(request)
+            with self._worker_send_lock:
+                self._tx_req_parent.send(request)
         except (BrokenPipeError, OSError):
             print("Worker pipe broken, respawning...", flush=True)
             self._spawn_transcribe_worker()
-            self._tx_req_parent.send(request)
+            with self._worker_send_lock:
+                self._tx_req_parent.send(request)
 
         # Wait for result with timeout
         if self._tx_res_parent.poll(timeout=TRANSCRIBE_TIMEOUT):
@@ -1220,6 +1241,88 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, killing worker...", flush=True)
             self._spawn_transcribe_worker()
             return None
+
+    # ── Transcribe While Talking ──
+
+    def _start_live_pieces(self, model_mode):
+        """Begin background piece transcription for this recording, if enabled."""
+        if not self.live_pieces_enabled or model_mode not in LIVE_PIECE_MODES:
+            return None
+        buffer = self.audio_buffer  # this recording's list; stop swaps in a new one
+
+        def get_audio():
+            blocks = list(buffer)
+            if not blocks:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(blocks, axis=0).flatten().astype(np.float32, copy=False)
+
+        return live_chunker.LivePieces(
+            get_audio,
+            lambda piece: self._transcribe_live_piece(piece, model_mode),
+            sample_rate=SAMPLE_RATE,
+            min_chunk_seconds=LIVE_PIECE_MIN_SECONDS,
+            pause_seconds=LIVE_PIECE_PAUSE_SECONDS,
+            log=lambda message: print(message, flush=True),
+        ).start()
+
+    def _transcribe_live_piece(self, audio, model_mode):
+        result = self._transcribe_via_worker(
+            None, model_mode, audio=(audio.astype(np.float32, copy=False), SAMPLE_RATE)
+        )
+        if result is None:
+            raise TimeoutError("transcription worker timed out")
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+        text = (result.get("text") or "").strip()
+        if text.lower().rstrip(".!?,;: ").strip() in ASR_HALLUCINATIONS:
+            return ""
+        return text
+
+    def _finish_live_pieces(self, live, audio, model_mode, latency):
+        """Return a worker-style result using pieces done during recording.
+
+        Returns None when the whole recording should be transcribed instead
+        (no pause was found, a piece failed, or the tail timed out).
+        """
+        wait_t0 = time.perf_counter()
+        text, start, error = live.finish(timeout=TRANSCRIBE_TIMEOUT)
+        latency["live_wait"] = time.perf_counter() - wait_t0
+        if error is not None:
+            print(f"Live pieces unavailable ({error}); transcribing the whole recording.", flush=True)
+            return None
+        if start <= 0:
+            return None
+        pieces = getattr(live, "pieces", 1)
+        tail = audio[start:]
+        tail_times = []
+        stitched = False
+        if len(tail) and not _no_volume_skip_reason(_analyze_audio_volume(tail)):
+            def transcribe_tail(segment):
+                began = time.perf_counter()
+                try:
+                    return self._transcribe_live_piece(segment, model_mode)
+                finally:
+                    tail_times.append(time.perf_counter() - began)
+
+            try:
+                text, stitched = live_chunker.continue_transcript(
+                    text, audio, start, len(audio), transcribe_tail, SAMPLE_RATE,
+                    getattr(live, "context_seconds", 3.0),
+                )
+            except TimeoutError:
+                return None
+            except Exception as exc:
+                return {"error": str(exc)}
+        tail_time = sum(tail_times)
+        latency["live_pieces"] = pieces
+        latency["live_tail"] = len(tail) / SAMPLE_RATE
+        print(
+            f"Live pieces: {pieces} done before release; tail {len(tail) / SAMPLE_RATE:.1f}s "
+            f"→ {tail_time:.2f}s{' (stitched)' if stitched else ''} "
+            f"(waited {latency['live_wait']:.2f}s for an in-flight piece)",
+            flush=True,
+        )
+        return {"text": text, "time": tail_time}
 
     # ── UI Helpers ──
 
@@ -2049,6 +2152,13 @@ class VoiceTranscribeApp(rumps.App):
         self._recording_auto_refresh_requested = False
         self.is_recording = True
         self._recording_start_time = time.time()
+        try:
+            self._live_pieces = self._start_live_pieces(
+                self._pending_model or self.default_model_mode
+            )
+        except Exception as exc:
+            self._live_pieces = None
+            print(f"Live pieces disabled for this recording: {exc}", flush=True)
         self._run_on_main_thread(self._hud.show)
         self._force_input_volume_before_recording(
             blocking=INPUT_VOLUME_FORCE_BLOCKING_ON_RECORDING
@@ -2079,8 +2189,12 @@ class VoiceTranscribeApp(rumps.App):
 
         audio_data = self.audio_buffer
         self.audio_buffer = []
+        live = getattr(self, "_live_pieces", None)
+        self._live_pieces = None
 
         if not audio_data:
+            if live is not None:
+                threading.Thread(target=live.finish, daemon=True).start()
             print(
                 "No audio callbacks captured during recording; refreshing mic input.",
                 flush=True,
@@ -2096,12 +2210,12 @@ class VoiceTranscribeApp(rumps.App):
         hud_label = "Loading model…" if loading else "Transcribing…"
         self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
         threading.Thread(
-            target=self._transcribe_and_paste, args=(audio_data, model_mode), daemon=True
+            target=self._transcribe_and_paste, args=(audio_data, model_mode, live), daemon=True
         ).start()
 
     # ── Transcription ──
 
-    def _transcribe_and_paste(self, audio_data, model_mode="fast"):
+    def _transcribe_and_paste(self, audio_data, model_mode="fast", live=None):
         self.is_processing = True
         wav_path = None
         screenshot_path = None
@@ -2206,12 +2320,17 @@ class VoiceTranscribeApp(rumps.App):
                 )
 
             asr_t0 = time.perf_counter()
-            result = self._transcribe_via_worker(
-                wav_path,
-                model_mode,
-                screen_context=screen_context,
-                audio=worker_audio,
-            )
+            result = None
+            if live is not None:
+                pieces, live = live, None
+                result = self._finish_live_pieces(pieces, audio, model_mode, latency)
+            if result is None:
+                result = self._transcribe_via_worker(
+                    wav_path,
+                    model_mode,
+                    screen_context=screen_context,
+                    audio=worker_audio,
+                )
             latency["asr_wall"] = time.perf_counter() - asr_t0
 
             if result is None:
@@ -2365,12 +2484,19 @@ class VoiceTranscribeApp(rumps.App):
                 latency_parts.insert(2, f"context={latency['context']:.2f}s")
             if latency.get("fallback_wall"):
                 latency_parts.insert(3, f"fallback_wall={latency['fallback_wall']:.2f}s")
+            if latency.get("live_pieces"):
+                latency_parts.append(
+                    f"live_pieces={latency['live_pieces']} live_tail={latency['live_tail']:.1f}s "
+                    f"live_wait={latency.get('live_wait', 0):.2f}s"
+                )
             print(f"Latency: model={model_mode} " + " ".join(latency_parts), flush=True)
 
         except Exception as e:
             print(f"Transcription error: {e}", flush=True)
             rumps.notification("Voice Transcribe", "Error", str(e))
         finally:
+            if live is not None:  # recording ended before ASR (e.g. silence gate)
+                live.finish(timeout=0)
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             if not history_queued:
@@ -2695,6 +2821,7 @@ class VoiceTranscribeApp(rumps.App):
             self.menu.add(item)
         self.menu.add(rumps.MenuItem(self._screen_context_menu_title(), callback=self._toggle_screen_context))
         self.menu.add(rumps.MenuItem(self._sound_effects_menu_title(), callback=self._toggle_sound_effects))
+        self.menu.add(rumps.MenuItem(self._live_pieces_menu_title(), callback=self._toggle_live_pieces))
         self.menu.add(rumps.MenuItem(self._thermal_menu_title(), callback=None))
         self.menu.add(rumps.MenuItem(self._power_menu_title(), callback=None))
         self.menu.add(rumps.separator)
@@ -2805,6 +2932,16 @@ class VoiceTranscribeApp(rumps.App):
     def _toggle_sound_effects(self, _):
         self.sound_effects_enabled = not self.sound_effects_enabled
         self.settings["sound_effects_enabled"] = self.sound_effects_enabled
+        self._save_settings()
+        self._rebuild_menu()
+
+    def _live_pieces_menu_title(self):
+        status = "On" if self.live_pieces_enabled else "Off"
+        return f"Transcribe While Talking (Nemotron): {status}"
+
+    def _toggle_live_pieces(self, _):
+        self.live_pieces_enabled = not self.live_pieces_enabled
+        self.settings["live_pieces_enabled"] = self.live_pieces_enabled
         self._save_settings()
         self._rebuild_menu()
 

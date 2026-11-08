@@ -366,6 +366,18 @@ that state, so each dictation prefills only its audio. Nemotron speed is limited
 by GPU memory bandwidth: Low Power Mode cuts it to roughly a fifth. See
 `docs/nemotron-speed-20261107.md` for measurements and rejected options.
 
+**Transcribe While Talking (Nemotron)** is a menu toggle (`live_pieces_enabled`
+in `settings.json`, off by default). During a long dictation, each finished
+piece is transcribed in the background once a 0.5-second pause comes at least
+8 seconds after the previous cut. Each piece re-hears 3 seconds before its start
+and is stitched to the previous text in that overlap, so a mid-sentence pause
+does not become ". The". Releasing Fn then waits only for the last piece. A
+failed piece falls back to transcribing the whole recording. `live_chunker.py`
+holds the logic. Override the thresholds with
+`VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS` and
+`VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS`. Measurements are in
+`docs/transcribe-while-talking-20261108.md`.
+
 Select **Qwen3-ASR 0.6B (MLX)** in the menu to return to the previous fast engine.
 The original model and runtime are retained.
 
