@@ -2,14 +2,6 @@
 import re
 
 
-# Number words → digits via word2number
-try:
-    from word2number import w2n
-    _HAS_W2N = True
-except ImportError:
-    _HAS_W2N = False
-
-
 # Word segmentation for merged tokens like "sidsleeping" → "side sleeping"
 try:
     import wordninja
@@ -171,98 +163,215 @@ def _split_merged_words(text):
 # Multiplier suffixes that should attach to numbers
 _SUFFIXES = {"k": "K", "m": "M", "b": "B", "x": "x"}
 
-# Common number words (for detection)
-_NUMBER_WORDS = {
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
-    "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred",
-    "thousand", "million", "billion", "trillion",
+_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+_TEENS = {
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_SCALES = {
+    "thousand": 1_000, "million": 1_000_000,
+    "billion": 1_000_000_000, "trillion": 1_000_000_000_000,
+}
+_NUMBER_WORDS = set(_UNITS) | set(_TEENS) | set(_TENS) | set(_SCALES) | {"hundred"}
+
+_TRAILING_PUNCT = ".,!?;:"
+
+# Words after a lone "one" that make it a quantity worth writing as "1".
+_ONE_AS_DIGIT_NEXT = {"percent", "dollar", "dollars", "a.m", "p.m", "o'clock"}
+
+# Words before "one" that make it the pronoun ("this one", "no one").
+_ONE_AS_PRONOUN_AFTER = {
+    "this", "that", "the", "which", "no", "each", "every", "any", "another",
 }
 
+# "twenty-four seven" is an idiom, not a number. Without this the parser would
+# see two numbers side by side and leave the words; "24/7" is what people mean.
+_TWENTY_FOUR_SEVEN = re.compile(
+    r"\b(?:twenty[\s-]+four|24)[\s-]+seven\b", re.IGNORECASE
+)
 
-def _is_number_word(w):
-    # Strip punctuation and handle hyphens (e.g. "twenty-five")
-    cleaned = w.lower().rstrip(".,!?;:")
-    # Handle hyphenated numbers like "twenty-five"
-    parts = cleaned.split("-")
-    if all(p in _NUMBER_WORDS for p in parts if p):
+
+def _number_tokens(word):
+    """Number tokens in one word ("Twenty-five," → ["twenty", "five"]),
+    ["and"] for the connective, or None when the word isn't a number word."""
+    core = word.rstrip(_TRAILING_PUNCT).lower()
+    if core == "and":
+        return ["and"]
+    parts = core.split("-")
+    if all(p in _NUMBER_WORDS for p in parts):
+        return parts
+    return None
+
+
+def _is_numberish(word):
+    if not word:
+        return False
+    core = word.rstrip(_TRAILING_PUNCT)
+    if re.fullmatch(r"\$?\d[\d,.]*%?", core):
         return True
-    return cleaned in _NUMBER_WORDS or cleaned == "and"
+    tokens = _number_tokens(word)
+    return tokens is not None and tokens != ["and"]
 
 
-def _expand_hyphens(words):
-    """Split hyphenated number words: ['twenty-five'] → ['twenty', 'five']"""
-    result = []
-    for w in words:
-        cleaned = w.lower().rstrip(".,!?;:")
-        parts = cleaned.split("-")
-        if len(parts) > 1 and all(p in _NUMBER_WORDS for p in parts if p):
-            # Preserve trailing punctuation on the last part
-            trailing = w[len(w.rstrip(".,!?;:")):]
-            for k, p in enumerate(parts):
-                if k == len(parts) - 1 and trailing:
-                    result.append(p + trailing)
-                else:
-                    result.append(p)
-        else:
-            result.append(w)
-    return result
+def _parse_below_hundred(tokens, i):
+    """Parse 0–99 at tokens[i]; return (value, next index) or None."""
+    if i >= len(tokens):
+        return None
+    word = tokens[i]
+    if word in _TENS:
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt in _UNITS and nxt != "zero":
+            return _TENS[word] + _UNITS[nxt], i + 2
+        return _TENS[word], i + 1
+    if word in _TEENS:
+        return _TEENS[word], i + 1
+    if word in _UNITS:
+        return _UNITS[word], i + 1
+    return None
+
+
+def _parse_group(tokens, i):
+    """Parse a group like "seven", "forty two", "three hundred and five",
+    or "fifteen hundred"; return (value, next index) or None."""
+    first = _parse_below_hundred(tokens, i)
+    if first is None:
+        return None
+    value, j = first
+    if j < len(tokens) and tokens[j] == "hundred" and value > 0:
+        value *= 100
+        j += 1
+        k = j + 1 if j < len(tokens) and tokens[j] == "and" else j
+        rest = _parse_below_hundred(tokens, k)
+        if rest is not None and rest[0] > 0:
+            value += rest[0]
+            j = rest[1]
+    return value, j
+
+
+def _parse_cardinal(tokens):
+    """Return the value when tokens spell exactly ONE number, else None.
+
+    The old word2number path did arithmetic on any run of number words, so
+    "twenty four seven" became 20*4+7 = 87 and "nineteen eighty four" became
+    1,524. Runs that aren't a single well-formed number now return None and
+    the caller keeps the spoken words.
+    """
+    total = 0
+    last_scale = None
+    i = 0
+    while i < len(tokens):
+        group = _parse_group(tokens, i)
+        if group is None:
+            return None
+        value, i = group
+        if last_scale is not None and value >= last_scale:
+            return None  # "one thousand fifteen hundred"
+        if i < len(tokens) and tokens[i] in _SCALES:
+            scale = _SCALES[tokens[i]]
+            if value == 0 or (last_scale is not None and scale >= last_scale):
+                return None  # "zero thousand", "five thousand two thousand"
+            total += value * scale
+            last_scale = scale
+            i += 1
+            if i + 1 < len(tokens) and tokens[i] == "and":
+                i += 1  # "one thousand and five"
+            continue
+        if i != len(tokens):
+            return None  # another number follows: "twenty four seven"
+        return total + value
+    return total
+
+
+def _keep_lone_one(words, i):
+    """True when a lone "one" is a word ("this one", "no one", "one of them",
+    "one thing"), not a count to write as a digit."""
+    nxt = words[i + 1].lower().rstrip(_TRAILING_PUNCT) if i + 1 < len(words) else ""
+    if words[i] != words[i].rstrip(_TRAILING_PUNCT):
+        nxt = ""  # punctuation ends the phrase: "this one, there's..."
+    if nxt in _ONE_AS_DIGIT_NEXT or nxt in _SUFFIXES:
+        return False
+    # Earlier spacing repair turns "p.m." into "p. m." before numbers run.
+    after = words[i + 2].lower().rstrip(_TRAILING_PUNCT) if i + 2 < len(words) else ""
+    if nxt in ("a", "p") and after == "m":
+        return False
+
+    # Keep ranges and lists consistent with their other end: "one or two" →
+    # "1 or 2", "one, two, three" → "1, 2, 3". ("one to one" stays words:
+    # that's the phrase, not a range.)
+    def other_end_is_number(k):
+        return 0 <= k < len(words) and _is_numberish(words[k]) and _number_tokens(words[k]) != ["one"]
+
+    prev = words[i - 1].lower().rstrip(_TRAILING_PUNCT) if i >= 1 else ""
+    if prev in _ONE_AS_PRONOUN_AFTER:
+        return True  # "this one, two of them" — "one" is the pronoun here
+    if words[i].endswith(",") and other_end_is_number(i + 1):
+        return False
+    if i >= 1 and words[i - 1].endswith(",") and other_end_is_number(i - 1):
+        return False
+    if nxt in ("or", "to") and other_end_is_number(i + 2):
+        return False
+    if prev in ("or", "to") and other_end_is_number(i - 2):
+        return False
+    return True
 
 
 def _convert_number_spans(text):
     """Find spans of number words and convert to digits."""
-    if not _HAS_W2N:
-        return text
+    text = _TWENTY_FOUR_SEVEN.sub("24/7", text)
 
     words = text.split()
-    # Expand hyphenated numbers before processing
-    words = _expand_hyphens(words)
     result = []
     i = 0
 
     while i < len(words):
-        if _is_number_word(words[i]):
-            span = []
-            j = i
-            while j < len(words) and _is_number_word(words[j]):
-                span.append(words[j])
-                j += 1
-
-            # Preserve trailing punctuation
-            last = span[-1]
-            trailing_punct = ""
-            stripped = last.rstrip(".,!?;:")
-            if len(stripped) < len(last):
-                trailing_punct = last[len(stripped):]
-                span[-1] = stripped
-
-            # Filter out standalone "and"
-            num_words = [w for w in span if w.lower() != "and" or len(span) > 1]
-
-            try:
-                num = w2n.word_to_num(" ".join(num_words))
-                num_str = f"{num:,}" if num >= 1000 else str(num)
-
-                # Check if next word is a suffix (K, M, etc.)
-                if j < len(words) and words[j].lower().rstrip(".,!?;:") in _SUFFIXES:
-                    suffix_raw = words[j]
-                    suffix_clean = _SUFFIXES[suffix_raw.lower().rstrip(".,!?;:")]
-                    suffix_trailing = suffix_raw[len(suffix_raw.rstrip(".,!?;:")):]
-                    num_str = str(num) + suffix_clean + suffix_trailing
-                    trailing_punct = ""  # suffix has its own punctuation
-                    j += 1
-
-                result.append(num_str + trailing_punct)
-            except (ValueError, IndexError):
-                result.extend(span)
-                if trailing_punct:
-                    result[-1] += trailing_punct
-
-            i = j
-        else:
+        tokens = _number_tokens(words[i])
+        if tokens is None or tokens == ["and"]:
             result.append(words[i])
             i += 1
+            continue
+
+        # Collect the run of number words. A word that carries punctuation
+        # ends the run, so "twenty-four, seven" stays two separate numbers.
+        j = i
+        while j < len(words) and _number_tokens(words[j]) is not None:
+            j += 1
+            if words[j - 1] != words[j - 1].rstrip(_TRAILING_PUNCT):
+                break
+        while _number_tokens(words[j - 1]) == ["and"]:
+            j -= 1  # "five and then" — the "and" is an ordinary word
+
+        span = words[i:j]
+        last = span[-1]
+        trailing_punct = last[len(last.rstrip(_TRAILING_PUNCT)):]
+        span_tokens = [t for w in span for t in _number_tokens(w)]
+        num = _parse_cardinal(span_tokens)
+
+        if num is None or (span_tokens == ["one"] and _keep_lone_one(words, i)):
+            # Not one well-formed number ("one two three", "nine one one"),
+            # or a lone pronoun-ish "one": keep the words exactly as spoken.
+            result.extend(span)
+            i = j
+            continue
+
+        num_str = f"{num:,}" if num >= 1000 else str(num)
+
+        # Check if next word is a suffix (K, M, etc.)
+        if not trailing_punct and j < len(words) and words[j].lower().rstrip(_TRAILING_PUNCT) in _SUFFIXES:
+            suffix_raw = words[j]
+            suffix_clean = _SUFFIXES[suffix_raw.lower().rstrip(_TRAILING_PUNCT)]
+            suffix_trailing = suffix_raw[len(suffix_raw.rstrip(_TRAILING_PUNCT)):]
+            num_str = str(num) + suffix_clean + suffix_trailing
+            j += 1
+
+        result.append(num_str + trailing_punct)
+        i = j
 
     return " ".join(result)
 

@@ -131,5 +131,52 @@ class SpacingRepairTest(unittest.TestCase):
         )
 
 
+class NumberConversionTest(unittest.TestCase):
+    def assertFormats(self, spoken, expected):
+        self.assertEqual(format_transcription(spoken), expected)
+
+    def test_twenty_four_seven_is_the_idiom_not_87(self):
+        self.assertFormats("Yes, twenty-four seven.", "Yes, 24/7.")
+        self.assertFormats("we need people on twenty four seven", "We need people on 24/7")
+
+    def test_runs_that_are_not_one_number_keep_their_words(self):
+        # word2number did arithmetic on these: 1,524 / 10 / 5 / "20 days".
+        self.assertFormats("nineteen eighty four", "Nineteen eighty four")
+        self.assertFormats("call nine one one", "Call nine one one")
+        self.assertFormats("one two three", "One two three")
+        self.assertFormats(
+            "open twenty-four seven, three sixty five days a year.",
+            "Open 24/7, three sixty five days a year.",
+        )
+        self.assertFormats("a hundred and twenty", "A hundred and twenty")
+
+    def test_real_numbers_still_become_digits(self):
+        self.assertFormats("twenty five", "25")
+        self.assertFormats("twenty-one days", "21 days")
+        self.assertFormats("two hundred five", "205")
+        self.assertFormats("one thousand two hundred thirty four", "1,234")
+        self.assertFormats("fifteen hundred", "1,500")
+        self.assertFormats("twenty five percent", "25%")
+        self.assertFormats("It costs five hundred dollars per month.", "It costs $500 per month.")
+        self.assertFormats("About two hundred and fifty K monthly active users.", "About 250K monthly active users.")
+        self.assertFormats("three x faster", "3x faster")
+        self.assertFormats("Twenty-five, thirty, forty.", "25, 30, 40.")
+
+    def test_lone_one_stays_a_word(self):
+        self.assertFormats("No one knows.", "No one knows.")
+        self.assertFormats("this one will just continue", "This one will just continue")
+        self.assertFormats("throw one of these creator nights", "Throw one of these creator nights")
+        self.assertFormats("For this one, there's one screen", "For this one, there's one screen")
+        self.assertFormats("one to one meeting", "One to one meeting")
+
+    def test_one_as_a_quantity_becomes_a_digit(self):
+        self.assertFormats("one percent of users", "1% of users")
+        self.assertFormats("it costs one dollar", "It costs $1")
+        self.assertFormats("meet at one p.m.", "Meet at 1 p.m.")
+        self.assertFormats("one or two things", "1 or 2 things")
+        self.assertFormats("one, two, three", "1, 2, 3")
+        self.assertFormats("one hundred people", "100 people")
+
+
 if __name__ == "__main__":
     unittest.main()
