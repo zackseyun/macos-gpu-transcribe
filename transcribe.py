@@ -207,6 +207,19 @@ SILENCE_LOW_CONFIDENCE_ACTIVE_RATIO = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_
 SILENCE_SHORT_BLIP_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_SECONDS", "0.50"))
 SILENCE_SHORT_BLIP_MAX_RMS = float(os.getenv("VOICE_TRANSCRIBE_SILENCE_SHORT_BLIP_MAX_RMS", "0.050"))
 
+# Long quiet stretches at the start or end of a recording (Fn held before or
+# after speaking) are cut before ASR. Fed 19 s of room noise after "Yes,
+# twenty-four seven.", Nemotron repeated the phrase until its token cap and the
+# whole dictation was refused (failed_recordings/20261119-115156-error.wav).
+# Loudness is measured in the speech band, so low rumble (desk bumps, HVAC)
+# doesn't count as talking. "Quiet" is relative to the recording's own speech,
+# because the mic's noise floor and Zack's speaking level both vary.
+EDGE_TRIM_FRAME_SECONDS = 0.25
+EDGE_TRIM_BAND_HZ = (300.0, 3400.0)
+EDGE_TRIM_RATIO = float(os.getenv("VOICE_TRANSCRIBE_EDGE_TRIM_RATIO", "0.08"))
+EDGE_TRIM_MIN_QUIET_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_EDGE_TRIM_MIN_QUIET_SECONDS", "2.0"))
+EDGE_TRIM_PAD_SECONDS = 0.75
+
 # "Transcribe While Talking": for slow, accurate models, transcribe each finished
 # piece of a long dictation (cut at a real pause) while the user keeps talking,
 # so releasing Fn leaves only the last piece. See live_chunker.py.
@@ -353,6 +366,50 @@ def _input_volume_should_log(previous, current, error=None):
     if previous is None or current is None:
         return True
     return previous != current
+
+
+def _speech_band_rms(audio, frame_seconds=EDGE_TRIM_FRAME_SECONDS):
+    """RMS of each frame counting only speech-band frequencies."""
+    frame = max(1, int(frame_seconds * SAMPLE_RATE))
+    count = len(audio) // frame
+    if count == 0:
+        return np.zeros(0, dtype=np.float32)
+    frames = np.asarray(audio[: count * frame], dtype=np.float32).reshape(count, frame)
+    spectrum = np.fft.rfft(frames, axis=1)
+    freqs = np.fft.rfftfreq(frame, 1.0 / SAMPLE_RATE)
+    low, high = EDGE_TRIM_BAND_HZ
+    band = (freqs >= low) & (freqs <= high)
+    # Parseval: mean square of the band-limited signal from one-sided bins.
+    power = 2.0 * np.sum(np.abs(spectrum[:, band]) ** 2, axis=1) / (frame * frame)
+    return np.sqrt(power).astype(np.float32)
+
+
+def _speech_bounds(audio):
+    """Return ``(start, end)`` sample indices that drop long quiet edges.
+
+    A frame is quiet when its speech-band RMS is below ``EDGE_TRIM_RATIO`` of
+    the recording's speech level (its third-loudest frame, so one cough or
+    knock can't set it). An edge is cut only when it stays quiet for at least
+    ``EDGE_TRIM_MIN_QUIET_SECONDS``, and ``EDGE_TRIM_PAD_SECONDS`` is kept next
+    to the speech so soft first and last words survive. Returns
+    ``(0, len(audio))`` when nothing qualifies.
+    """
+    audio = np.nan_to_num(np.asarray(audio, dtype=np.float32).flatten())
+    total = len(audio)
+    rms = _speech_band_rms(audio)
+    if len(rms) < 3:
+        return 0, total
+    level = float(np.sort(rms)[-3])
+    if level <= 0.0:
+        return 0, total
+    loud = np.flatnonzero(rms >= EDGE_TRIM_RATIO * level)
+    frame = int(EDGE_TRIM_FRAME_SECONDS * SAMPLE_RATE)
+    pad = int(EDGE_TRIM_PAD_SECONDS * SAMPLE_RATE)
+    min_quiet = int(EDGE_TRIM_MIN_QUIET_SECONDS * SAMPLE_RATE)
+    speech_start, speech_end = int(loud[0]) * frame, (int(loud[-1]) + 1) * frame
+    start = speech_start - pad if speech_start >= min_quiet else 0
+    end = speech_end + pad if total - speech_end >= min_quiet else total
+    return max(0, start), min(total, end)
 
 
 def _longest_true_run_seconds(mask, frame_seconds):
@@ -1266,6 +1323,8 @@ class VoiceTranscribeApp(rumps.App):
         ).start()
 
     def _transcribe_live_piece(self, audio, model_mode):
+        start, end = _speech_bounds(audio)  # a mostly-quiet piece can loop too
+        audio = audio[start:end]
         result = self._transcribe_via_worker(
             None, model_mode, audio=(audio.astype(np.float32, copy=False), SAMPLE_RATE)
         )
@@ -2218,6 +2277,7 @@ class VoiceTranscribeApp(rumps.App):
     def _transcribe_and_paste(self, audio_data, model_mode="fast", live=None):
         self.is_processing = True
         wav_path = None
+        preserve_wav = None  # wav_path only when it holds the full recording
         screenshot_path = None
         screen_context = ""
         history_queued = False
@@ -2266,15 +2326,28 @@ class VoiceTranscribeApp(rumps.App):
                 self._set_title(self._idle_icon_with_thermal())
                 return
 
+            # The model hears only the spoken part; long quiet edges make it
+            # loop. Saved/failed recordings keep the full audio.
+            speech_start, speech_end = _speech_bounds(audio)
+            asr_audio = audio[speech_start:speech_end]
+            if len(asr_audio) < len(audio):
+                print(
+                    f"Trimmed quiet edges: kept {speech_start / SAMPLE_RATE:.1f}-"
+                    f"{speech_end / SAMPLE_RATE:.1f}s of {duration:.1f}s",
+                    flush=True,
+                )
+
             worker_audio = None
-            if _should_send_audio_in_memory(model_mode, duration):
+            if _should_send_audio_in_memory(model_mode, len(asr_audio) / SAMPLE_RATE):
                 # Cohere and Qwen can consume the already-normalized 16 kHz
                 # float32 buffer directly. This skips the temp WAV write,
                 # worker-side WAV decode, and an extra last_recording copy.
-                worker_audio = (audio.astype(np.float32, copy=False), SAMPLE_RATE)
+                worker_audio = (asr_audio.astype(np.float32, copy=False), SAMPLE_RATE)
             else:
                 wav_path = tempfile.mktemp(suffix=".wav")
-                _write_wav_file(audio, wav_path)
+                _write_wav_file(asr_audio, wav_path)
+                if len(asr_audio) == len(audio):
+                    preserve_wav = wav_path
             latency["prep"] = time.perf_counter() - prep_t0
 
             if self.screen_context_enabled:
@@ -2323,7 +2396,9 @@ class VoiceTranscribeApp(rumps.App):
             result = None
             if live is not None:
                 pieces, live = live, None
-                result = self._finish_live_pieces(pieces, audio, model_mode, latency)
+                # Only the end is trimmed here: live piece offsets index the
+                # untrimmed recording.
+                result = self._finish_live_pieces(pieces, audio[:speech_end], model_mode, latency)
             if result is None:
                 result = self._transcribe_via_worker(
                     wav_path,
@@ -2362,12 +2437,12 @@ class VoiceTranscribeApp(rumps.App):
                         result = fallback
                         model_mode = "cohere"
                     else:
-                        self._preserve_current_recording(wav_path, audio, "granite_error")
+                        self._preserve_current_recording(preserve_wav, audio, "granite_error")
                         if fallback is None:
                             raise Exception(result["error"])
                         raise Exception(fallback.get("error") or result["error"])
                 else:
-                    self._preserve_current_recording(wav_path, audio, "error")
+                    self._preserve_current_recording(preserve_wav, audio, "error")
                     raise Exception(result["error"])
 
             # Model produced a result → it's warm now. Subsequent HUDs show
@@ -2399,11 +2474,11 @@ class VoiceTranscribeApp(rumps.App):
                         text = fallback.get("text", "")
                         transcribe_time = fallback.get("time", 0)
                     else:
-                        self._preserve_current_recording(wav_path, audio, "empty")
+                        self._preserve_current_recording(preserve_wav, audio, "empty")
                         print("No speech detected.", flush=True)
                         return
                 if not text:
-                    self._preserve_current_recording(wav_path, audio, "empty")
+                    self._preserve_current_recording(preserve_wav, audio, "empty")
                     print("No speech detected.", flush=True)
                     return
 
@@ -2438,11 +2513,11 @@ class VoiceTranscribeApp(rumps.App):
                     transcribe_time = fallback.get("time", 0)
                     normalized = text.strip().lower().rstrip(".!?,;: ").strip()
                 else:
-                    self._preserve_current_recording(wav_path, audio, "granite_hallucination")
+                    self._preserve_current_recording(preserve_wav, audio, "granite_hallucination")
                     return
 
             if not text:
-                self._preserve_current_recording(wav_path, audio, "empty")
+                self._preserve_current_recording(preserve_wav, audio, "empty")
                 print("No speech detected.", flush=True)
                 return
 
@@ -2451,7 +2526,7 @@ class VoiceTranscribeApp(rumps.App):
                     f"Dropping ASR hallucination on low-content audio: {text!r}",
                     flush=True,
                 )
-                self._preserve_current_recording(wav_path, audio, "hallucination")
+                self._preserve_current_recording(preserve_wav, audio, "hallucination")
                 return
 
             format_t0 = time.perf_counter()
@@ -2467,7 +2542,7 @@ class VoiceTranscribeApp(rumps.App):
             print(f"Transcribed ({duration:.1f}s audio → {transcribe_time:.1f}s{slow_note}): {text}", flush=True)
             self._add_to_history(text)
             history_queued = True
-            self._save_last_recording_async(wav_path=wav_path, audio=audio)
+            self._save_last_recording_async(wav_path=preserve_wav, audio=audio)
             paste_t0 = time.perf_counter()
             self._paste_text(text)
             latency["paste"] = time.perf_counter() - paste_t0

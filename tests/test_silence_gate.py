@@ -199,5 +199,60 @@ class SilenceGateTest(unittest.TestCase):
             )
 
 
+class QuietEdgeTrimTest(unittest.TestCase):
+    """_speech_bounds drops long quiet starts/ends so Nemotron doesn't loop."""
+
+    rng = np.random.default_rng(7)
+
+    def room(self, seconds, amplitude=0.004):
+        samples = int(transcribe.SAMPLE_RATE * seconds)
+        return (amplitude * self.rng.standard_normal(samples)).astype(np.float32)
+
+    def voice(self, seconds, amplitude=0.05):
+        # 1 kHz sits in the speech band; the shared sine() helper is 180 Hz.
+        return sine(seconds, amplitude=amplitude, hz=1000) + self.room(seconds)
+
+    def bounds(self, *parts):
+        audio = np.concatenate(parts)
+        start, end = transcribe._speech_bounds(audio)
+        return start / transcribe.SAMPLE_RATE, end / transcribe.SAMPLE_RATE, len(audio) / transcribe.SAMPLE_RATE
+
+    def test_long_quiet_ending_is_cut_with_a_margin(self):
+        start, end, total = self.bounds(self.voice(1.5), self.room(19.0))
+        self.assertEqual(start, 0.0)
+        self.assertAlmostEqual(end, 1.5 + transcribe.EDGE_TRIM_PAD_SECONDS, delta=0.26)
+        self.assertGreater(total, 20.0)
+
+    def test_long_quiet_start_is_cut_with_a_margin(self):
+        start, end, total = self.bounds(self.room(4.0), self.voice(3.0))
+        self.assertAlmostEqual(start, 4.0 - transcribe.EDGE_TRIM_PAD_SECONDS, delta=0.26)
+        self.assertEqual(end, total)
+
+    def test_continuous_speech_and_short_pauses_are_untouched(self):
+        for parts in (
+            (self.voice(12.0),),
+            (self.voice(3.0), self.room(1.5)),
+            (self.room(1.5), self.voice(3.0), self.room(1.0), self.voice(2.0)),
+        ):
+            start, end, total = self.bounds(*parts)
+            self.assertEqual((start, end), (0.0, total))
+
+    def test_low_rumble_does_not_count_as_speech(self):
+        rumble = sine(10.0, amplitude=0.05, hz=60) + self.room(10.0)
+        start, end, total = self.bounds(self.voice(2.0), rumble)
+        self.assertLess(end, 3.5)
+
+    def test_soft_last_words_survive_a_loud_knock(self):
+        knock = self.voice(0.25, amplitude=0.8)
+        start, end, total = self.bounds(
+            self.voice(2.0), knock, self.voice(3.0, amplitude=0.012), self.room(0.5)
+        )
+        self.assertEqual((start, end), (0.0, total))
+
+    def test_short_or_silent_audio_is_untouched(self):
+        for audio in (np.zeros(0, dtype=np.float32), np.zeros(8000, dtype=np.float32), self.room(5.0)):
+            self.assertEqual(transcribe._speech_bounds(audio), (0, len(audio)))
+
+
 if __name__ == "__main__":
     unittest.main()
