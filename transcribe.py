@@ -2266,6 +2266,10 @@ class VoiceTranscribeApp(rumps.App):
 
         model_mode = self._pending_model or self.default_model_mode
         loading = not self._model_warmed.get(model_mode, False)
+        if model_mode == "nemotron35":
+            import nemotron_resident
+            if nemotron_resident.enabled():
+                loading = not nemotron_resident.SOCKET.exists()
         hud_label = "Loading model…" if loading else "Transcribing…"
         self._run_on_main_thread(lambda lbl=hud_label: self._hud.setProcessingWithLabel_(lbl))
         threading.Thread(

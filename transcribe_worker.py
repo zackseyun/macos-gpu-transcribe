@@ -885,6 +885,7 @@ def run(request_pipe, result_pipe):
 
     from swift_asr import SwiftASR
     from mlx_next_asr import NextASR, MODES as NEXT_MODES
+    import nemotron_resident
     next_asr = NextASR()
     swift_qwen = SwiftASR()
     fallback_warmed = set()
@@ -1186,7 +1187,10 @@ def run(request_pipe, result_pipe):
             if warm_model_mode in NEXT_MODES:
                 def _warm_next(mode=warm_model_mode):
                     try:
-                        next_asr.warm(mode)
+                        if mode == "nemotron35" and nemotron_resident.enabled():
+                            nemotron_resident.request({"warm": True})
+                        else:
+                            next_asr.warm(mode)
                         print(f"Transcription worker: {mode} ready (isolated MLX)", flush=True)
                     except Exception as exc:
                         print(f"Transcription worker: {mode} warm failed: {exc}", flush=True)
@@ -1255,9 +1259,11 @@ def run(request_pipe, result_pipe):
 
             if model_mode in NEXT_MODES:
                 with inference_lock:
-                    text = next_asr.transcribe(
-                        audio_input if audio_input is not None else wav_path, model_mode
-                    )
+                    source = audio_input if audio_input is not None else wav_path
+                    if model_mode == "nemotron35" and nemotron_resident.enabled():
+                        text = nemotron_resident.transcribe(source)
+                    else:
+                        text = next_asr.transcribe(source, model_mode)
                     last_real_inference_at[0] = time.time()
                     last_any_inference_at[0] = time.time()
             elif model_mode == "granite":

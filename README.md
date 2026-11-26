@@ -397,3 +397,15 @@ This measures normalized word errors and synchronized warm latency on eight
 clean clips, eight deterministic 15 dB noise variants, and one concatenated clip.
 It is a small, single-speaker reading-speech test, not evidence of general accuracy
 or a substitute for evaluating the owner's spontaneous dictation.
+
+### Optional always-ready Nemotron (macOS)
+
+With the isolated Nemotron runtime installed, run
+`.venv/bin/python scripts/install_nemotron_resident.py` to preload it at login.
+This opt-in LaunchAgent owns the model independently of the microphone, GUI and
+worker. Display sleep can still release the mic; the next GUI reconnects over a
+user-private Unix socket. Only the initial login, a service crash or a deliberate
+service restart needs a full load. The service stays resident even when the menu
+app quits; this trades memory for readiness, not instantaneous speech decoding.
+To opt out, boot out `gui/$(id -u)/com.zack.voice-transcribe.nemotron` with
+launchctl and remove its matching plist from `~/Library/LaunchAgents`.
