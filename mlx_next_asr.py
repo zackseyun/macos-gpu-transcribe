@@ -20,6 +20,10 @@ MODES = {"granite5": "Granite Speech 5.0 2B (MLX)",
 MODEL_DIRS = {"granite5": "granite5", "nemotron35": "nemotron"}
 
 
+class TokenLimitError(RuntimeError):
+    """The request failed; the resident model and pipe are still healthy."""
+
+
 class NextASR:
     def __init__(self):
         self.process = None
@@ -56,9 +60,13 @@ class NextASR:
             if not line:
                 raise RuntimeError("MLX transcription process exited")
             result = json.loads(line)
+            if payload.get("wav") and result.get("error_code") == "token_limit":
+                raise TokenLimitError(result["error"])
             if result.get("error"):
                 raise RuntimeError(result["error"])
             return result
+        except TokenLimitError:
+            raise
         except Exception:
             self.stop()
             raise
@@ -116,7 +124,7 @@ def serve(mode):
                 if request.get("warm"):
                     # Compile the same path used for speech, without recording.
                     audio = np.zeros(16000, dtype=np.float32)
-                    generate(model, audio, mode, max_tokens=128, prefix=prefix)
+                    generate(model, audio, mode, max_tokens=2 if mode == "nemotron35" else 128, prefix=prefix)
                     response = {"ready": True}
                 else:
                     audio, sr = sf.read(io.BytesIO(base64.b64decode(request["wav"])), dtype="float32")
@@ -124,6 +132,9 @@ def serve(mode):
                         raise ValueError("Expected nonempty mono 16 kHz audio")
                     response = {"text": generate(model, audio, mode, prefix=prefix)}
                 mx.clear_cache()
+            except TokenLimitError as exc:
+                mx.clear_cache()
+                response = {"error": str(exc), "error_code": "token_limit"}
             except Exception as exc:
                 response = {"error": f"{type(exc).__name__}: {exc}"}
             protocol.write(json.dumps(response) + "\n")
@@ -229,7 +240,7 @@ def generate(model, audio, mode, max_tokens=None, prefix=None):
             result = model.generate(mx.array(chunk), **kwargs)
         if max_tokens is None and (getattr(result, "finish_reason", None) == "length"
                 or getattr(result, "generation_tokens", 0) >= budget):
-            raise RuntimeError("Transcription reached its token limit; refusing incomplete text")
+            raise TokenLimitError("Transcription reached its token limit; refusing incomplete text")
         text = result.text.strip()
         if texts:
             # Only deduplicate exact words in the overlap, not repeated phrases elsewhere.

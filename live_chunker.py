@@ -156,8 +156,7 @@ class LivePieces:
     single thread, so the worker sees at most one request from here.
     ``finish()`` stops looking for pauses, waits for an in-flight piece, and
     returns ``(text, start_sample, error)``: everything before ``start_sample``
-    is transcribed in ``text``. On error the caller should transcribe the
-    whole recording the ordinary way.
+    is transcribed in ``text``. Completed pieces remain valid after a later piece fails.
     """
 
     def __init__(self, get_audio, transcribe, sample_rate=16000, min_chunk_seconds=8.0,
@@ -201,9 +200,9 @@ class LivePieces:
                     f"→ {elapsed:.2f}s{' (stitched)' if stitched else ''}"
                 )
                 self.text, self.start_sample = text, cut
-            except Exception as exc:  # fall back to whole-recording transcription
+            except Exception as exc:
                 self.error = exc
-                self._log(f"Live piece failed; will transcribe the whole recording: {exc}")
+                self._log(f"Live piece failed; will retry remaining audio: {exc}")
                 return
 
     def finish(self, timeout=None):

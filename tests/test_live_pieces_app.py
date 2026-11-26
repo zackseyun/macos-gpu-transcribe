@@ -61,8 +61,17 @@ class LivePiecesAppTest(unittest.TestCase):
 
     def test_piece_error_falls_back_to_whole_recording(self):
         app = Stub([])
-        result = app._finish_live_pieces(FakeLive("x", SR, RuntimeError("boom")), loud(3), "nemotron35", {})
+        result = app._finish_live_pieces(FakeLive("", 0, RuntimeError("boom")), loud(3), "nemotron35", {})
         self.assertIsNone(result)
+
+    def test_later_failure_preserves_completed_pieces(self):
+        app = Stub([{"text": "last few words and the rest."}])
+        result = app._finish_live_pieces(
+            FakeLive("Here are the last few words.", 10 * SR, RuntimeError("token limit")),
+            loud(14), "nemotron35", {})
+        self.assertEqual(result["text"], "Here are the last few words and the rest.")
+        self.assertEqual(len(app.requests), 1)
+        self.assertLess(app.requests[0][1], 7 * SR)
 
     def test_no_pieces_falls_back(self):
         self.assertIsNone(Stub([])._finish_live_pieces(FakeLive("", 0), loud(3), "nemotron35", {}))

@@ -372,7 +372,8 @@ piece is transcribed in the background once a 0.5-second pause comes at least
 8 seconds after the previous cut. Each piece re-hears 3 seconds before its start
 and is stitched to the previous text in that overlap, so a mid-sentence pause
 does not become ". The". Releasing Fn then waits only for the last piece. A
-failed piece falls back to transcribing the whole recording. `live_chunker.py`
+failed piece retries from the last finished boundary (the whole recording only if
+no piece finished). A token-limit error rejects partial text without unloading the model. `live_chunker.py`
 holds the logic. Override the thresholds with
 `VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS` and
 `VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS`. Measurements are in

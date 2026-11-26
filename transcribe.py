@@ -1341,12 +1341,12 @@ class VoiceTranscribeApp(rumps.App):
         """Return a worker-style result using pieces done during recording.
 
         Returns None when the whole recording should be transcribed instead
-        (no pause was found, a piece failed, or the tail timed out).
+        (no piece finished, or the worker timed out).
         """
         wait_t0 = time.perf_counter()
         text, start, error = live.finish(timeout=TRANSCRIBE_TIMEOUT)
         latency["live_wait"] = time.perf_counter() - wait_t0
-        if error is not None:
+        if error is not None and (start <= 0 or isinstance(error, TimeoutError)):
             print(f"Live pieces unavailable ({error}); transcribing the whole recording.", flush=True)
             return None
         if start <= 0:

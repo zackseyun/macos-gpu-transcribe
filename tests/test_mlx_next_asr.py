@@ -29,6 +29,18 @@ class NextASRTest(unittest.TestCase):
                 client._request({'warm': True}, timeout=0)
             stop.assert_called_once()
 
+    def test_truncation_keeps_same_worker_for_retry(self):
+        client = backend.NextASR()
+        client.process = Mock()
+        client.process.stdout.readline.side_effect = [
+            json.dumps({"error": "incomplete", "error_code": "token_limit"}),
+            json.dumps({"text": "complete"})]
+        with patch('select.select', return_value=([True], [], [])), patch.object(client, 'stop') as stop:
+            with self.assertRaises(backend.TokenLimitError):
+                client._request({"wav": "audio"})
+            self.assertEqual(client._request({"wav": "retry"})["text"], "complete")
+            stop.assert_not_called()
+
     def test_server_error_stops_child(self):
         client = backend.NextASR()
         client.process = Mock()
