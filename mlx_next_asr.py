@@ -119,6 +119,7 @@ def serve(mode):
                 request = json.loads(line)
                 if model is None:
                     model = load(str(ROOT / ".mlx-next/models" / MODEL_DIRS[mode]))
+                    keep_weights_wired(mx, model)
                     if mode == "nemotron35":
                         prefix = NemotronPrefixCache(model)
                 if request.get("warm"):
@@ -139,6 +140,31 @@ def serve(mode):
                 response = {"error": f"{type(exc).__name__}: {exc}"}
             protocol.write(json.dumps(response) + "\n")
             protocol.flush()
+
+
+def keep_weights_wired(mx, model):
+    """Keep the weights wired between requests, not only while generating.
+
+    mlx_audio's wired_limit() drops the limit back to 0 after every request.
+    On 2026-11-26 another job filled memory, macOS compressed or swapped most
+    of Nemotron's 18 GB, and each dictation waited 15-55 s for it to page back.
+    Raising the limit adds the loaded weights to MLX's residency set, and
+    wired_limit() then restores this value instead of 0.
+    """
+    from mlx.utils import tree_reduce
+    import hardware
+    if not mx.metal.is_available():
+        return
+    weights = tree_reduce(lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0)
+    if hardware.unified_memory_bytes() < 3 * weights:
+        print(f"Weights not wired: {weights / 2**30:.1f} GB is too much of this Mac's memory",
+              file=sys.stderr, flush=True)
+        return
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    limit = info["max_recommended_working_set_size"]
+    mx.set_wired_limit(limit)
+    print(f"Weights wired between requests ({weights / 2**30:.1f} GB, limit {limit / 2**30:.0f} GB)",
+          file=sys.stderr, flush=True)
 
 
 class NemotronPrefixCache:

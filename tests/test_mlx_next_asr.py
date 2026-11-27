@@ -8,6 +8,28 @@ import mlx_next_asr as backend
 
 
 class NextASRTest(unittest.TestCase):
+    def _fake_mx(self, weight_bytes):
+        class FakeArray:
+            def __init__(self, nbytes):
+                self.nbytes = nbytes
+        mx = types.SimpleNamespace(array=FakeArray, set_wired_limit=Mock(return_value=0))
+        mx.metal = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_info=lambda: {"max_recommended_working_set_size": 100 * 2**30})
+        return mx, {"layers": [FakeArray(weight_bytes // 2), FakeArray(weight_bytes // 2)]}
+
+    def test_weights_stay_wired_between_requests_on_roomy_macs(self):
+        mx, model = self._fake_mx(18 * 2**30)
+        with patch('hardware.unified_memory_bytes', return_value=128 * 2**30):
+            backend.keep_weights_wired(mx, model)
+        mx.set_wired_limit.assert_called_once_with(100 * 2**30)
+
+    def test_weights_not_wired_when_they_crowd_the_mac(self):
+        mx, model = self._fake_mx(18 * 2**30)
+        with patch('hardware.unified_memory_bytes', return_value=48 * 2**30):
+            backend.keep_weights_wired(mx, model)
+        mx.set_wired_limit.assert_not_called()
+
     def test_unknown_mode_fails_before_launch(self):
         with self.assertRaises(ValueError):
             backend.NextASR().warm('invalid')
