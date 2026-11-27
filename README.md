@@ -379,6 +379,16 @@ holds the logic. Override the thresholds with
 `VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS`. Measurements are in
 `docs/transcribe-while-talking-20261108.md`.
 
+**Pause background GPU jobs while dictating** (`pause_while_dictating` in
+`settings.json`, empty by default). The model shares the GPU with anything else
+on it: with a Whisper/Qwen batch running, an 8-second clip took about 6 s
+instead of 0.5 s. Each entry is a Python regex matched against a process's full
+command line. Matching processes and all their children get SIGSTOP when Fn goes
+down and SIGCONT when the dictation ends, after 180 s at the latest, on quit, and
+on the next launch. Anchor patterns to the executable, for example
+`"^\\S*whisper-cli "`, so shells or editors that only mention the job never
+match. `gpu_yield.py` holds the logic.
+
 Select **Qwen3-ASR 0.6B (MLX)** in the menu to return to the previous fast engine.
 The original model and runtime are retained.
 

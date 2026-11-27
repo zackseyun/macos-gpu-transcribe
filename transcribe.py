@@ -50,6 +50,7 @@ import key_monitor
 import hardware
 import transcribe_worker
 import live_chunker
+from gpu_yield import GpuYield
 from format_text import format_transcription
 from hud_overlay import get_controller as get_hud_controller
 from main_window import get_controller as get_main_window_controller
@@ -837,6 +838,13 @@ class VoiceTranscribeApp(rumps.App):
         self.sound_effects_enabled = bool(self.settings.get("sound_effects_enabled", True))
         self.live_pieces_enabled = bool(self.settings.get("live_pieces_enabled", False))
         self._live_pieces = None
+        # Background GPU jobs (e.g. sermon Whisper batches) slowed an 8 s
+        # dictation from ~0.5 s to ~6 s; pause them while dictating.
+        self._gpu_yield = GpuYield(
+            self.settings.get("pause_while_dictating", []),
+            log=lambda message: print(message, flush=True),
+        )
+        self._gpu_yield.resume_all()
         self.vocabulary = str(self.settings.get("vocabulary", STATIC_VOCABULARY_DEFAULT))
         self.default_model_is_auto, self.default_model_mode = _resolve_default_model_setting(
             self.settings.get("default_model_mode", AUTO_MODEL_MODE)
@@ -1774,6 +1782,7 @@ class VoiceTranscribeApp(rumps.App):
                         self._pending_model = model_mode
                         model_label = self._model_display_name(model_mode)
                         print(f"Fn hold → recording ({model_label})", flush=True)
+                        self._gpu_yield.pause_in_background()
                         self._play_sound("Tink")
                         # Speculatively warm the selected model while user is recording.
                         # Cohere warms MPS; Granite starts/reuses the resident CrispASR
@@ -2259,6 +2268,7 @@ class VoiceTranscribeApp(rumps.App):
                 flush=True,
             )
             self._refresh_audio_stream_async("empty-recording", force=True)
+            self._gpu_yield.resume()
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             self._run_on_main_thread(self._hud.hide)
@@ -2576,6 +2586,7 @@ class VoiceTranscribeApp(rumps.App):
         finally:
             if live is not None:  # recording ended before ASR (e.g. silence gate)
                 live.finish(timeout=0)
+            self._gpu_yield.resume()
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
             if not history_queued:
@@ -3113,6 +3124,10 @@ if __name__ == "__main__":
     # Without this, each restart leaves zombie key_monitor/worker/tracker processes
     # reparented to launchd (PID 1) that accumulate indefinitely.
     def _cleanup():
+        try:
+            app._gpu_yield.resume(reason="app exit")
+        except Exception:
+            pass
         for proc in multiprocessing.active_children():
             proc.kill()
             proc.join(timeout=2)
