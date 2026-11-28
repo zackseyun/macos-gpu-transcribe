@@ -94,6 +94,48 @@ class BrandReplacementTest(unittest.TestCase):
             "Seedance and Kling should be spelled correctly.",
         )
 
+    def test_corrects_nemotron_name_spellings(self):
+        # Real Nemotron output from Zack's dictations (2026-11-27).
+        self.assertEqual(
+            format_transcription("Carthage is an omegle style social network. Try Carthage dot com."),
+            "Cartha is an Omegle style social network. Try cartha.com.",
+        )
+        self.assertEqual(
+            format_transcription("fellowship and prayer on carter dot com"),
+            "Fellowship and prayer on cartha.com",
+        )
+        self.assertEqual(
+            format_transcription("our Omega style matching across Carthage's pages"),
+            "Our Omegle style matching across Cartha's pages",
+        )
+        self.assertEqual(
+            format_transcription("browsing Higgs field videos, or do we need Hicksfield?"),
+            "Browsing Higgsfield videos, or do we need Higgsfield?",
+        )
+        self.assertEqual(
+            format_transcription("have codex do the stills, then Kling or Cedence via Open Router."),
+            "Have Codex do the stills, then Kling or Seedance via OpenRouter.",
+        )
+
+    def test_leaves_lookalike_ordinary_words(self):
+        self.assertEqual(
+            format_transcription("Omega three fish oil, and my friend Carter cleaned up."),
+            "Omega 3 fish oil, and my friend Carter cleaned up.",
+        )
+
+
+class LetterTwoLetterTest(unittest.TestCase):
+    def test_spoken_business_shorthand_is_joined(self):
+        self.assertEqual(format_transcription("the B two B angle"), "The B2B angle")
+        self.assertEqual(format_transcription("B to B and B to C"), "B2B and B2C")
+        self.assertEqual(format_transcription("a B 2B angle"), "A B2B angle")
+        self.assertEqual(format_transcription("p two p payments and D two C brands"), "P2P payments and D2C brands")
+
+    def test_other_letters_and_phrases_are_left_alone(self):
+        self.assertEqual(format_transcription("go from A to B"), "Go from A to B")
+        self.assertEqual(format_transcription("plan B to the store"), "Plan B to the store")
+        self.assertEqual(format_transcription("B2B already"), "B2B already")
+
 
 class SpacingRepairTest(unittest.TestCase):
     def test_repairs_missing_space_before_iphone(self):

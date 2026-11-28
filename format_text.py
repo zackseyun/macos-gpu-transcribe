@@ -429,6 +429,22 @@ def _normalize_ampm_spacing(text):
     )
 
 
+# Business shorthand spoken letter-"two"-letter. Without this, number cleanup
+# read "B two B" as "B" plus "two B" (two billion) and pasted "B 2B".
+_LETTER_TWO_LETTER = frozenset({"B2B", "B2C", "C2B", "C2C", "D2C", "P2P", "B2G", "G2B", "G2C"})
+_LETTER_TWO_LETTER_RE = re.compile(
+    r"\b([bcdgp])(?:\s+(?:two|to)\s+|\s*-?\s*2\s*-?\s*)([bcdgp])\b", re.IGNORECASE
+)
+
+
+def _join_letter_two_letter(text):
+    """"B two B" / "B to B" / "B 2B" → "B2B" for the pairs above only."""
+    def repl(match):
+        joined = f"{match.group(1)}2{match.group(2)}".upper()
+        return joined if joined in _LETTER_TWO_LETTER else match.group(0)
+    return _LETTER_TWO_LETTER_RE.sub(repl, text)
+
+
 def _capitalize_first(text):
     """Ensure first character is capitalized."""
     if text and text[0].islower():
@@ -445,6 +461,11 @@ def _capitalize_first(text):
 # (Cohere often spells the period out loud as "Dot" in URL dictation).
 _DOM_SEP = r"(?:[\s,.]+(?:dot[\s,.]+)?)+"
 _CARTHA = r"(?:c|k)artha"
+# Nemotron writes "Carthage" for Cartha and, in URLs, also "carter dot com".
+# Its "Contextual vocabulary" prompt was tried on 2026-11-27 instead: it fixed
+# the names but invented "Cartha" on quiet or noisy audio and turned the name
+# Carter into Cartha, so names are corrected here, after transcription.
+_CARTHA_DOMAIN = r"(?:(?:c|k)arth(?:a|age)|carter)"
 
 _BRAND_REPLACEMENTS = [
     # Developer/device terms where ASR frequently inserts or drops spaces.
@@ -464,14 +485,17 @@ _BRAND_REPLACEMENTS = [
     # Cartha domain forms — tolerates Cohere's hard-C misspelling ("Kartha"),
     # the spoken "dot" word, dropped trailing "e" ("Mobil"), and incorrect
     # plural "websites".
-    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
-    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
-    (re.compile(rf"\b{_CARTHA}{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
+    (re.compile(rf"\b{_CARTHA_DOMAIN}{_DOM_SEP}ai{_DOM_SEP}mobile?s?\b", re.IGNORECASE), "cartha.ai.mobile"),
+    (re.compile(rf"\b{_CARTHA_DOMAIN}{_DOM_SEP}websites?\b", re.IGNORECASE), "cartha.website"),
+    (re.compile(rf"\b{_CARTHA_DOMAIN}{_DOM_SEP}com\b", re.IGNORECASE), "cartha.com"),
     # Camel-case service names
     (re.compile(rf"\b{_CARTHA}[\s.]+cdk[\s.]+service\b", re.IGNORECASE), "CarthaCdkService"),
     # Standalone brand: Cohere often chooses "Kartha" for the company/app name.
     # Keep this after the domain/service forms so longer canonical names win.
     (re.compile(r"\bkartha\b", re.IGNORECASE), "Cartha"),
+    # Nemotron's spelling of Cartha. This also rewrites the ancient city, which
+    # comes up far less often in this dictation than the company does.
+    (re.compile(r"\bcarthage\b", re.IGNORECASE), "Cartha"),
     # User name: Cohere tends to choose the more common spelling.
     (re.compile(r"\bzach\b", re.IGNORECASE), "Zack"),
     (re.compile(r"\bmichelle\b", re.IGNORECASE), "Mishaal"),
@@ -486,6 +510,13 @@ _BRAND_REPLACEMENTS = [
     (re.compile(r"\b(?:c|sea|see|seed)\s*[- ]?dance\b", re.IGNORECASE), "Seedance"),
     (re.compile(r"\bseeddance\b", re.IGNORECASE), "Seedance"),
     (re.compile(r"\b(?:cling|clang|kling)\b", re.IGNORECASE), "Kling"),
+    (re.compile(r"\b(?:cedence|sedance|seedence|ceedance)\b", re.IGNORECASE), "Seedance"),
+    (re.compile(r"\b(?:higgs|hicks|higs)[\s-]*field\b", re.IGNORECASE), "Higgsfield"),
+    (re.compile(r"\bopen\s*router\b", re.IGNORECASE), "OpenRouter"),
+    (re.compile(r"\bcodex\b", re.IGNORECASE), "Codex"),
+    # The video-chat site. Nemotron hears "Omega style"; "Omega three" stays.
+    (re.compile(r"\bomega(?=[\s-]+(?:style|like|type)\b)", re.IGNORECASE), "Omegle"),
+    (re.compile(r"\bomegle\b", re.IGNORECASE), "Omegle"),
     # Common Anthropic/AI brand mishearings
     (re.compile(r"\banthropic\b", re.IGNORECASE), "Anthropic"),
 ]
@@ -571,6 +602,7 @@ def format_transcription(text):
     text = _fix_punctuation_spacing(text)      # "shift.should" → "shift. should"
     text = _split_merged_words(text)           # "carcause" → "car cause"
 
+    text = _join_letter_two_letter(text)      # "B two B" → "B2B" (before "two B" → "2B")
     text = _normalize_digit_multiplier(text)  # "3 thousand" → "3,000" (before word spans)
     text = _convert_number_spans(text)        # "twenty five" → "25"
     text = _normalize_percentages(text)

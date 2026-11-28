@@ -369,15 +369,26 @@ by GPU memory bandwidth: Low Power Mode cuts it to roughly a fifth. See
 **Transcribe While Talking (Nemotron)** is a menu toggle (`live_pieces_enabled`
 in `settings.json`, off by default). During a long dictation, each finished
 piece is transcribed in the background once a 0.5-second pause comes at least
-8 seconds after the previous cut. Each piece re-hears 3 seconds before its start
+20 seconds after the previous cut. Each piece re-hears 6 seconds before its start
 and is stitched to the previous text in that overlap, so a mid-sentence pause
 does not become ". The". Releasing Fn then waits only for the last piece. A
 failed piece retries from the last finished boundary (the whole recording only if
 no piece finished). A token-limit error rejects partial text without unloading the model. `live_chunker.py`
 holds the logic. Override the thresholds with
-`VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS` and
-`VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS`. Measurements are in
-`docs/transcribe-while-talking-20261108.md`.
+`VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS`,
+`VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS` and
+`VOICE_TRANSCRIBE_LIVE_PIECE_CONTEXT_SECONDS`. Measurements are in
+`docs/transcribe-while-talking-20261108.md`. The first version used 8-second
+pieces with 3 seconds of context. With so little context Nemotron misheard words
+that the whole recording got right ("the ass slide" for "the ask slide"), so
+since 2026-11-27 pieces are longer. The cost is a slightly longer wait after
+release, because the last piece can be up to about 20 seconds.
+
+Names are fixed after transcription in `format_text.py` (for example
+Carthage → Cartha, Higgs field → Higgsfield, Omega style → Omegle style,
+B two B → B2B). Nemotron's own "Contextual vocabulary" prompt was tested on
+2026-11-27 and not used: it got the names right but invented "Cartha" on quiet
+or noisy recordings and changed the name Carter to Cartha.
 
 **Pause background GPU jobs while dictating** (`pause_while_dictating` in
 `settings.json`, empty by default). The model shares the GPU with anything else

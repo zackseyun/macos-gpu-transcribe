@@ -70,3 +70,14 @@ never cut, so they are unchanged.
   but dropped two words ("our", "I") at boundaries in one clip.
 - Cancelling an in-flight piece at release would need cancellation in the MLX
   child process.
+
+## 2026-11-27: longer pieces
+
+Pieces are now at least 20 s with 6 s of re-heard context (were 8 s / 3 s).
+On a 165 s off-script dictation, 8 s pieces wrote "the ass slide" and
+"B2B and gold conferences". The whole recording, and 20 s / 6 s pieces, gave
+"the ask slide" and "B2B angle of conferences". On the two scripted founder
+takes the change is small: words differing from the whole-take transcript went
+3.2% → 2.6% (zoom-last-take, 94 s) and 2.5% → 2.5% (zack-extra-take, 136 s).
+Both settings still turn "Alexa" into "Lex" at one boundary. The last piece is
+longer, so the wait after release grows by up to about 1 s with the GPU free.

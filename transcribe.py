@@ -224,9 +224,14 @@ EDGE_TRIM_PAD_SECONDS = 0.75
 # "Transcribe While Talking": for slow, accurate models, transcribe each finished
 # piece of a long dictation (cut at a real pause) while the user keeps talking,
 # so releasing Fn leaves only the last piece. See live_chunker.py.
+# Pieces were 8 s with 3 s of re-heard context until 2026-11-27. That was too
+# little context: on a 165 s dictation the pieces wrote "the ass slide" and
+# "B2B and gold conferences" where the whole recording, and 20 s pieces with
+# 6 s of context, gave "the ask slide" and "B2B angle of conferences".
 LIVE_PIECE_MODES = frozenset({"nemotron35"})
-LIVE_PIECE_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS", "8"))
+LIVE_PIECE_MIN_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_MIN_SECONDS", "20"))
 LIVE_PIECE_PAUSE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_PAUSE_SECONDS", "0.5"))
+LIVE_PIECE_CONTEXT_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_LIVE_PIECE_CONTEXT_SECONDS", "6"))
 
 # Known ASR hallucination outputs on silent/near-silent audio. These are the
 # most common ones Whisper-family and Cohere Transcribe emit from training
@@ -1327,6 +1332,7 @@ class VoiceTranscribeApp(rumps.App):
             sample_rate=SAMPLE_RATE,
             min_chunk_seconds=LIVE_PIECE_MIN_SECONDS,
             pause_seconds=LIVE_PIECE_PAUSE_SECONDS,
+            context_seconds=LIVE_PIECE_CONTEXT_SECONDS,
             log=lambda message: print(message, flush=True),
         ).start()
 
